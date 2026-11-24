@@ -186,6 +186,16 @@ function copyFinishedWaiter(host, timeoutMs) {
   return () => traps.waitForTrap({ source: host, oid: RL_COPY_FINISHED_OID, timeoutMs: timeoutMs || 600000 }).promise;
 }
 
+// The ONE derivation of an SNMPv3 target's methods and security level, used
+// to build the session and to judge whether it encrypts (keyTransportWarning),
+// so the two can never disagree. An explicit method wins; an older saved
+// target that only carries `level` gets the defaults it always got.
+function v3SecurityOf(v3) {
+  const authName = v3.authProtocol === undefined ? (v3.level === 'noAuthNoPriv' ? 'none' : 'sha') : v3.authProtocol;
+  const privName = v3.privProtocol === undefined ? (v3.level === 'authPriv' ? 'aes128' : 'none') : v3.privProtocol;
+  return { authName, privName, level: v3crypto.securityLevelFor(authName, privName) };
+}
+
 function buildSnmpSession(target) {
   const { host, port, version, community, v3 } = target;
   const commonOptions = {
@@ -203,9 +213,7 @@ function buildSnmpSession(target) {
     // The security level is derived from the two method choices rather
     // than asked for separately -- "authPriv with privacy None" is a
     // contradiction the user should never have to resolve.
-    const authName = v3.authProtocol === undefined ? (v3.level === 'noAuthNoPriv' ? 'none' : 'sha') : v3.authProtocol;
-    const privName = v3.privProtocol === undefined ? (v3.level === 'authPriv' ? 'aes128' : 'none') : v3.privProtocol;
-    const level = v3crypto.securityLevelFor(authName, privName);
+    const { authName, privName, level } = v3SecurityOf(v3);
 
     const user = { name: v3.username, level: snmp.SecurityLevel[level] };
     if (level !== 'noAuthNoPriv') {
@@ -1336,7 +1344,11 @@ async function runAaaSteps(target, groups) {
 function keyTransportWarning(target, cfg) {
   const hasKey = cfg && !cfg.useGlobalKey && cfg.key !== undefined && cfg.key !== null && cfg.key !== '';
   if (!hasKey) return null;
-  const isV3Priv = String(target.version) === '3' && target.v3 && String(target.v3.level) === 'authPriv';
+  // Judged from what the session will actually negotiate, not the saved
+  // `level` label, which can say authPriv while privacy is set to None.
+  let isV3Priv = false;
+  try { isV3Priv = String(target.version) === '3' && !!target.v3 && v3SecurityOf(target.v3).level === 'authPriv'; }
+  catch (e) { isV3Priv = false; }   // an unsupported method: the session build reports it
   return isV3Priv ? null : 'The shared key will be sent in cleartext because this session is not SNMPv3 with privacy (authPriv). Anyone capturing the traffic could read it.';
 }
 
