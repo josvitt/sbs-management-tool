@@ -53,6 +53,7 @@ const collector = require('./collector');
 const rotate = require('./rotate');
 const v3crypto = require('./snmp-crypto');
 const snmpConfig = require('./snmp-config');
+const guard = require('./request-guard');
 
 // Catch anything that would otherwise silently kill the process.
 process.on('uncaughtException', (err) => {
@@ -65,6 +66,9 @@ process.on('unhandledRejection', (reason) => {
 });
 
 const app = express();
+// First, before any asset or route: refuse cross-site and DNS-rebinding
+// requests (see request-guard.js). LAN access is unaffected.
+app.use(guard.middleware(log));
 app.use(express.json());
 /**
  * Compress static assets. The MIB database alone is 2 MB of JSON fetched
@@ -2229,7 +2233,7 @@ app.post('/api/health', async (req, res) => {
 });
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, verifyClient: guard.verifyClient(log) });
 
 // Legacy algorithms are included because many Cisco IOS/IOS-XE switches,
 // especially older ones, only support older SSH key exchange / cipher
