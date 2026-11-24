@@ -805,7 +805,7 @@ produce the remaining repetitions, so it keeps generating successors
 key = IP_Applications.DNS_client.maximum_number_of_pending_msgs
 ```
 
-The bounded walk in `server.js` keeps GETBULK's speed but enforces the
+The bounded walk in `snmp-core.js` keeps GETBULK's speed but enforces the
 subtree boundary locally: anything outside the base OID is discarded and
 the walk stops rather than asking for more. It also lowers
 `maxRepetitions` to 10, caps total rows, guards against OID depth blowing
@@ -1478,7 +1478,7 @@ What it does protect against:
 - Saved switches and their credentials are kept encrypted in `state.enc`
   (see `vault.js` and `docs/SERVER-STANDARD.md` §7). They are never stored
   in the browser.
-- `server.js` offers modern SSH algorithms first and keeps legacy key
+- `routes/terminal.js` offers modern SSH algorithms first and keeps legacy key
   exchange and cipher suites as fallbacks, since Cisco small-business
   switches may not support modern-only sets. See `LEGACY_ALGORITHMS`.
 - SNMP uses [net-snmp](https://www.npmjs.com/package/net-snmp). Each

@@ -11,7 +11,7 @@ reconcile after; an error is not evidence of impossibility; read what the
 system actually has). This document is their application to the server, and,
 like the module standard, it is **derived from the code that already exists** —
 `collector.js`, `events.js`, `rotate.js`, the shared collection/probe paths in
-`server.js`, and `history.js`. Nothing here is aspirational.
+`collection.js`, `snmp-core.js`, the routes under `routes/`, and `history.js`. Nothing here is aspirational.
 
 ---
 
@@ -30,7 +30,7 @@ a browser-driven collection loop is a regression against this principle.
 
 ---
 
-## 1. The one collection path — `collectHealthFor` (server.js)
+## 1. The one collection path — `collectHealthFor` (collection.js)
 
 There is exactly **one** function that builds an SNMP session, walks a switch,
 and keeps the per-switch rate baseline: `collectHealthFor(target, { mode, only })`.
@@ -45,7 +45,7 @@ place and both callers inherit it.
 - `previous` (the per-switch `lastCollection` cache) turns error counters into
   rates; it is keyed by `host:port`.
 
-## 2. The reachability probe — `probeSwitch` (server.js)
+## 2. The reachability probe — `probeSwitch` (collection.js)
 
 `probeSwitch(target)` is a single-PDU GET of sysUpTime, CPU, PoE, the
 config-saved flag, and cpu-pps. It never rejects; it resolves
@@ -231,7 +231,7 @@ running→startup save by the copy index — a possible future enhancement.
   memory and the per-host files below against spoofed UDP.
 - **traps / syslog** — received notifications are persisted to rotating per-host
   stores under `logs/traps/<host>.log` and `logs/syslog/<host>.log` by an
-  always-on subscriber in `server.js`, in addition to the in-memory ring buffers
+  always-on subscriber in `routes/streams.js`, in addition to the in-memory ring buffers
   and SSE streams (which are unchanged).
 - **`history.js`** — the time-series gained `temp` (max sensor °C, from
   `summary.maxTempC`) and `fan` (worst fan-state code: 0 unknown · 1 ok ·
@@ -381,16 +381,25 @@ so "C1300X supports OSPF/PTP; C1200/C1300 do not" is visible, not just internal.
 
 ## 11. Shared request and SNMP paths (the server's own helpers)
 
+**Where server code lives.** `server.js` only wires things together: it
+builds the app (`web.js`: the guard and every other middleware), registers
+the route modules under `routes/` (one per feature, each
+`module.exports = function register(app)`), attaches the terminal WebSocket
+(`routes/terminal.js`), starts the receivers and the collector, and listens.
+SNMP primitives live in `snmp-core.js`, the collection path in
+`collection.js`. A new feature's routes go in their own `routes/<feature>.js`
+and use those helpers; nothing new is added to `server.js` itself.
+
 The server-side counterparts of `MODULE-STANDARD §B8`. Each is the one place
 its concern lives; a new route or caller uses it rather than re-implementing it.
 
 | Concern | Helper | Why it exists |
 |---|---|---|
 | Who may call the server | `request-guard.js` (`middleware`, `verifyClient`) | Runs before every HTTP request and on the WebSocket upgrade. The dashboard is opened from any PC, so it does NOT restrict which machine connects; it refuses a browser request whose `Origin` is another site, and any `Host` that is not an IP, `localhost`, this computer's name, or a name in `SBS_ALLOWED_HOSTS` (DNS rebinding). |
-| JSON varbinds → net-snmp SET | `mapSetVarbinds(varbinds)` (server.js) | Every SET path (the `/api/snmp/set` route, snmp-config's bundle, the OPC/AAA/flash step runners) converts through it: numeric types, `valueHex` → Buffer with an even-length check, anything else unchanged. There were three copies, only some handling `valueHex`. |
-| Walking a subtree | `boundedWalk(session, base, opts, onDone)` (server.js) | The ONE walk: subtree boundary, advance check, pacing (§B5a), row/depth caps, and a per-request watchdog (`SNMP_STEP_WATCHDOG_MS`, 12 s) so a reply net-snmp never delivers ends the walk instead of hanging it. `raw: true` returns untouched varbinds for snmp-config (`boundedWalkRaw` is that, with its 4000-row / depth-64 limits). |
-| SNMPv3 security level | `v3SecurityOf(v3)` (server.js) | One derivation of auth/priv method and level, used to build the session and to judge whether a shared key would travel in cleartext, so the two cannot disagree. |
-| A snapshot leaving the server | `publicSnapshot(snap)` (server.js) | The collector keeps the full target to poll with; responses carry it through `redactTarget`. |
+| JSON varbinds → net-snmp SET | `mapSetVarbinds(varbinds)` (snmp-core.js) | Every SET path (the `/api/snmp/set` route, snmp-config's bundle, the OPC/AAA/flash step runners) converts through it: numeric types, `valueHex` → Buffer with an even-length check, anything else unchanged. There were three copies, only some handling `valueHex`. |
+| Walking a subtree | `boundedWalk(session, base, opts, onDone)` (snmp-core.js) | The ONE walk: subtree boundary, advance check, pacing (§B5a), row/depth caps, and a per-request watchdog (`SNMP_STEP_WATCHDOG_MS`, 12 s) so a reply net-snmp never delivers ends the walk instead of hanging it. `raw: true` returns untouched varbinds for snmp-config (`boundedWalkRaw` is that, with its 4000-row / depth-64 limits). |
+| SNMPv3 security level | `v3SecurityOf(v3)` (snmp-core.js) | One derivation of auth/priv method and level, used to build the session and to judge whether a shared key would travel in cleartext, so the two cannot disagree. |
+| A snapshot leaving the server | `publicSnapshot(snap)` (routes/monitoring.js) | The collector keeps the full target to poll with; responses carry it through `redactTarget`. |
 
 Offline tests for these and the persistence helpers live in `test/` and run
 with `npm test` (node:test, no extra dependency). A new control gets a test
