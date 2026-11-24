@@ -2104,6 +2104,9 @@ function loadLayouts() {
   } catch (e) {
     layouts = {};   // missing or unreadable: start clean rather than fail
   }
+  // Keyed by a host taken from the URL: with no prototype, a host such as
+  // "__proto__" or "constructor" is an ordinary key, not Object.prototype.
+  layouts = Object.assign(Object.create(null), layouts);
   return layouts;
 }
 
