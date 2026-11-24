@@ -58,6 +58,15 @@ function tacacsIndex(ip) {
   return INET_IPV4 + '.' + inetIndexV4(ip);
 }
 
+// A numeric form field, or undefined when it was left blank. Number(null) and
+// Number('') are both 0, so a blank field (sent as null or '') used to write
+// 0 to the switch instead of leaving the setting alone.
+function num(v) {
+  if (v === undefined || v === null || v === '') return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 // Varbind builders: {oid, type, value|valueHex} as /api/snmp/set expects.
 const I = (oid, v) => ({ oid, type: 'Integer', value: v });
 const S = (oid, v) => ({ oid, type: 'OctetString', value: v });
@@ -84,10 +93,10 @@ function planRadius(cfg) {
     vbs.push(I(col(RCOL.addressType), INET_IPV4));
     vbs.push(A(col(RCOL.address), cfg.address));
   }
-  if (Number.isFinite(Number(cfg.timeout))) vbs.push(I(col(RCOL.timeout), Number(cfg.timeout)));
-  if (Number.isFinite(Number(cfg.retries))) vbs.push(I(col(RCOL.retries), Number(cfg.retries)));
-  if (Number.isFinite(Number(cfg.deadtime))) vbs.push(I(col(RCOL.deadtime), Number(cfg.deadtime)));
-  if (Number.isFinite(Number(cfg.priority))) vbs.push(I(col(RCOL.priority), Number(cfg.priority)));
+  if (num(cfg.timeout) !== undefined) vbs.push(I(col(RCOL.timeout), num(cfg.timeout)));
+  if (num(cfg.retries) !== undefined) vbs.push(I(col(RCOL.retries), num(cfg.retries)));
+  if (num(cfg.deadtime) !== undefined) vbs.push(I(col(RCOL.deadtime), num(cfg.deadtime)));
+  if (num(cfg.priority) !== undefined) vbs.push(I(col(RCOL.priority), num(cfg.priority)));
   if (cfg.usage && USAGE[String(cfg.usage).toLowerCase()]) vbs.push(I(col(RCOL.usage), USAGE[String(cfg.usage).toLowerCase()]));
   // Key handling: either use the global default, or set a per-server key.
   if (cfg.useGlobalKey) {
@@ -116,9 +125,9 @@ function planTacacs(cfg) {
     vbs.push(I(col(TCOL.addressType), INET_IPV4));
     vbs.push(A(col(TCOL.address), cfg.address));
   }
-  if (Number.isFinite(Number(cfg.port))) vbs.push(I(col(TCOL.port), Number(cfg.port)));
-  if (Number.isFinite(Number(cfg.timeout))) vbs.push(I(col(TCOL.timeout), Number(cfg.timeout)));
-  if (Number.isFinite(Number(cfg.priority))) vbs.push(I(col(TCOL.priority), Number(cfg.priority)));
+  if (num(cfg.port) !== undefined) vbs.push(I(col(TCOL.port), num(cfg.port)));
+  if (num(cfg.timeout) !== undefined) vbs.push(I(col(TCOL.timeout), num(cfg.timeout)));
+  if (num(cfg.priority) !== undefined) vbs.push(I(col(TCOL.priority), num(cfg.priority)));
   if (cfg.useGlobalKey) {
     vbs.push(I(col(TCOL.useGlobalKey), 1));
   } else if (cfg.key !== undefined && cfg.key !== null && cfg.key !== '') {
