@@ -12,6 +12,7 @@
  * configured -- on a machine with several interfaces, guessing is wrong.
  */
 
+const crypto = require('crypto');
 const dgram = require('dgram');
 const snmp = require('net-snmp');
 const log = require('./logger');
@@ -214,8 +215,10 @@ async function fetchConfig(buildSession, opts) {
   }
   const localIp = await localAddressFor(opts.host);
   // Unique per attempt so a stale file from an earlier run can never be
-  // mistaken for this one.
-  const fileName = kind + '-' + Date.now().toString(36) + '.cfg';
+  // mistaken for this one, and unguessable: the TFTP receiver accepts an
+  // upload from any address, so a predictable name would let another host on
+  // the LAN race the switch with a forged configuration.
+  const fileName = kind + '-' + Date.now().toString(36) + '-' + crypto.randomBytes(6).toString('hex') + '.cfg';
   const index = opts.index || (Math.floor(Math.random() * 900) + 100);
 
   log.info('config', 'Requesting configuration over TFTP', {

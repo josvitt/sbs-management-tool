@@ -20,6 +20,14 @@ const OP_RRQ = 1, OP_WRQ = 2, OP_DATA = 3, OP_ACK = 4, OP_ERROR = 5, OP_OACK = 6
 const DEFAULT_PORT = 69;
 const BLOCK = 512;
 const TRANSFER_TIMEOUT_MS = 60000;
+// Limits on what an unauthenticated UDP sender can make this process hold.
+// The receiver does not check the sender's address (doing so could refuse a
+// switch that uploads from an interface other than the one it is managed on;
+// not verified either way), so size and concurrency are what is capped. The
+// largest legitimate upload is a packet capture copied off flash; the default
+// leaves ample room for that. Tunable via env.
+const MAX_FILE_BYTES = Number(process.env.TFTP_MAX_BYTES) || 256 * 1024 * 1024;
+const MAX_TRANSFERS = Number(process.env.TFTP_MAX_TRANSFERS) || 16;
 
 let socket = null;
 let listening = false;
@@ -128,7 +136,14 @@ function onMessage(msg, rinfo) {
       return;
     }
 
+    if (transfers.size >= MAX_TRANSFERS) {
+      log.warn('tftp', 'Write request refused: too many transfers in progress', { from: rinfo.address });
+      sendError(rinfo, 3, 'Too many transfers in progress');
+      return;
+    }
+
     const xfer = {
+      bytes: 0,
       name: name.value.replace(/^.*[\\/]/, ''),   // ignore any path the client sends
       chunks: [], from: rinfo.address,
       blksize: hasOpts ? blksize : BLOCK,
@@ -166,6 +181,14 @@ function onMessage(msg, rinfo) {
     if (xfer.done) { sendAck(rinfo, block); return; }
     const expected = (xfer.block + 1) & 0xffff;
     if (block === expected) {
+      xfer.bytes += data.length;
+      if (xfer.bytes > MAX_FILE_BYTES) {
+        clearTimeout(xfer.timer);
+        transfers.delete(key);
+        log.warn('tftp', 'Upload refused: larger than TFTP_MAX_BYTES', { name: xfer.name, from: xfer.from, limit: MAX_FILE_BYTES });
+        sendError(rinfo, 3, 'File too large');
+        return;
+      }
       xfer.chunks.push(data);
       xfer.block = block;
     }
@@ -214,13 +237,15 @@ function expect(name, timeoutMs) {
   const done = completed.get(name);
   if (done) return Promise.resolve(done.buffer);
   return new Promise((resolve, reject) => {
+    let timer = null;
+    const settle = (buffer) => { clearTimeout(timer); resolve(buffer); };
     const list = waiters.get(name) || [];
-    list.push(resolve);
+    list.push(settle);
     waiters.set(name, list);
-    setTimeout(() => {
+    timer = setTimeout(() => {
       const l = waiters.get(name);
       if (l) {
-        const i = l.indexOf(resolve);
+        const i = l.indexOf(settle);
         if (i >= 0) l.splice(i, 1);
         if (!l.length) waiters.delete(name);
       }
