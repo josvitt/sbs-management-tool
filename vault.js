@@ -110,13 +110,31 @@ function decrypt(buffer) {
   return Buffer.concat([decipher.update(body), decipher.final()]).toString('utf8');
 }
 
+// The last decrypted state, keyed by the file's mtime and size. The collector
+// reads the vault on every 30 s tick of every switch; re-reading and
+// decrypting an unchanged file each time is wasted work, and an unreadable
+// file logged the same error every tick. A fresh copy is parsed from the
+// cached text on each load, so a caller can never mutate the cache.
+let cache = null;   // { mtimeMs, size, text } or { mtimeMs, size, unreadable: true }
+
 function load() {
+  let st;
   try {
-    if (!fs.existsSync(STATE_FILE)) { unreadableOnDisk = false; return null; }
-    const parsed = JSON.parse(decrypt(fs.readFileSync(STATE_FILE)));
+    st = fs.statSync(STATE_FILE);
+  } catch (e) {
+    cache = null;
     unreadableOnDisk = false;
-    // The collector reads the vault on every tick of every switch; logging
-    // each read buried app.log. Say it once, and again only when it changes.
+    return null;
+  }
+  if (cache && cache.mtimeMs === st.mtimeMs && cache.size === st.size) {
+    if (cache.unreadable) return { unreadable: true };
+    return JSON.parse(cache.text);
+  }
+  try {
+    const text = decrypt(fs.readFileSync(STATE_FILE));
+    const parsed = JSON.parse(text);
+    cache = { mtimeMs: st.mtimeMs, size: st.size, text };
+    unreadableOnDisk = false;
     const count = (parsed.switches || []).length;
     if (count !== lastLoggedCount) {
       lastLoggedCount = count;
@@ -127,6 +145,7 @@ function load() {
     // A wrong key, a truncated file, or a passphrase that has changed all
     // land here. Saying which is impossible and guessing would be worse
     // than admitting the file cannot be read.
+    cache = { mtimeMs: st.mtimeMs, size: st.size, unreadable: true };
     unreadableOnDisk = true;
     log.error('vault', 'Could not read the saved state', {
       message: e.message,
@@ -148,6 +167,7 @@ function save(state) {
       log.warn('vault', 'Kept the unreadable state file instead of overwriting it', { file: kept });
     }
     rotate.writeFileAtomic(STATE_FILE, encrypt(payload), { mode: 0o600 });
+    cache = null;   // the next load reads what was just written
     return true;
   } catch (e) {
     log.error('vault', 'Could not save state', { message: e.message });
@@ -156,6 +176,7 @@ function save(state) {
 }
 
 function clear() {
+  cache = null;
   for (const file of [STATE_FILE]) {
     try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch (e) { /* nothing to do */ }
   }

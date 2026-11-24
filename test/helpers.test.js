@@ -94,3 +94,22 @@ test('vault keeps an unreadable state file instead of overwriting it', () => {
   const out = execFileSync(process.execPath, ['-e', script], { cwd: dir, env }).toString().trim().split('\n').pop();
   assert.deepEqual(JSON.parse(out), { unreadable: true, now: [2], kept: 1 });
 });
+
+test('vault: repeated loads do not re-read the file; a save is seen at once', () => {
+  const dir = tmpDir();
+  for (const f of ['vault.js', 'rotate.js', 'logger.js']) fs.copyFileSync(path.join(ROOT, f), path.join(dir, f));
+  const script = `
+    const fs = require('fs'); const v = require('./vault.js');
+    v.save({ switches: [1] });
+    let reads = 0; const orig = fs.readFileSync;
+    fs.readFileSync = function (f, ...a) { if (String(f).endsWith('state.enc')) reads++; return orig.call(this, f, ...a); };
+    const a = v.load(); a.switches.push('mutated');
+    const hit = v.load(); hit.switches.push('mutated');   // a cache hit, mutated
+    const b = v.load();
+    v.save({ switches: [2] });
+    const c = v.load();
+    console.log(JSON.stringify({ reads, b: b.switches, c: c.switches }));`;
+  const env = { ...process.env }; delete env.SBS_PASSPHRASE; delete env.SWITCH_CONSOLE_PASSPHRASE;
+  const out = execFileSync(process.execPath, ['-e', script], { cwd: dir, env }).toString().trim().split('\n').pop();
+  assert.deepEqual(JSON.parse(out), { reads: 2, b: [1], c: [2] });
+});
