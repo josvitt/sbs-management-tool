@@ -2475,6 +2475,13 @@ wss.on('connection', (ws, req) => {
 
     switch (msg.type) {
       case 'connect': {
+        // Same guard serial-connect has: a second connect on this socket
+        // would replace `conn` and leave the first SSH session running with
+        // nothing able to close it.
+        if (console_ || conn) {
+          send({ type: 'error', message: 'This tab already has a session open.' });
+          break;
+        }
         const { host, port, username, password, cols, rows } = msg;
         targetHost = host;
         endedNotified = false;
