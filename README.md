@@ -1470,6 +1470,11 @@ What it does protect against:
   `localhost`, or this computer's own name. If you open the dashboard
   through another DNS name (an alias), add it to `SBS_ALLOWED_HOSTS`,
   comma-separated, e.g. `SBS_ALLOWED_HOSTS=sbs.example.lan`.
+- **Saved passwords stay on the server.** Once a switch is saved, the page
+  never receives its community string, SNMPv3 keys or SSH password again:
+  Settings shows those fields as *saved — leave blank to keep*, and the
+  server fills them in when it talks to the switch. Typing a new value
+  replaces the saved one.
 - **Secrets in logs and responses.** Passwords, community strings, SNMPv3
   keys and RADIUS/TACACS keys are redacted at any depth in `logs/app.log`,
   SET values are not logged, and collector snapshots never return

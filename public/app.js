@@ -1511,13 +1511,20 @@
       port: parseInt(s.portInput.value, 10) || 161,
       version: s.versionInput.value
     };
+    // A saved switch's secrets stay on the server (credentials.js): a field
+    // left blank while it says "saved" is sent empty, and the server fills it
+    // in from the switch named by `ref`.
+    const saved = s.savedSecrets || {};
+    if (s.savedId) t.ref = s.savedId;
     if (t.version === '3') {
       t.v3 = {
         username: s.v3User.value,
         authProtocol: s.v3Auth.value, authKey: s.v3AuthKey.value,
         privProtocol: s.v3Priv.value, privKey: s.v3PrivKey.value
       };
-    } else t.community = s.communityInput.value || 'public';
+    } else if (s.communityInput.value || !saved.community) {
+      t.community = s.communityInput.value || 'public';
+    }
     return t;
   }
 
@@ -1595,6 +1602,7 @@
         if (sw.forgotten) continue;
         if (!sw.target && !sw.consoleTarget) continue;
         list.push({
+          id: sw.savedId || undefined,
           host: sw.host || null,
           target: sw.target || null,
           // The per-switch poll interval drives the server's collector cadence
@@ -1713,9 +1721,11 @@
           sw.sshHost.value = entry.ssh.host || '';
           sw.sshPort.value = entry.ssh.port || 22;
           sw.sshUser.value = entry.ssh.username || '';
-          sw.sshPass.value = entry.ssh.password || '';
           sw.sshEverConnected = !!entry.ssh.username;
         }
+        sw.savedId = entry.id || null;
+        sw.savedSecrets = entry.saved || {};
+        showSavedSecrets(sw);
         if (entry.console) sw.consoleTarget = entry.console;
         if (entry.target) {
           sw.target = entry.target;
@@ -1762,6 +1772,25 @@
       if (target.v3.privKey) s.v3PrivKey.value = target.v3.privKey;
     }
     updateVersionFields(s);
+  }
+
+  /**
+   * The server never sends a saved secret back (credentials.js), so each
+   * secret field of a restored switch is left empty and says so. Typing in
+   * it replaces the saved value; leaving it blank keeps it.
+   */
+  function showSavedSecrets(s) {
+    const saved = s.savedSecrets || {};
+    const mark = (input, has) => {
+      if (!input || !has) return;
+      input.value = '';
+      input.placeholder = 'saved \u2014 leave blank to keep';
+      input.required = false;
+    };
+    mark(s.communityInput, saved.community);
+    mark(s.v3AuthKey, saved.authKey);
+    mark(s.v3PrivKey, saved.privKey);
+    mark(s.sshPass, saved.sshPassword);
   }
 
   let storageInfo = null;
@@ -8320,7 +8349,7 @@
   }
 
   const hasConsole = (s) => !!(s.consoleTarget && s.consoleTarget.path);
-  const hasSsh = (s) => !!(s.sshEverConnected || (s.sshUser.value && s.sshPass.value));
+  const hasSsh = (s) => !!(s.sshEverConnected || (s.sshUser.value && (s.sshPass.value || (s.savedSecrets && s.savedSecrets.sshPassword))));
 
   function cliTooltip(s) {
     if (hasConsole(s)) return 'Console  \u2014  ' + s.consoleTarget.path + ' @ ' + s.consoleTarget.baudRate;
@@ -12197,7 +12226,7 @@
         : 'connecting to ' + host;
       sock.send(JSON.stringify(serialOpts
         ? { type: 'serial-connect', path: host, baudRate: port }
-        : { type: 'connect', host, port, username, password, cols: s.term.cols, rows: s.term.rows }));
+        : { type: 'connect', host, port, username, password, ref: s.savedId || undefined, cols: s.term.cols, rows: s.term.rows }));
     };
 
     sock.onmessage = (ev) => {

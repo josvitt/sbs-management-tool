@@ -6,6 +6,8 @@
  */
 
 const log = require('../logger');
+const vault = require('../vault');
+const credentials = require('../credentials');
 const serial = require('../serial');
 const { Client } = require('ssh2');
 
@@ -243,7 +245,11 @@ module.exports = function register(app, wss) {
             send({ type: 'error', message: 'This tab already has a session open.' });
             break;
           }
-          const { host, port, username, password, cols, rows } = msg;
+          // A saved switch's SSH password stays on the server; the browser
+        // sends the connect without it (credentials.resolveSsh).
+        const saved = vault.load();
+        const resolved = credentials.resolveSsh(msg, saved && !saved.unreadable ? saved : null);
+        const { host, port, username, password, cols, rows } = resolved;
           targetHost = host;
           endedNotified = false;
 

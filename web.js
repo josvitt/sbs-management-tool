@@ -2,7 +2,8 @@
 
 /**
  * The Express app and the middleware every request passes through, in
- * order: the request guard, security headers, JSON parsing, compression, static files, request
+ * order: the request guard, security headers, JSON parsing, filling in saved
+ * credentials, compression, static files, request
  * logging, and the client log sink.
  */
 
@@ -14,6 +15,8 @@ const crypto = require('crypto');
 const log = require('./logger');
 const guard = require('./request-guard');
 const securityHeaders = require('./security-headers');
+const vault = require('./vault');
+const credentials = require('./credentials');
 
 const app = express();
 // First, before any asset or route: refuse cross-site and DNS-rebinding
@@ -22,6 +25,17 @@ app.use(guard.middleware(log));
 // Then the browser security headers, on every response (security-headers.js).
 app.use(securityHeaders.middleware());
 app.use(express.json());
+// A request naming a saved switch arrives without its secrets (the browser is
+// never given them); fill them in from the vault before any route sees the
+// target. One place, so every SNMP route inherits it (credentials.js).
+app.use((req, res, next) => {
+  const b = req.body;
+  if (b && typeof b === 'object' && b.target && typeof b.target === 'object') {
+    const state = vault.load();
+    b.target = credentials.resolveTarget(b.target, state && !state.unreadable ? state : null);
+  }
+  next();
+});
 /**
  * Compress static assets. The MIB database alone is 2 MB of JSON fetched
  * on every page load and gzips to about 315 KB, so this is the single
