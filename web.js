@@ -2,7 +2,7 @@
 
 /**
  * The Express app and the middleware every request passes through, in
- * order: the request guard, JSON parsing, compression, static files, request
+ * order: the request guard, security headers, JSON parsing, compression, static files, request
  * logging, and the client log sink.
  */
 
@@ -13,11 +13,14 @@ const zlib = require('zlib');
 const crypto = require('crypto');
 const log = require('./logger');
 const guard = require('./request-guard');
+const securityHeaders = require('./security-headers');
 
 const app = express();
 // First, before any asset or route: refuse cross-site and DNS-rebinding
 // requests (see request-guard.js). LAN access is unaffected.
 app.use(guard.middleware(log));
+// Then the browser security headers, on every response (security-headers.js).
+app.use(securityHeaders.middleware());
 app.use(express.json());
 /**
  * Compress static assets. The MIB database alone is 2 MB of JSON fetched
