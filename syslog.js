@@ -14,6 +14,7 @@
 
 const dgram = require('dgram');
 const log = require('./logger');
+const { sourceLimiter } = require('./source-limit');
 
 const DEFAULT_PORT = 514;
 const PER_SOURCE_LIMIT = 2000;
@@ -110,7 +111,10 @@ function parseMessage(text, from) {
   return out;
 }
 
+const admit = sourceLimiter('syslog', bySource, log);
+
 function record(entry) {
+  if (!admit(entry.from)) return;
   received += 1;
   let bucket = bySource.get(entry.from);
   if (!bucket) {

@@ -14,6 +14,7 @@
 
 const snmp = require('net-snmp');
 const log = require('./logger');
+const { sourceLimiter } = require('./source-limit');
 
 const PER_SOURCE_LIMIT = 1000;
 const buffers = new Map();          // source ip -> { messages: [], total }
@@ -108,7 +109,10 @@ function shape(pdu, source, describe) {
   };
 }
 
+const admit = sourceLimiter('traps', buffers, log);
+
 function record(message) {
+  if (!admit(message.source)) return;
   const bucket = bucketFor(message.source);
   bucket.messages.push(message);
   bucket.total++;
