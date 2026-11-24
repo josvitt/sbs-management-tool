@@ -1,0 +1,7 @@
+node_modules/
+logs/
+state.enc
+state.enc.*
+.state-key
+history.json
+layouts.json

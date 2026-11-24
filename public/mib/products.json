@@ -1,0 +1,27 @@
+{
+  "_comment": "Product registry - the single source of truth for which switch lines the app knows, which MIB database each uses, how to recognise one from its model string, and which features the MIB proves it has. Read by the browser (MIB Explorer, product picker) and by the server (products.js: detection + gating). C1200 and C1300 share one MIB set (they are byte-identical); C1300X has its own, which adds OSPF/OSPFv3 and PTP and renumbers the 802.3bt PoE table. 'match' prefixes are tested most-specific-first, so C1300X wins over C1300.",
+  "default": "C1300",
+  "products": [
+    {
+      "line": "C1300X",
+      "label": "Catalyst 1300X",
+      "db": "mib/oid-db-c1300x.json",
+      "match": ["C1300X"],
+      "features": { "ospf": true, "ptp": true }
+    },
+    {
+      "line": "C1300",
+      "label": "Catalyst 1300",
+      "db": "mib/oid-db.json",
+      "match": ["C1300"],
+      "features": { "ospf": false, "ptp": false }
+    },
+    {
+      "line": "C1200",
+      "label": "Catalyst 1200",
+      "db": "mib/oid-db.json",
+      "match": ["C1200"],
+      "features": { "ospf": false, "ptp": false }
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+# systemd unit for SBS Management Tool (Linux equivalent of the Windows service).
+#
+# Install:
+#   1. Put the app somewhere stable, e.g. /opt/sbs-management-tool, and run
+#      `npm install` in it once.
+#   2. Edit WorkingDirectory and ExecStart below if your path or node differ
+#      (run `which node` to find node).
+#   3. sudo cp sbs-management-tool.service /etc/systemd/system/
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now sbs-management-tool
+#   4. Open http://localhost:3000 and add your switches there.
+#
+# Like the Windows service, this runs headless, starts on boot, restarts on
+# failure, and keeps collecting with no browser open. The vault key and state
+# live in the app directory and survive reboots (SERVER-STANDARD §7).
+
+[Unit]
+Description=SBS Management Tool (Cisco Catalyst 1200/1300 management over SNMP/SSH/serial)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sbs-management-tool
+ExecStart=/usr/bin/node /opt/sbs-management-tool/server.js
+Restart=on-failure
+RestartSec=3
+Environment=PORT=3000
+
+# The SNMP trap (162), syslog (514) and TFTP (69) receivers bind privileged
+# UDP ports. Pick ONE of these approaches:
+#
+#  (a) Run as root - simplest, broadest privilege (default if no User= is set).
+#
+#  (b) Run as a dedicated unprivileged user and grant just the bind capability:
+#        User=sbs
+#        AmbientCapabilities=CAP_NET_BIND_SERVICE
+#
+#  (c) Avoid privileged ports entirely by moving the receivers high (the switch
+#      must then be told to send traps/syslog to these ports):
+#        Environment=TRAP_PORT=1162
+#        Environment=SYSLOG_PORT=1514
+#        Environment=TFTP_PORT=6969
+
+[Install]
+WantedBy=multi-user.target

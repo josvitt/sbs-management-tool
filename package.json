@@ -1,0 +1,18 @@
+{
+  "name": "sbs-management-tool",
+  "version": "1.0.0",
+  "description": "SBS Management Tool: local web app (HTML frontend + Node.js backend) for managing Cisco Catalyst 1200/1300 switches over SNMP, SSH and serial.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.22.3",
+    "net-snmp": "^3.29.2",
+    "ssh2": "^1.17.0",
+    "ws": "^8.22.0"
+  },
+  "optionalDependencies": {
+    "serialport": "^13.0.0"
+  }
+}

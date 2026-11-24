@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SBS Management Tool</title>
+<link rel="stylesheet" href="vendor/xterm/xterm.css" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<div id="tab-bar">
+  <div id="tab-strip">
+    <button class="new-btn" id="new-switch" type="button" title="Add a switch" aria-label="Add a switch">+</button>
+  </div>
+  <div id="tab-bar-actions">
+    <button class="icon-btn" id="mib-toggle" type="button">MIB Explorer</button>
+    <button class="icon-btn" id="log-toggle" type="button">Log <span class="badge">!</span></button>
+  </div>
+</div>
+
+<main>
+  <div id="switches"></div>
+  <div id="topo-panel">
+    <div class="overlay-head">
+      <span class="overlay-title">Topology</span>
+      <span class="topo-stats">
+        <span>SWITCHES <b id="topo-n-sw">0</b></span>
+        <span>LINKS <b id="topo-n-link">0</b></span>
+        <span>ENDPOINTS <b id="topo-n-ep">0</b></span>
+        <span id="topo-n-warn-wrap">NOTES <b id="topo-n-warn">0</b></span>
+        <span id="topo-stale" style="display:none;color:var(--amber);">SNAPSHOT</span>
+      </span>
+      <span class="spacer"></span>
+    </div>
+    <div class="topo-body">
+      <aside class="topo-side">
+        <div class="topo-sect">
+          <div class="eyebrow">Show</div>
+          <label class="check-label" title="Phones, access points, cameras and hosts on access ports, including ones known only by a MAC address learned on a port. Off by default: on a full switch they outnumber everything else."><input type="checkbox" id="topo-f-endpoints" /><span>Endpoints</span></label>
+          <label class="check-label" title="Neighbours this app is not polling, drawn from what the polled switches report about them."><input type="checkbox" id="topo-f-external" checked /><span>Switches not polled</span></label>
+        </div>
+        <div class="topo-sect">
+          <div class="eyebrow">Focus VLAN</div>
+          <select id="topo-vlan"><option value="">All VLANs</option></select>
+        </div>
+        <div class="topo-sect">
+          <div class="eyebrow">Notes</div>
+          <div id="topo-warnings" class="topo-warnings"></div>
+        </div>
+        <div class="topo-sect">
+          <div class="eyebrow">Legend</div>
+          <div id="topo-legend" class="topo-legend"></div>
+        </div>
+      </aside>
+      <div class="topo-canvas">
+        <svg id="topo-svg"><g id="topo-viewport">
+          <g id="topo-edges"></g><g id="topo-edgelabels"></g><g id="topo-nodes"></g>
+        </g></svg>
+        <div class="topo-hint" id="topo-hint">Drag to arrange &middot; scroll to zoom &middot; click for detail</div>
+        <div class="topo-tools">
+          <button class="ct" id="topo-zin" type="button" title="Zoom in">+</button>
+          <button class="ct" id="topo-zout" type="button" title="Zoom out">&minus;</button>
+          <button class="ct" id="topo-fit" type="button" title="Fit to view">&#9707;</button>
+          <button class="ct" id="topo-relayout" type="button" title="Lay out again">&#8635;</button>
+          <button class="ct" id="topo-png" type="button" title="Save as PNG">&#10515;</button>
+        </div>
+      </div>
+      <section class="topo-inspector" id="topo-inspector"></section>
+    </div>
+    <div class="topo-tip" id="topo-tip"></div>
+  </div>
+
+  <div id="mib-panel">
+    <div class="overlay-head">
+      <span class="overlay-title">MIB Explorer</span>
+      <span class="mib-note"></span>
+      <span style="flex:1"></span>
+      <button class="icon-btn" id="mib-close" type="button">Close</button>
+    </div>
+    <div class="mib-search-bar">
+      <input type="search" id="mib-q" class="search-input" placeholder="Search name, OID or description&hellip;" />
+      <select id="mib-product" title="Which product's MIB set to browse"></select>
+      <select id="mib-access">
+        <option value="">Any access</option>
+        <option value="readable">Readable</option>
+        <option value="writable">Writable</option>
+      </select>
+      <select id="mib-shape">
+        <option value="">Any shape</option>
+        <option value="scalar">Scalars</option>
+        <option value="column">Table columns</option>
+        <option value="table">Tables</option>
+      </select>
+      <select id="mib-tree">
+        <option value="">Whole tree</option>
+        <option value="vendor">Catalyst 1200/1300 vendor</option>
+        <option value="standard">Standard MIB-II</option>
+      </select>
+    </div>
+    <div class="mib-main">
+      <div class="mib-results" id="mib-results"></div>
+      <div class="mib-detail" id="mib-detail"></div>
+    </div>
+  </div>
+
+  <div id="panel-dialog">
+    <div class="dialog-card">
+      <div class="eyebrow f-dlg-title">Add panel</div>
+
+      <div class="field">
+        <label>Panel type</label>
+        <select class="f-dlg-kind">
+          <option value="oid">Custom OID</option>
+        </select>
+      </div>
+
+      <div class="f-dlg-oid-fields">
+        <div class="field">
+          <label>OID or MIB name</label>
+          <div class="oid-wrap">
+            <input type="text" class="f-dlg-oid" placeholder="e.g. rlPethPsePortTable or 1.3.6.1.2.1.1.5.0"
+                   autocomplete="off" spellcheck="false" />
+            <div class="suggest f-dlg-suggest"></div>
+          </div>
+        </div>
+        <div class="row-split">
+          <div class="field">
+            <label>Operation</label>
+            <select class="f-dlg-op">
+              <option value="get">GET (single value)</option>
+              <option value="walk">WALK (table)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Title</label>
+            <input type="text" class="f-dlg-name" placeholder="defaults to the OID name" autocomplete="off" />
+          </div>
+        </div>
+      </div>
+
+      <div class="row-split">
+        <button type="button" class="btn f-dlg-ok">Add</button>
+        <button type="button" class="btn btn-amber f-dlg-cancel">Cancel</button>
+      </div>
+      <div class="form-error f-dlg-error"></div>
+    </div>
+  </div>
+
+  <div id="log-panel">
+    <div class="log-header">
+      <span>Error &amp; event log</span>
+      <button id="log-clear" type="button">Clear</button>
+      <button id="log-close" type="button">Close</button>
+    </div>
+    <div id="log-list"></div>
+  </div>
+</main>
+
+<!-- ==================== one switch ==================== -->
+<template id="switch-template">
+  <div class="switch-pane">
+
+    <div class="subtabs">
+      <div class="subtab active" data-view="a"><span class="sdot"></span><span class="sub-label">SNMP</span></div>
+      <div class="subtab" data-view="b"><span class="sdot"></span><span class="sub-label">SSH</span></div>
+    </div>
+
+    <!-- ---------- CREDENTIALS (setup, and later Settings) ---------- -->
+    <div class="subview" data-view="creds">
+      <div class="form-view v-creds">
+        <div class="card-form f-snmp-card">
+          <div class="eyebrow">SNMP credentials</div>
+          <form class="f-target-form">
+            <div class="row-split">
+              <div class="field" style="flex:3;">
+                <label>IP Address / Host</label>
+                <input type="text" class="f-host" placeholder="192.168.1.1" required autocomplete="off" />
+              </div>
+              <div class="field port">
+                <label>Port</label>
+                <input type="number" class="f-port" value="161" min="1" max="65535" required />
+              </div>
+            </div>
+            <div class="field">
+              <label>SNMP Version</label>
+              <select class="f-version">
+                <option value="2c" selected>v2c</option>
+                <option value="1">v1</option>
+                <option value="3">v3</option>
+              </select>
+            </div>
+            <div class="field community-field">
+              <label>Community String</label>
+              <input type="text" class="f-community" placeholder="public" autocomplete="off" />
+            </div>
+            <div class="v3-fields">
+              <div class="field"><label>Username</label><input type="text" class="f-v3-username" autocomplete="off" /></div>
+              <div class="field">
+                <label>Authentication Method</label>
+                <select class="f-v3-auth"></select>
+              </div>
+              <div class="field f-v3-authkey-field">
+                <label>Authentication Password</label>
+                <input type="password" class="f-v3-authkey" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label>Privacy Method</label>
+                <select class="f-v3-priv"></select>
+              </div>
+              <div class="field f-v3-privkey-field">
+                <label>Privacy Password</label>
+                <input type="password" class="f-v3-privkey" autocomplete="off" />
+              </div>
+              <div class="card-sub f-v3-level">Security level: noAuthNoPriv</div>
+            </div>
+            <button type="submit" class="btn btn-violet f-collect-btn">Save and collect</button>
+            <div class="form-error"></div>
+          </form>
+          <div class="form-hint"><span class="f-mib-status"></span></div>
+        </div>
+
+
+
+        <div class="card-form f-ssh-card">
+          <div class="eyebrow">SSH credentials</div>
+          <form class="f-ssh-form">
+            <div class="row-split">
+              <div class="field" style="flex:3;">
+                <label>Host</label>
+                <input type="text" class="f-ssh-host" required autocomplete="off" />
+              </div>
+              <div class="field port">
+                <label>Port</label>
+                <input type="number" class="f-ssh-port" value="22" min="1" max="65535" required />
+              </div>
+            </div>
+            <div class="field"><label>Username</label><input type="text" class="f-ssh-user" placeholder="cisco" required autocomplete="off" /></div>
+            <div class="field"><label>Password</label><input type="password" class="f-ssh-pass" placeholder="********" required autocomplete="off" /></div>
+            <button type="submit" class="btn f-ssh-connect">Save and connect</button>
+            <div class="form-error"></div>
+          </form>
+
+        </div>
+
+        <div class="card-form f-console-card">
+          <div class="eyebrow">Console (serial)</div>
+          <form class="f-console-form">
+            <div class="row-split">
+              <div class="field" style="flex:3;">
+                <label>Serial port</label>
+                <select class="f-com-port"><option value="">looking for ports&hellip;</option></select>
+              </div>
+              <div class="field port">
+                <label>Baud</label>
+                <select class="f-baud"></select>
+              </div>
+            </div>
+            <button type="submit" class="btn btn-blue f-console-connect">Open console</button>
+            <div class="form-error"></div>
+          </form>
+          <div class="form-hint"><span class="f-serial-status"></span></div>
+        </div>
+
+        <div class="card-form f-product-card">
+          <div class="eyebrow">Product</div>
+          <div class="form-hint"><span class="f-product-note"></span></div>
+          <div class="field">
+            <label>Product line</label>
+            <select class="f-product-select"></select>
+          </div>
+        </div>
+
+        <div class="card-form f-storage-card">
+          <div class="eyebrow">Saved session</div>
+          <div class="form-hint"><span class="f-storage-note"></span></div>
+          <button type="button" class="btn btn-danger f-forget">Forget this switch</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ---------- OVERVIEW (the dashboard) ---------- -->
+    <div class="subview" data-view="overview">
+      <div class="toolbar">
+        <span class="toolbar-status">not collected</span>
+        <button type="button" class="btn f-refresh-btn">Refresh now</button>
+        <button type="button" class="btn btn-blue f-add-panel" style="display:none;">+ Add panel</button>
+        <button type="button" class="btn btn-amber f-reset-layout">Reset layout</button>
+      </div>
+      <div class="scroll-body"><div class="panel-grid f-grid"></div></div>
+    </div>
+
+    <!-- ---------- NO SNMP YET, after connecting ---------- -->
+    <div class="subview" data-view="setup">
+      <div class="setup-wrap">
+        <div class="card-form setup-card">
+          <div class="eyebrow">Connected</div>
+          <div class="form-hint f-setup-intro"></div>
+          <div class="setup-choices">
+            <button type="button" class="btn f-setup-cli">Go to the CLI</button>
+            <button type="button" class="btn btn-blue f-setup-snmp">Enter SNMP credentials</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ---------- OVERLAYS ---------- -->
+    <!-- Not tabs: each is opened from the thing that produces it, and
+         closes back to where you were. -->
+    <div class="sw-overlay f-tech-overlay">
+      <div class="overlay-head">
+        <span class="overlay-title">show tech-support</span>
+        <span class="toolbar-status f-tech-status">no capture</span>
+        <input type="search" class="search-input f-tech-search" placeholder="Search the capture&hellip;" />
+        <button type="button" class="btn f-tech-save" disabled>Save capture</button>
+        <button type="button" class="icon-btn f-tech-close">Close</button>
+      </div>
+      <div class="tech-split">
+        <div class="tech-nav f-tech-nav"></div>
+        <div class="tech-pane f-tech-pane"></div>
+      </div>
+    </div>
+
+    <div class="sw-overlay f-cfg-overlay">
+      <div class="overlay-head">
+        <span class="overlay-title">Configuration</span>
+        <span class="toolbar-status f-cfg-status"></span>
+        <button type="button" class="icon-btn f-cfg-close">Close</button>
+      </div>
+      <div class="scroll-body f-cfg-body"></div>
+    </div>
+
+    <div class="sw-overlay f-graph-overlay">
+      <div class="overlay-head">
+        <span class="overlay-title f-graph-title">Metric</span>
+        <span class="graph-ranges">
+          <button type="button" class="tr" data-range="3600000">1 hour</button>
+          <button type="button" class="tr" data-range="21600000">6 hours</button>
+          <button type="button" class="tr active" data-range="86400000">24 hours</button>
+          <button type="button" class="tr" data-range="604800000">7 days</button>
+          <button type="button" class="tr" data-range="0">All</button>
+        </span>
+        <span class="toolbar-status f-graph-status"></span>
+        <span class="spacer"></span>
+        <button type="button" class="btn f-graph-save">Save CSV</button>
+        <button type="button" class="icon-btn f-graph-close">Close</button>
+      </div>
+      <div class="graph-body f-graph-body"></div>
+    </div>
+
+    <div class="sw-overlay f-term-overlay">
+      <div class="overlay-head">
+        <span class="overlay-title">CLI</span>
+        <span class="transport-switch">
+          <button type="button" class="tr f-tr-console" data-tr="console">Console</button>
+          <button type="button" class="tr f-tr-ssh" data-tr="ssh">SSH</button>
+        </span>
+        <span class="toolbar-status">not connected</span>
+        <button type="button" class="btn f-term-clear">Clear</button>
+        <button type="button" class="btn f-ssh-save" disabled>Save</button>
+        <button type="button" class="btn btn-danger f-disconnect">Disconnect</button>
+        <button type="button" class="btn btn-amber f-reconnect" style="display:none;">Connect again</button>
+        <button type="button" class="icon-btn f-term-close">Close</button>
+      </div>
+      <div class="term-body f-term"></div>
+    </div>
+
+  </div>
+</template>
+
+<script src="vendor/xterm/xterm.js"></script>
+<script src="vendor/xterm/xterm-addon-fit.js"></script>
+<script src="tech-parse.js"></script>
+<script src="topology.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

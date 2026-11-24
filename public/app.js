@@ -1,0 +1,13730 @@
+/* SBS Management Tool - client application.
+ *
+ * A switch is the unit of work: one tab per device, holding a Health page
+ * (the entry point) plus SNMP, SSH and tech-support views that all reuse
+ * the same host. Nothing is written to disk unless the user clicks Save.
+ */
+(function () {
+  'use strict';
+
+  // =================================================================
+  // Logging
+  // =================================================================
+  const logListEl = document.getElementById('log-list');
+  const logPanelEl = document.getElementById('log-panel');
+  const logToggleEl = document.getElementById('log-toggle');
+
+  function appLog(level, message, meta) {
+    const ts = new Date().toISOString();
+    const fn = level === 'error' ? console.error : (level === 'warn' ? console.warn : console.log);
+    fn('[' + ts + ']', message, meta || '');
+
+    const entry = document.createElement('div');
+    entry.className = 'log-entry ' + level;
+    const metaStr = meta ? (typeof meta === 'string' ? meta : safeStringify(meta)) : '';
+    entry.innerHTML =
+      '<span class="ts">' + ts.split('T')[1].replace('Z', '') + '</span>' +
+      '<span class="lvl">' + level.toUpperCase() + '</span>' +
+      '<span class="msg"></span>' + (metaStr ? '<span class="meta"></span>' : '');
+    entry.querySelector('.msg').textContent = message;
+    if (metaStr) entry.querySelector('.meta').textContent = metaStr;
+    logListEl.appendChild(entry);
+    logListEl.scrollTop = logListEl.scrollHeight;
+    if (level === 'error') logToggleEl.classList.add('has-errors');
+
+    try {
+      fetch('/api/log', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ level, message, meta: sanitizeMeta(meta) })
+      }).catch(() => {});
+    } catch (e) { /* ignore */ }
+  }
+  function safeStringify(o) { try { return JSON.stringify(o); } catch (e) { return String(o); } }
+  function sanitizeMeta(meta) {
+    if (!meta || typeof meta !== 'object') return meta;
+    const c = {};
+    for (const k in meta) c[k] = /pass(word)?|secret|token|community|authkey|privkey/i.test(k) ? '[REDACTED]' : meta[k];
+    return c;
+  }
+
+  window.addEventListener('error', (e) => appLog('error', e.message || 'Uncaught error',
+    { source: e.filename, line: e.lineno, col: e.colno, stack: e.error && e.error.stack }));
+  window.addEventListener('unhandledrejection', (e) => appLog('error', 'Unhandled promise rejection',
+    { reason: e.reason && e.reason.message ? e.reason.message : String(e.reason) }));
+
+  logToggleEl.addEventListener('click', () => logPanelEl.classList.toggle('open'));
+  document.getElementById('log-close').addEventListener('click', () => logPanelEl.classList.remove('open'));
+  document.getElementById('log-clear').addEventListener('click', () => {
+    logListEl.innerHTML = ''; logToggleEl.classList.remove('has-errors');
+  });
+
+  const librariesLoaded = () =>
+    typeof window.Terminal === 'function' && typeof window.FitAddon === 'object';
+  if (!librariesLoaded()) {
+    appLog('error', 'Terminal library failed to load from vendor/xterm/. SSH cannot start.');
+  }
+
+  // =================================================================
+  // Small helpers
+  // =================================================================
+  // Sentinel for "show the whole capture" in the section rail.
+  const FULL_OUTPUT = '__full__';
+
+  function el(tag, cls, text, title) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    if (title) e.title = title;
+    return e;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  // One consistent row-action button, used for Edit/Delete/etc. across every
+  // table so they look and behave identically. `variant`: '' (neutral),
+  // 'danger' (red on hover), or 'primary' (blue). onClick receives the event.
+  // ---- action feedback ----
+  // A completed action is shown, not announced: the button briefly morphs to a
+  // check with a success tint then settles back, and (optionally) the value
+  // that changed gets a soft highlight that fades. No "Applied" text.
+  // Put an inline spinner in an action button and disable it, remembering the
+  // resting label so flashButtonOk can restore it. Used for the "click -> spin
+  // while applying AND refreshing -> Done" flow, so the button only says Done
+  // once the UI actually reflects the change.
+  function buttonSpin(btn, label) {
+    if (!btn) return;
+    if (btn.dataset && !btn.dataset.restLabel) {
+      const t = (btn.textContent || '').trim();
+      if (t && !/\u2026$/.test(t)) btn.dataset.restLabel = t;
+    }
+    btn._okOriginal = (btn.dataset && btn.dataset.restLabel) || btn._okOriginal || (btn.textContent || '').trim();
+    clearTimeout(btn._okTimer);
+    btn.classList.remove('is-ok');
+    clear(btn);
+    btn.appendChild(el('span', 'spinner inline'));
+    if (label) btn.appendChild(document.createTextNode(label));
+    btn.disabled = true;
+  }
+
+  function flashButtonOk(btn, holdMs) {
+    if (!btn) return;
+    // The original label must be the button's RESTING label, not whatever it
+    // shows mid-action ("Applying…"). Prefer an explicit one stored at creation
+    // (dataset.restLabel), fall back to a previously captured one, else the
+    // current text - and never capture a transient "…" label.
+    let original = btn.dataset && btn.dataset.restLabel;
+    if (!original) original = btn._okOriginal;
+    if (!original) {
+      const t = btn.textContent || '';
+      original = /\u2026$/.test(t) ? t.replace(/\u2026$/, '').replace(/ing$/, '') : t;
+    }
+    btn._okOriginal = original;
+    clearTimeout(btn._okTimer);
+    clear(btn);
+    const check = el('span', 'ok-check', '\u2713');
+    btn.appendChild(check);
+    btn.appendChild(document.createTextNode('Done'));
+    btn.classList.add('is-ok');
+    btn.disabled = false;
+    clearTimeout(btn._okTimer);
+    btn._okTimer = setTimeout(() => {
+      btn.classList.remove('is-ok');
+      btn.textContent = original;
+    }, holdMs || 1400);
+  }
+
+  // ===========================================================================
+  // runButtonAction - the single, reusable flow for any action button.
+  // ---------------------------------------------------------------------------
+  // Every button that performs a change should go through this so the behavior
+  // is identical everywhere: the button shows a spinner the instant it is
+  // clicked, keeps spinning through BOTH the write AND the UI refresh, and only
+  // resolves once the interface actually reflects the change - never a premature
+  // "Done" ahead of the table catching up. The caller declares WHAT happens, not
+  // how to sequence it:
+  //
+  //   runButtonAction(btn, {
+  //     run:    () => apiPost('/api/port/admin', {...}),  // the write; returns a promise
+  //     settle: () => refreshOnePort(s, ifIndex),         // the UI refresh; returns a promise
+  //     ok:     (res) => true,          // optional: did it succeed? (default: res.ok && !res.body.error)
+  //     error:  (res) => 'message',     // optional: error text for a toast
+  //     find:   () => theNewButton,     // optional: locate the button after a reconcile replaced it
+  //     spinLabel, doneHoldMs, onDone   // optional extras
+  //   })
+  //
+  // After settle(), if the original button is still in the DOM it flashes Done;
+  // if a reconcile replaced it (e.g. a shut flips the label), find() locates the
+  // fresh button to flash, or - if there is none - the flipped button already on
+  // screen is itself the confirmation. On failure the button is restored and a
+  // toast shown. Returns the flow's promise.
+  // ===========================================================================
+  function runButtonAction(btn, spec) {
+    spec = spec || {};
+    const restLabel = (btn && btn.dataset && btn.dataset.restLabel) || (btn && (btn.textContent || '').trim()) || '';
+    const okOf = spec.ok || ((res) => res && res.ok && !(res.body && res.body.error));
+    const errOf = spec.error || ((res) => (res && res.body && res.body.error) || 'the switch rejected it');
+    const restore = () => { if (btn) { btn.disabled = false; btn.classList.remove('is-ok'); clear(btn); btn.appendChild(document.createTextNode(restLabel)); } };
+
+    if (btn) buttonSpin(btn, spec.spinLabel);
+    // Floor the spinner's visible duration so a near-instant write (a single fast
+    // SET resolves in ~15ms) still shows a perceptible "working" moment rather
+    // than flashing straight to Done. Only the SUCCESS path waits this out - a
+    // failure should surface immediately. Overridable (or 0 to disable) via
+    // spec.minSpinMs; default 250ms is enough to register without feeling slow.
+    const spinStart = Date.now();
+    const minSpinMs = spec.minSpinMs != null ? spec.minSpinMs : 250;
+    const waitMinSpin = () => {
+      const remaining = minSpinMs - (Date.now() - spinStart);
+      return remaining > 0 ? new Promise((r) => setTimeout(r, remaining)) : Promise.resolve();
+    };
+    let runPromise;
+    try { runPromise = Promise.resolve(spec.run ? spec.run() : null); }
+    catch (e) { runPromise = Promise.reject(e); }
+
+    return runPromise.then((res) => {
+      if (!okOf(res)) {
+        toast((spec.failLabel || restLabel || 'Action') + ' failed: ' + errOf(res), 'error');
+        restore();
+        return res;
+      }
+      if (spec.onApplied) { try { spec.onApplied(res); } catch (e) { /* non-fatal */ } }
+      // Wait for the UI to actually reflect the change before confirming, and for
+      // the minimum spin floor, so the spinner is always perceptible.
+      const settle = spec.settle ? Promise.resolve(spec.settle(res)) : Promise.resolve();
+      return Promise.all([settle, waitMinSpin()]).then(() => {
+        let target = btn && btn.isConnected ? btn : null;
+        if (!target && spec.find) { try { target = spec.find(); } catch (e) { target = null; } }
+        if (target) flashButtonOk(target, spec.doneHoldMs);
+        // else: a reconcile replaced the button with its new correct label, which
+        // is itself the confirmation.
+        if (spec.onDone) { try { spec.onDone(res); } catch (e) { /* non-fatal */ } }
+        return res;
+      });
+    }).catch((e) => {
+      toast((spec.failLabel || restLabel || 'Action') + ' failed: ' + (e && e.message ? e.message : e), 'error');
+      restore();
+      throw e;
+    });
+  }
+
+  // Highlight an element (a table cell, a display value) so a change is felt as
+  // it lands. Re-triggers cleanly if called again.
+  // Briefly highlight a changed value so the user sees the change land. Works
+  // on a display cell (dd/span) or a form control (input/select) - the CSS
+  // targets both. Pass the control itself; a null/undefined node is ignored.
+  function flashValue(node) {
+    if (!node) return;
+    node.classList.remove('value-changed');
+    // Force reflow so the animation restarts even on a repeated change.
+    void node.offsetWidth;
+    node.classList.add('value-changed');
+    setTimeout(() => { node.classList.remove('value-changed'); }, 1700);
+  }
+  // Highlight several controls at once (convenience for an editor's apply).
+  function flashValues(nodes) { for (const n of nodes || []) flashValue(n); }
+
+  // ---- apply/save button lifecycle ----
+  // The scaffold every editor shares: an actions row holding a primary (blue)
+  // Apply/Save button, and a message element for inline status/errors. Returns
+  // { actions, apply, msg } so the caller wires its own handler and placement.
+  // opts: { extra: [buttons beside the primary], msgClass: 'port-detail-msg' }.
+  function applyActions(label, opts) {
+    opts = opts || {};
+    const actions = el('div', 'snmp-form-actions');
+    const apply = el('button', 'btn btn-small btn-blue', label || 'Apply'); apply.type = 'button';
+    const msg = el('div', opts.msgClass || 'port-detail-msg');
+    actions.appendChild(apply);
+    for (const b of opts.extra || []) if (b) actions.appendChild(b);
+    return { actions, apply, msg };
+  }
+
+  // ---- shared building blocks (used by every module) ----
+  // A labelled form field: <div class="FIELDCLASS"><label>..</label><control></div>.
+  // The default class suits the form grids; pass another for a different layout.
+  function field(labelText, control, cls) {
+    const f = el('div', cls || 'snmp-field');
+    f.appendChild(el('label', '', labelText));
+    f.appendChild(control);
+    return f;
+  }
+
+  // One place that knows how to POST JSON to the local API and parse the reply.
+  // Returns { ok, body } (never throws on HTTP status); throws only on a network
+  // failure. Every module should go through this instead of hand-rolling fetch.
+  async function apiPost(path, payload) {
+    const r = await fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {})
+    });
+    let body = null;
+    try { body = await r.json(); } catch (e) { body = null; }
+    return { ok: r.ok, status: r.status, body };
+  }
+
+  // The single SNMP write path. Accepts one varbind ({oid,type,value|valueHex})
+  // or an array of them, sends them in ONE atomic SET PDU, and THROWS on any
+  // failure (so callers can try/catch uniformly). Returns the parsed body on
+  // success. Every write in the app should use this rather than its own fetch.
+  async function snmpSet(s, varbinds) {
+    const vbs = Array.isArray(varbinds) ? varbinds : [varbinds];
+    const { ok, status, body } = await apiPost('/api/snmp/set', { target: s.target, varbinds: vbs });
+    if (!ok || (body && body.error)) throw new Error((body && body.error) || ('HTTP ' + status));
+    return body;
+  }
+  // Non-throwing variant for callers that want to branch on the result instead
+  // of catching - returns { ok, body } like the raw fetch used to.
+  async function snmpSetResult(s, varbinds) {
+    const vbs = Array.isArray(varbinds) ? varbinds : [varbinds];
+    return apiPost('/api/snmp/set', { target: s.target, varbinds: vbs });
+  }
+
+  // Delete a conceptual-row by its RowStatus column OID (already including the
+  // row index). Some Cisco tables reject a direct destroy(6) with CommitFailed
+  // when the row is active - they require it be moved to notInService(2) first.
+  // This tries the direct destroy, and on failure falls back to
+  // notInService -> destroy, so one helper handles both kinds of table. Returns
+  // the { ok, body } of the set that settled it.
+  async function rowStatusDelete(s, statusOid) {
+    const DESTROY = 6, NOT_IN_SERVICE = 2;
+    const first = await snmpSetResult(s, { oid: statusOid, type: 'Integer', value: DESTROY });
+    if (first && first.ok && !(first.body && first.body.error)) return first;
+    // Fallback: suspend the row, then destroy it.
+    const suspend = await snmpSetResult(s, { oid: statusOid, type: 'Integer', value: NOT_IN_SERVICE });
+    if (!suspend || !suspend.ok || (suspend.body && suspend.body.error)) return first; // report the original failure
+    return snmpSetResult(s, { oid: statusOid, type: 'Integer', value: DESTROY });
+  }
+
+  // Interpret a snmpSetResult into the common { ok, error } shape many callers
+  // return, checking both the top-level error and any per-varbind error.
+  function interpretSet(res) {
+    const { ok, status, body } = res;
+    if (!ok || (body && body.error)) return { ok: false, error: (body && body.error) || ('HTTP ' + status) };
+    const bad = (body && (body.results || []).find((v) => v.error)) || null;
+    return bad ? { ok: false, error: bad.error } : { ok: true };
+  }
+
+  // The single SNMP read path for ad-hoc GETs. Returns the array of result
+  // varbinds (possibly empty); throws on network/HTTP/agent error.
+  async function snmpGet(s, oids) {
+    const { ok, status, body } = await apiPost('/api/snmp/get', { target: s.target, oids: Array.isArray(oids) ? oids : [oids] });
+    if (!ok || (body && body.error)) throw new Error((body && body.error) || ('HTTP ' + status));
+    return (body && body.results) || [];
+  }
+
+  // A brief floating notice for actions whose result isn't shown in place -
+  // e.g. a table-row delete that failed (the row is still there and the user
+  // needs to know why). kind: 'error' | 'ok'. Auto-dismisses; stacks at the
+  // bottom-right; clicking it dismisses early.
+  function toast(message, kind) {
+    let host = document.querySelector('.toast-host');
+    if (!host) { host = el('div', 'toast-host'); document.body.appendChild(host); }
+    const t = el('div', 'toast toast-' + (kind === 'ok' ? 'ok' : 'error'));
+    t.appendChild(el('span', 'toast-icon', kind === 'ok' ? '\u2713' : '\u26A0'));
+    t.appendChild(el('span', 'toast-msg', message));
+    host.appendChild(t);
+    void t.offsetWidth; t.classList.add('toast-in');
+    const dismiss = () => { t.classList.remove('toast-in'); setTimeout(() => t.remove(), 250); };
+    t.addEventListener('click', dismiss);
+    setTimeout(dismiss, kind === 'ok' ? 2600 : 5000);
+  }
+
+  // Two-tap confirmation, modern and inline: the first click arms the button
+  // (it morphs to "Confirm?" with a warning tint); a second click within a few
+  // seconds runs the action; otherwise it disarms and returns to its label.
+  // Wrap a click handler with this to require confirmation. `danger` tints red.
+  function withConfirm(btn, run, opts) {
+    opts = opts || {};
+    const label = opts.label || btn.textContent;
+    const confirmText = opts.confirmText || 'Confirm?';
+    const danger = opts.danger;
+    btn._armed = false;
+    const disarm = () => {
+      btn._armed = false;
+      clearTimeout(btn._armTimer);
+      btn.classList.remove('is-arming', 'is-arming-danger');
+      btn.textContent = label;
+    };
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!btn._armed) {
+        btn._armed = true;
+        btn.classList.add(danger ? 'is-arming-danger' : 'is-arming');
+        btn.textContent = confirmText;
+        clearTimeout(btn._armTimer);
+        btn._armTimer = setTimeout(disarm, 3500);
+        return;
+      }
+      disarm();
+      run(e);
+    });
+    return btn;
+  }
+
+  function actBtn(label, onClick, variant, title) {
+    const b = el('button', 'tbl-act-btn' + (variant ? ' ' + variant : ''), label);
+    b.type = 'button';
+    if (title) b.title = title;
+    b.addEventListener('click', (e) => { e.stopPropagation(); onClick(e); });
+    return b;
+  }
+  // A table action button that requires a second tap to confirm (for deletes
+  // and other destructive actions). First tap -> "Confirm?"; second runs it.
+  function actBtnConfirm(label, onClick, variant, title) {
+    const b = el('button', 'tbl-act-btn' + (variant ? ' ' + variant : ''), label);
+    b.type = 'button';
+    if (title) b.title = title;
+    withConfirm(b, (e) => onClick(e), { label, danger: variant === 'danger' });
+    return b;
+  }
+  // A right-aligned group of row-action buttons, as a DOM node for a table cell.
+  function actGroup(buttons) {
+    const g = el('span', 'tbl-acts');
+    for (const b of buttons) if (b) g.appendChild(b);
+    return g;
+  }
+
+  // One consistent "+ Add ..." control, placed bottom-left below the table it
+  // relates to. Returns the wrapping div (so callers can also render the inline
+  // add form into it). onClick receives the host div.
+  // ---- static MAC entries (dot1qStaticUnicastTable) ----
+  // Index: { dot1qFdbId (VLAN), MAC (6 bytes), ReceivePort (0 = any) }.
+  // Create: Status = permanent(3) + AllowedToGoTo (bridge-port bitmap).
+  // Delete: Status = invalid(2). The standard learned FDB (dot1qTpFdbStatus)
+  // is read-only, so only static entries can be removed via SNMP; a learned
+  // entry is cleared by bouncing its port or letting it age out.
+  const STATIC_MAC = {
+    allowedToGoTo: '1.3.6.1.2.1.17.7.1.3.1.1.3',  // dot1qStaticUnicastAllowedToGoTo (PortList)
+    status:        '1.3.6.1.2.1.17.7.1.3.1.1.4'   // dot1qStaticUnicastStatus (INTEGER)
+  };
+  // "AA:BB:CC:DD:EE:FF" -> "170.187.204.221.238.255" (dotted decimal, for the OID index).
+  function macToOidBytes(mac) {
+    const parts = String(mac).trim().split(/[:\-.]/).map((h) => parseInt(h, 16));
+    if (parts.length !== 6 || parts.some((n) => !Number.isFinite(n) || n < 0 || n > 255)) return null;
+    return parts.join('.');
+  }
+  // Validate a MAC address string.
+  function isValidMac(mac) { return /^([0-9a-f]{2}[:\-]){5}[0-9a-f]{2}$/i.test(String(mac).trim()); }
+
+  // Voice VLAN Telephony OUI prefix = OCTET STRING(SIZE 3). On this firmware the
+  // index is the 3 raw bytes with NO length prefix (e.g. OUI AA-BB-CC indexes as
+  // "170.187.204", not "3.170.187.204" - verified against a switch-created row).
+  // Encode "AA-BB-CC" (3 hex octets) to "b1.b2.b3", or null if invalid; decode back.
+  function ouiToOidIndex(oui) {
+    const parts = String(oui || '').trim().split(/[:\-.\s]+/).map((h) => parseInt(h, 16));
+    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n) || n < 0 || n > 255)) return null;
+    return parts.join('.');
+  }
+  function ouiIndexToStr(idx) {
+    const p = String(idx || '').split('.').map((n) => parseInt(n, 10));
+    if (p.length !== 3 || p.some((n) => !Number.isFinite(n) || n < 0 || n > 255)) return String(idx || '');
+    return p.map((n) => n.toString(16).padStart(2, '0')).join('-');
+  }
+
+  // Build the static-table index suffix: <vlan>.<mac bytes>.<receivePort>.
+  function staticMacSuffix(vlan, mac, receivePort) {
+    const mb = macToOidBytes(mac);
+    if (mb === null) return null;
+    return vlan + '.' + mb + '.' + (receivePort || 0);
+  }
+
+  // Create a static MAC entry. Verified against a real entry the switch made:
+  // the PORT is encoded in the index as the ReceivePort (last arc), and the only
+  // thing written is Status = permanent(3). dot1qStaticUnicastAllowedToGoTo is
+  // NOT set (writing it was the WrongValue). Index: <vlan>.<mac bytes>.<port>.
+  async function addStaticMac(s, vlan, mac, bridgePort, status) {
+    const suffix = staticMacSuffix(vlan, mac, parseInt(bridgePort, 10));
+    if (!suffix) throw new Error('invalid MAC address');
+    // status: permanent(3) default, deleteOnReset(4), deleteOnTimeout(5),
+    // secure(1). Any of these creates the entry; writing invalid(2) deletes.
+    const st = [1, 3, 4, 5].indexOf(parseInt(status, 10)) !== -1 ? parseInt(status, 10) : 3;
+    await snmpSet(s, { oid: STATIC_MAC.status + '.' + suffix, type: 'Integer', value: st });
+  }
+  // Delete a static MAC entry: Status = invalid(2) at the same index (the port
+  // is part of the index, so the caller passes the entry's receive port).
+  async function deleteStaticMac(s, vlan, mac, bridgePort) {
+    const suffix = staticMacSuffix(vlan, mac, parseInt(bridgePort, 10) || 0);
+    if (!suffix) throw new Error('invalid MAC address');
+    await snmpSet(s, { oid: STATIC_MAC.status + '.' + suffix, type: 'Integer', value: 2 }); // invalid = delete
+  }
+
+  // Walk the static-MAC tables so we can see exactly how THIS switch stores a
+  // static entry: which table, the index format, and the port-bitmap width.
+  // Create one static entry on the switch (CLI/web), then run this.
+
+  // The add-static-MAC form (popout): MAC, VLAN, and the port to map it to.
+  function openStaticMacForm(s, h) {
+    // Port options: each bridge port -> its interface name. AllowedToGoTo is a
+    // bridge-port bitmap, so we offer bridge-port numbers labelled by name.
+    const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : c.display));
+    const nameByIfx = new Map();
+    for (const r of (h.interfaces || [])) { const nm = String(cv(r.rlifPresentName) || '').trim(); if (nm) nameByIfx.set(String(r.index), nm); }
+    const portOpts = [];
+    for (const r of (h.bridgePorts || [])) {
+      const bp = String(r.index);
+      const ifx = String(cv(r.dot1dBasePortIfIndex) || '');
+      const nm = nameByIfx.get(ifx);
+      if (nm && !/^\d+$/.test(nm)) portOpts.push({ label: nm + ' (bridge ' + bp + ')', value: bp, sort: nm });
+    }
+    portOpts.sort((a, b) => String(a.sort).localeCompare(String(b.sort), undefined, { numeric: true }));
+    const vlanOpts = (h.vlans || []).map((v) => ({ label: 'VLAN ' + v.index, value: String(v.index) }));
+
+    const tabs = [{ label: 'Add static MAC', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const sec = formSection('Static MAC entry');
+      const macIn = el('input'); macIn.type = 'text'; macIn.placeholder = 'AA:BB:CC:DD:EE:FF'; macIn.maxLength = 17;
+      sec.body.appendChild(field('MAC address', macIn));
+      const vlanSel = vlanOpts.length ? selectInput(vlanOpts, vlanOpts[0].value) : (() => { const i = el('input'); i.type = 'number'; i.min = '1'; i.max = '4094'; i.value = '1'; return i; })();
+      sec.body.appendChild(field('VLAN', vlanSel));
+      const portSel = portOpts.length ? selectInput(portOpts, portOpts[0].value) : (() => { const i = el('input'); i.type = 'number'; i.min = '1'; i.placeholder = 'bridge port #'; return i; })();
+      sec.body.appendChild(field('Port', portSel));
+      // Status matches the switch's own dialog (dot1qStaticUnicastStatus):
+      // Permanent(3), Delete on reset(4), Delete on timeout(5), Secure(1=other).
+      const statusSel = selectInput([
+        { label: 'Permanent', value: '3' },
+        { label: 'Delete on reset', value: '4' },
+        { label: 'Delete on timeout', value: '5' },
+        { label: 'Secure', value: '1' }
+      ], '3');
+      sec.body.appendChild(field('Status', statusSel));
+      form.appendChild(sec.sec);
+      const { actions, apply } = applyActions('Add static MAC');
+      const msg = el('div', 'port-detail-msg');
+      withConfirm(apply, (ev) => {
+        clear(msg);
+        const mac = (macIn.value || '').trim();
+        if (!isValidMac(mac)) { msg.appendChild(el('div', 'sw-err', 'Enter a MAC like AA:BB:CC:DD:EE:FF.')); return; }
+        const vlan = parseInt(vlanSel.value, 10);
+        const bp = parseInt(portSel.value, 10);
+        if (!Number.isFinite(vlan) || !Number.isFinite(bp)) { msg.appendChild(el('div', 'sw-err', 'Choose a VLAN and port.')); return; }
+        const status = parseInt(statusSel.value, 10) || 3;
+        runButtonAction(ev.currentTarget, {
+          failLabel: 'Add static MAC', spinLabel: 'Adding\u2026',
+          run: () => addStaticMac(s, vlan, mac, bp, status).then(() => ({ ok: true }), (e) => ({ ok: false, error: e.message })),
+          ok: (r) => r && r.ok,
+          error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not add static MAC \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+          onApplied: () => { const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove(); markConfigDirty(s); s._macFetchedAt = 0; },
+          settle: () => new Promise((res) => setTimeout(() => refreshTables(s, ['macTable']).then(res, res), 800))
+        });
+      });
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+    } }];
+    openTabbedPopout(s, 'Add static MAC', tabs, []);
+  }
+
+  function addControl(label, onClick) {
+    const host = el('div', 'tbl-add');
+    const btn = el('button', 'tbl-add-btn', '+ ' + label); btn.type = 'button';
+    btn.addEventListener('click', () => onClick(host, btn));
+    host.appendChild(btn);
+    return host;
+  }
+
+  function stripAnsi(str) {
+    if (!str) return str;
+    let out = str;
+    out = out.replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '');
+    out = out.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '');
+    out = out.replace(/\x1b./g, '').replace(/\x1b/g, '').replace(/\x07/g, '');
+    let r = '';
+    for (const ch of out) { if (ch === '\b') r = r.slice(0, -1); else r += ch; }
+    return r;
+  }
+
+  function padTo(s, w) { s = String(s == null ? '' : s); return s + ' '.repeat(Math.max(0, w - s.length)); }
+  function textTable(headers, rows) {
+    const widths = headers.map((h, i) =>
+      Math.max(String(h).length, ...rows.map((r) => String(r[i] == null ? '' : r[i]).length)));
+    const line = (cells) => cells.map((c, i) => padTo(c, widths[i])).join('  ').replace(/\s+$/, '');
+    const out = [line(headers), widths.map((w) => '-'.repeat(w)).join('  ')];
+    for (const r of rows) out.push(line(r));
+    return out.join('\n') + '\n';
+  }
+  function fmtBytes(n) {
+    const v = Number(n);
+    if (!Number.isFinite(v)) return String(n);
+    if (v >= 1048576) return (v / 1048576).toFixed(1) + ' MB';
+    if (v >= 1024) return (v / 1024).toFixed(0) + ' KB';
+    return v + ' B';
+  }
+  function download(name, text) {
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+  const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
+  const safeHost = (h) => String(h || 'switch').replace(/[^a-zA-Z0-9.\-]/g, '_');
+
+  // Build a CISCOSB VlanListN 128-byte bitmap for one 1024-VLAN block.
+  // Encoding (confirmed against live switch data): byte 0 holds VLANs 1-8,
+  // MSB = lowest VLAN. blockBase is 1, 1025, 2049 or 3073.
+  function buildVlanListBlock(vlans, blockBase) {
+    const buf = new Uint8Array(128);
+    for (const v of vlans) {
+      if (v < blockBase || v > blockBase + 1023) continue;
+      const bit = v - blockBase;              // 0-based within the block
+      buf[Math.floor(bit / 8)] |= (0x80 >> (bit % 8));
+    }
+    let hex = '';
+    for (const b of buf) hex += b.toString(16).padStart(2, '0');
+    return hex;
+  }
+  const vlanListBlocks = (vlans) => ([
+    ['vlanTrunkModeList1to1024', buildVlanListBlock(vlans, 1)],
+    ['vlanTrunkModeList1025to2048', buildVlanListBlock(vlans, 1025)],
+    ['vlanTrunkModeList2049to3072', buildVlanListBlock(vlans, 2049)],
+    ['vlanTrunkModeList3073to4094', buildVlanListBlock(vlans, 3073)]
+  ]);
+
+  // =================================================================
+  // MIB database (shared by every switch)
+  // =================================================================
+  // The active MIB view. Which product's database it holds can change (the MIB
+  // Explorer's product picker), so loadMib takes a product line; each product's
+  // DB is fetched once and cached. C1200 and C1300 share one DB; C1300X has its
+  // own (it adds OSPF/PTP and renumbers some OIDs), so the set MUST match the
+  // product being browsed - see products.json.
+  const MIB = { entries: [], byOid: new Map(), loaded: false, error: null, product: null };
+  const MIB_DB_CACHE = {};      // db file -> Promise<{entries, byOid}>
+  let PRODUCTS = null, PRODUCTS_LOADING = null;
+
+  function loadProducts() {
+    if (PRODUCTS) return Promise.resolve(PRODUCTS);
+    if (PRODUCTS_LOADING) return PRODUCTS_LOADING;
+    PRODUCTS_LOADING = fetch('mib/products.json')
+      .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then((d) => { PRODUCTS = d; return d; })
+      .catch(() => {
+        PRODUCTS = { default: 'C1300', products: [
+          { line: 'C1300', label: 'Catalyst 1200/1300', db: 'mib/oid-db.json', match: ['C1300'], features: {} }] };
+        return PRODUCTS;
+      });
+    return PRODUCTS_LOADING;
+  }
+  function productByLine(line) { return (PRODUCTS && PRODUCTS.products.find((p) => p.line === line)) || null; }
+
+  // Identify the product line from any model-bearing strings, most-specific
+  // match first (so "C1300X-..." matches C1300X, not C1300). Mirrors
+  // products.js on the server.
+  function detectProductLine(strings) {
+    if (!PRODUCTS) return null;
+    const hay = (Array.isArray(strings) ? strings : [strings]).filter(Boolean).map((s) => String(s).toUpperCase());
+    let best = null, bestLen = -1;
+    for (const p of PRODUCTS.products) for (const m of (p.match || [])) {
+      const n = String(m).toUpperCase();
+      if (hay.some((h) => h.indexOf(n) >= 0) && n.length > bestLen) { best = p; bestLen = n.length; }
+    }
+    return best;
+  }
+
+  function buildMibFrom(data) {
+    const entries = [], byOid = new Map(), enums = data.enums || [];
+    for (const row of data.entries) {
+      const e = { name: row[0], oid: row[1], access: row[2], syntax: row[3],
+        description: row[4], mib: row[5], units: row[7] || '' };
+      if (typeof row[6] === 'number' && row[6] >= 0 && enums[row[6]]) e.enum = enums[row[6]];
+      entries.push(e);
+      if (!byOid.has(e.oid)) byOid.set(e.oid, e.name);
+    }
+    return { entries, byOid };
+  }
+  function dbFor(dbFile) {
+    if (!MIB_DB_CACHE[dbFile]) {
+      MIB_DB_CACHE[dbFile] = fetch(dbFile)
+        .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(buildMibFrom);
+    }
+    return MIB_DB_CACHE[dbFile];
+  }
+
+  // Load (and make active) the MIB set for a product line. No argument loads the
+  // default line's DB, which keeps every existing caller (autocomplete, status)
+  // working against the C1200/C1300 set.
+  function loadMib(line) {
+    return loadProducts().then(() => {
+      const prod = productByLine(line) || productByLine(PRODUCTS.default) || PRODUCTS.products[0];
+      return dbFor(prod.db).then((built) => {
+        MIB.entries = built.entries; MIB.byOid = built.byOid;
+        MIB.loaded = true; MIB.product = prod.line; MIB.error = null;
+        appLog('info', 'MIB database loaded', { product: prod.line, oids: MIB.entries.length });
+        return MIB;
+      }).catch((e) => {
+        MIB.error = e.message;
+        appLog('error', 'Could not load MIB database', { message: e.message, product: prod.line });
+        return MIB;
+      });
+    });
+  }
+
+  // The product line in effect for a switch: a manual override wins, else the
+  // server-detected line, else the registry default. This is what drives the
+  // Explorer default and feature gating.
+  function effectiveProductLine(s) {
+    if (s && s.productOverride) return s.productOverride;
+    if (s && s.product && s.product.line) return s.product.line;
+    return (PRODUCTS && PRODUCTS.default) || null;
+  }
+  function effectiveProduct(s) { return productByLine(effectiveProductLine(s)); }
+
+  // The MIB half of the hybrid gate: a built-in panel that declares a required
+  // `mibFeature` (e.g. OSPF/PTP) is shown only on a product whose MIB proves
+  // that feature. A panel with no `mibFeature` is common to all three lines and
+  // always passes here - its runtime data presence is handled by `needs`
+  // (the runtime half). See SERVER-STANDARD.md Products section.
+  function productSupports(s, def) {
+    if (!def || !def.mibFeature) return true;
+    const prod = effectiveProduct(s);
+    const feats = (prod && prod.features) || (s && s.product && s.product.features) || {};
+    return !!feats[def.mibFeature];
+  }
+
+  function describeOid(oid) {
+    if (!MIB.loaded || !oid) return null;
+    const parts = String(oid).replace(/^\./, '').split('.');
+    const suffix = [];
+    while (parts.length) {
+      const name = MIB.byOid.get(parts.join('.'));
+      if (name) return suffix.length ? name + '.' + suffix.slice().reverse().join('.') : name;
+      suffix.push(parts.pop());
+    }
+    return null;
+  }
+
+  /**
+   * True when an object is a column of a table rather than a scalar. Name
+   * alone is not enough: rlifPresentName looks like a scalar but lives
+   * under rlifPresentEntry, so appending ".0" and doing a GET returns
+   * nothing. Check whether the parent OID is a table entry instead.
+   */
+  function isColumnar(entry) {
+    if (!entry || !entry.oid) return false;
+    if (/Table$|Entry$/.test(entry.name)) return true;
+    const parent = String(entry.oid).split('.').slice(0, -1).join('.');
+    const parentName = MIB.byOid.get(parent);
+    return !!(parentName && /Entry$/.test(parentName));
+  }
+
+  function searchMib(query, limit) {
+    limit = limit || 40;
+    if (!MIB.loaded) return [];
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    const prefix = [], contains = [];
+    for (const e of MIB.entries) {
+      const ln = e.name.toLowerCase();
+      const i = ln.indexOf(q);
+      if (i === 0) { prefix.push(e); if (prefix.length >= limit) break; }
+      else if (i > 0) { if (contains.length < limit) contains.push(e); }
+      else if (e.oid.indexOf(q) === 0) { if (contains.length < limit) contains.push(e); }
+    }
+    return prefix.concat(contains).slice(0, limit);
+  }
+
+  // Interface presets use rlifPresentTable rather than ifTable: per the
+  // 4.1.9.85 release notes it reports only interfaces physically present
+  // in the stack, whereas ifTable also lists ones that do not exist.
+  const PRESETS_STD = [
+    { label: 'System Info', op: 'get', oids: ['sysDescr.0', 'sysName.0', 'sysUpTime.0', 'sysContact.0', 'sysLocation.0', 'sysObjectID.0'] },
+    { label: 'VLANs', op: 'walk', oid: 'dot1qVlanStaticName' },
+    { label: 'Inventory', op: 'walk', oid: 'entPhysicalName' },
+    { label: 'PoE (standard)', op: 'walk', oid: 'pethPsePortTable' },
+    { label: 'ifTable (all, incl. absent)', op: 'walk', oid: 'ifDescr' }
+  ];
+  const PRESETS_VENDOR = [
+    { label: 'Interfaces (present only)', op: 'walk', oid: 'rlifPresentName' },
+    { label: 'Interface Status (present)', op: 'walk', oid: 'rlifPresentOperStatus' },
+    { label: 'Interface Detail (present)', op: 'walk', oid: 'rlifPresentTable' },
+    { label: 'CPU Utilisation', op: 'get', oids: ['rlCpuUtilDuringLastSecond.0', 'rlCpuUtilDuringLastMinute.0', 'rlCpuUtilDuringLast5Minutes.0'] },
+    { label: 'PoE Ports', op: 'walk', oid: 'rlPethPsePortTable' },
+    { label: 'Fans', op: 'walk', oid: 'rlEnvMonFanStatusTable' },
+    { label: 'Power Supplies', op: 'walk', oid: 'rlEnvMonSupplyStatusTable' },
+    { label: 'Stack Units', op: 'walk', oid: 'rlPhdStackTable' }
+  ];
+
+  // =================================================================
+  // Switch tabs
+  // =================================================================
+  const tabStrip = document.getElementById('tab-strip');
+  const switchesEl = document.getElementById('switches');
+  const switchTpl = document.getElementById('switch-template');
+  const switches = new Map();
+  let activeId = null;
+  let counter = 0;
+  let dragTab = null;
+
+  const newSwitchBtn = document.getElementById('new-switch');
+
+  /**
+   * The topology is a tab, not a button in the corner.
+   *
+   * It is a view of the estate in the same way each other tab is a view of
+   * one switch, so it belongs in the same row and is navigated the same
+   * way. It has no close control: closing it would mean nothing, since
+   * there is nothing behind it to close.
+   *
+   * It appears once there is a switch to draw and stays for as long as any
+   * switch exists, open or merely put away.
+   */
+  const topoTab = el('div', 'tab topo-tab');
+  topoTab.appendChild(el('span', 'tab-dot'));
+  topoTab.appendChild(el('span', 'tab-label', 'Topology'));
+  topoTab.title = 'Every switch you have added, and everything they can see';
+  topoTab.style.display = 'none';
+  tabStrip.insertBefore(topoTab, tabStrip.firstChild);
+  topoTab.addEventListener('click', () => selectTopology());
+
+  let topoTabActive = false;
+
+  /** Show the topology, as a tab rather than as an overlay over a switch. */
+  function selectTopology() {
+    const prev = activeId && switches.get(activeId);
+    if (prev) { prev.tab.classList.remove('active'); prev.pane.classList.remove('active'); }
+    document.getElementById('mib-panel').classList.remove('open');
+    topoTab.classList.add('active');
+    topoTabActive = true;
+    topoPanel.classList.add('open');
+    paintTopoButton();
+    topoRebuild(true);
+  }
+
+  /** Leaving the topology for a switch tab. */
+  function leaveTopology() {
+    if (!topoTabActive) return;
+    topoTabActive = false;
+    topoTab.classList.remove('active');
+    topoPanel.classList.remove('open');
+  }
+  newSwitchBtn.addEventListener('click', () => createSwitch());
+
+  /**
+   * Drag a tab to reorder it. Uses the HTML drag API rather than pointer
+   * maths: the browser handles the drag image and autoscroll, and a tab is
+   * a small target that a hand-rolled version tends to get wrong.
+   *
+   * Only the tab strip's DOM order changes -- nothing else depends on it,
+   * because each switch owns its own pane.
+   */
+  function initTabReorder(tab) {
+    tab.draggable = true;
+
+    tab.addEventListener('dragstart', (e) => {
+      dragTab = tab;
+      tab.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      // Firefox will not start a drag without payload.
+      try { e.dataTransfer.setData('text/plain', ''); } catch (err) {}
+    });
+
+    tab.addEventListener('dragend', () => {
+      tab.classList.remove('dragging');
+      for (const t of tabStrip.querySelectorAll('.tab')) {
+        t.classList.remove('drop-before', 'drop-after');
+      }
+      dragTab = null;
+    });
+
+    tab.addEventListener('dragover', (e) => {
+      if (!dragTab || dragTab === tab) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      // Which half of the tab is the pointer over?
+      const box = tab.getBoundingClientRect();
+      const before = (e.clientX - box.left) < box.width / 2;
+      tab.classList.toggle('drop-before', before);
+      tab.classList.toggle('drop-after', !before);
+    });
+
+    tab.addEventListener('dragleave', () => {
+      tab.classList.remove('drop-before', 'drop-after');
+    });
+
+    tab.addEventListener('drop', (e) => {
+      if (!dragTab || dragTab === tab) return;
+      e.preventDefault();
+      const box = tab.getBoundingClientRect();
+      const before = (e.clientX - box.left) < box.width / 2;
+      tabStrip.insertBefore(dragTab, before ? tab : tab.nextSibling);
+      tab.classList.remove('drop-before', 'drop-after');
+      appLog('info', 'Switch tabs reordered', {
+        order: Array.from(tabStrip.querySelectorAll('.tab-label')).map((l) => l.textContent)
+      });
+    });
+  }
+
+  /**
+   * A tab, wired up. Built here rather than inline because a switch that
+   * was closed and is being reopened needs exactly the same one back, and
+   * two copies of this would drift apart.
+   */
+  function buildTab(id, text) {
+    const tab = el('div', 'tab');
+    tab.appendChild(el('span', 'tab-dot'));
+    const label = el('span', 'tab-label', text || 'New switch');
+    tab.appendChild(label);
+    const close = el('span', 'tab-close', '\u00d7', 'Close');
+    tab.appendChild(close);
+    // The add button lives inside the strip, so tabs go before it.
+    tabStrip.insertBefore(tab, newSwitchBtn);
+    initTabReorder(tab);
+
+    tab.addEventListener('click', (e) => {
+      if (e.target === close) return;
+      // A switch's tab is its front door: always land on the dashboard,
+      // even if the last thing you did was stare at a terminal.
+      const sw = switches.get(id);
+      selectSwitch(id);
+      if (sw) showView(sw, sw.subMode === 'ready' ? 'overview' : 'creds');
+    });
+    close.addEventListener('click', (e) => { e.stopPropagation(); closeSwitch(id); });
+    return { tab, label, close };
+  }
+
+  function createSwitch() {
+    counter += 1;
+    const id = 'sw' + counter;
+
+    const { tab, label } = buildTab(id, 'New switch');
+
+    const pane = switchTpl.content.cloneNode(true).querySelector('.switch-pane');
+    switchesEl.appendChild(pane);
+
+    const q = (sel) => pane.querySelector(sel);
+    const s = {
+      id, tab, pane, label, dot: tab.querySelector('.tab-dot'),
+      host: null, target: null, view: 'health',
+      subtabs: Array.from(pane.querySelectorAll('.subtab')),
+      views: {
+        creds: pane.querySelector('.subview[data-view="creds"]'),
+        setup: pane.querySelector('.subview[data-view="setup"]'),
+        overview: pane.querySelector('.subview[data-view="overview"]')
+      },
+      setupIntro: q('.f-setup-intro'),
+      // Overlays: opened by the action that produces them, not by a tab.
+      techOverlay: q('.f-tech-overlay'), cfgOverlay: q('.f-cfg-overlay'), termOverlay: q('.f-term-overlay'),
+      snmpCard: q('.f-snmp-card'), sshCard: q('.f-ssh-card'),
+      // dashboard
+      targetForm: q('.f-target-form'),
+      healthStatus: q('.subview[data-view="overview"] .toolbar-status'),
+      autoInput: q('.f-auto'), autoLabelEl: q('.f-auto-label'), autoLeft: null,
+      intervalInput: q('.f-interval'), refreshBtn: q('.f-refresh-btn'),
+      addPanelBtn: q('.f-add-panel'), resetLayoutBtn: q('.f-reset-layout'),
+      grid: q('.f-grid'), panels: [], interval: 30,
+
+      mibStatus: q('.f-mib-status'), targetError: q('.f-target-form .form-error'),
+      hostInput: q('.f-host'), portInput: q('.f-port'), versionInput: q('.f-version'),
+      communityField: q('.community-field'), communityInput: q('.f-community'),
+      v3Fields: q('.v3-fields'), v3User: q('.f-v3-username'), v3Level: q('.f-v3-level'),
+      v3Auth: q('.f-v3-auth'), v3AuthKey: q('.f-v3-authkey'), v3AuthKeyField: q('.f-v3-authkey-field'),
+      v3Priv: q('.f-v3-priv'), v3PrivKey: q('.f-v3-privkey'), v3PrivKeyField: q('.f-v3-privkey-field'),
+      collectBtn: q('.f-collect-btn'),
+      health: null, autoTimer: null,
+      // snmp
+      // ssh
+      sshForm: q('.f-ssh-form'),
+      storageCard: q('.f-storage-card'), storageNote: q('.f-storage-note'),
+      forgetBtn: q('.f-forget'),
+      productCard: q('.f-product-card'), productNote: q('.f-product-note'),
+      productSelect: q('.f-product-select'),
+      consoleCard: q('.f-console-card'), consoleForm: q('.f-console-form'),
+      consoleConnect: q('.f-console-connect'),
+      comPort: q('.f-com-port'), baud: q('.f-baud'),
+      serialStatus: q('.f-serial-status'), consoleError: q('.f-console-form .form-error'),
+      sshHost: q('.f-ssh-host'), sshPort: q('.f-ssh-port'),
+      sshUser: q('.f-ssh-user'), sshPass: q('.f-ssh-pass'),
+      sshConnect: q('.f-ssh-connect'), sshError: q('.f-ssh-form .form-error'),
+      sshStatus: q('.f-term-overlay .toolbar-status'), termClear: q('.f-term-clear'),
+      sshSave: q('.f-ssh-save'), disconnectBtn: q('.f-disconnect'), reconnectBtn: q('.f-reconnect'),
+      trConsole: q('.f-tr-console'), trSsh: q('.f-tr-ssh'),
+      termEl: q('.f-term'), ws: null, term: null, fit: null, sshBuffer: '', capturing: false,
+      // Configuration has its own page: fetching files is a task you go
+      // and do, not a panel to scroll past on the dashboard.
+      cfgBody: q('.f-cfg-body'),
+      cfgStatus: q('.f-cfg-status'), cfgClose: q('.f-cfg-close'),
+      // tech-support: the raw capture gets its own page too.
+      techNav: q('.f-tech-nav'), techPane: q('.f-tech-pane'),
+      techSearch: q('.f-tech-search'), techSave: q('.f-tech-save'),
+      techStatus: q('.f-tech-status'),
+      techSection: FULL_OUTPUT,
+      techPending: false,
+      tech: null, techRaw: '', techNote: ''
+    };
+
+    for (const st of s.subtabs) st.addEventListener('click', () => onSubtabClick(s, st));
+    setSubtabMode(s, 'setup');
+
+    for (const [btn, view] of [['.f-tech-close', null], ['.f-cfg-close', null],
+      ['.f-term-close', null], ['.f-graph-close', null]]) {
+      q(btn).addEventListener('click', () => closeOverlays(s));
+    }
+
+    switches.set(id, s);
+    initHealth(s);
+    initSsh(s);
+    initConsole(s);
+    initGraph(s);
+    initSetup(s);
+    initStorageCard(s);
+    initProductCard(s);
+    initTech(s);
+    selectSwitch(id);
+    tab.scrollIntoView({ inline: 'end', block: 'nearest' });
+    // The MIB database is 2 MB of JSON, and nothing on the dashboard needs
+    // it: names are resolved server-side. Only the MIB Explorer and the
+    // add-panel autocomplete do, so it is fetched when one of those is
+    // first opened rather than on the way to a page that will not use it.
+    updateMibStatus(s);
+    return s;
+  }
+
+  function selectSwitch(id) {
+    if (id !== activeId) setTimeout(saveState, 0);
+    leaveTopology();
+    const prev = activeId && switches.get(activeId);
+    if (prev) { prev.tab.classList.remove('active'); prev.pane.classList.remove('active'); }
+    activeId = id;
+    const s = switches.get(id);
+    s.tab.classList.add('active');
+    s.pane.classList.add('active');
+    if (s.view === 'ssh' && s.fit) fitTerm(s);
+  }
+
+  /**
+   * Closing a tab puts the switch away; it does not throw it out.
+   *
+   * A tab is a place to look at a switch, not the switch itself. Tearing
+   * down the SSH session, the trap stream and everything collected -- and
+   * then rebuilding all of it when the same switch is opened again a
+   * minute later -- costs the operator time for nothing. So the pane is
+   * detached and kept whole: the session stays up, the layout and the
+   * history survive, and reopening is instant.
+   *
+   * The topology is where a put-away switch is found again, which is why
+   * closing the last tab lands there.
+   */
+  const closedSwitches = new Map();
+
+  function closeSwitch(id) {
+    const s = switches.get(id);
+    if (!s) return;
+    appLog('info', 'Switch tab closed; session kept', { host: s.host, live: !!s.ws });
+
+    // Auto-refresh stops -- nobody is watching, and a collection is not
+    // free. The probe keeps going, because it is one small packet every
+    // thirty seconds and it is what keeps the topology honest.
+    if (s.autoTimer) { clearInterval(s.autoTimer); s.autoTimer = null; }
+
+    s.tab.remove();
+    // Detached rather than destroyed: putting this element back is what
+    // makes reopening free.
+    if (s.pane.parentNode) s.pane.parentNode.removeChild(s.pane);
+    switches.delete(id);
+    closedSwitches.set(id, s);
+
+    saveState();
+    paintTopoButton();
+    if (activeId !== id) return;
+
+    activeId = null;
+    const rest = Array.from(switches.keys());
+    if (rest.length) { selectSwitch(rest[rest.length - 1]); return; }
+
+    /**
+     * The last tab has gone. A blank credentials form is a strange place
+     * to be left after deliberately closing everything, so the topology
+     * takes over: it is the view that is about the network rather than
+     * about one switch, and it is where the closed ones are waiting.
+     */
+    // Land on the topology: the closed switches are still there and this
+    // is where they are found. No blank tab is created -- the "+" says
+    // how to add one, and an empty credentials form pretending to be a
+    // switch is just something else to close.
+    paintTopoButton();
+    selectTopology();
+  }
+
+  /** Put a closed switch back on screen, exactly as it was left. */
+  function reopenSwitch(id) {
+    const s = closedSwitches.get(id);
+    if (!s) return false;
+    closedSwitches.delete(id);
+    switches.set(id, s);
+
+    // The tab was removed, so it is built again; the pane is the original.
+    const rebuilt = buildTab(id, s.host || 'switch');
+    s.tab = rebuilt.tab;
+    s.label = rebuilt.label;
+    s.dot = rebuilt.tab.querySelector('.tab-dot');
+    if (s.host) setTab(s, s.reachable === false ? 'err' : 'ok', s.host);
+    switchesEl.appendChild(s.pane);
+    selectSwitch(id);
+
+    // Auto-refresh resumes if it was on, and the terminal needs a nudge:
+    // xterm cannot size itself while detached.
+    if (s.autoInput && s.autoInput.checked) startAuto(s);
+    if (s.term && s.fit) setTimeout(() => fitTerm(s), 60);
+    appLog('info', 'Switch tab reopened', { host: s.host, live: !!s.ws });
+    saveState();
+    paintTopoButton();
+    return true;
+  }
+
+  /** Everything the topology should draw: on screen or merely put away. */
+  function allSwitches() {
+    return Array.from(switches.values()).concat(Array.from(closedSwitches.values()));
+  }
+
+  /** Really finish with a switch: the session goes too. */
+  function forgetSwitch(id) {
+    const s = switches.get(id) || closedSwitches.get(id);
+    if (!s) return;
+    if (s.autoTimer) clearInterval(s.autoTimer);
+    stopProbe(s);
+    stopSyslogStream(s);
+    stopTrapStream(s);
+    if (s.ws) { try { s.ws.send(JSON.stringify({ type: 'disconnect' })); s.ws.close(); } catch (e) {} }
+    if (s.term) { try { s.term.dispose(); } catch (e) {} }
+    switches.delete(id);
+    closedSwitches.delete(id);
+    if (s.tab.parentNode) s.tab.remove();
+    if (s.pane.parentNode) s.pane.remove();
+    saveState();
+    paintTopoButton();
+  }
+
+  /**
+   * The two sub-tabs mean different things before and after a switch
+   * exists. Before: pick which credentials you are adding. After: the
+   * dashboard, or the settings that produced it. Same two slots either
+   * way, so nothing jumps around when a switch comes up.
+   */
+  function setSubtabMode(s, mode) {
+    s.subMode = mode;
+    const spec = mode === 'ready'
+      ? [{ view: 'overview', label: 'Overview' },
+         { view: 'overview', label: 'CLI', action: 'cli' },
+         { view: 'creds', label: 'Settings' }]
+      : [{ view: 'creds', label: 'SNMP', card: 'snmp' }, { view: 'creds', label: 'SSH', card: 'ssh' },
+         { view: 'creds', label: 'Console', card: 'console' }];
+    // The strip holds however many the mode needs: two once a switch is
+    // up, three while choosing which credentials to add.
+    const strip = s.subtabs[0].parentNode;
+    while (s.subtabs.length < spec.length) {
+      const extra = s.subtabs[0].cloneNode(true);
+      strip.appendChild(extra);
+      s.subtabs.push(extra);
+      extra.addEventListener('click', () => onSubtabClick(s, extra));
+    }
+    s.subtabs.forEach((tab, i) => {
+      const def = spec[i];
+      tab.style.display = def ? '' : 'none';
+      // A hidden tab must also stop being active, or it keeps matching
+      // the current view and two tabs light up at once.
+      if (!def) { tab.classList.remove('active'); return; }
+      tab.dataset.view = def.view;
+      tab.dataset.card = def.card || '';
+      tab.dataset.action = def.action || '';
+      tab.querySelector('.sub-label').textContent = def.label;
+      tab.title = def.action === 'cli' ? cliTooltip(s) : '';
+      tab.classList.remove('disabled');
+    });
+    // During setup each tab shows one credential card; in settings, both.
+    if (mode === 'ready') {
+      s.snmpCard.style.display = '';
+      s.sshCard.style.display = '';
+      s.consoleCard.style.display = '';
+      // Only meaningful once there is a switch to have saved.
+      if (s.storageCard) s.storageCard.style.display = '';
+      if (s.productCard) s.productCard.style.display = '';
+      showView(s, 'overview');
+    } else {
+      selectCredCard(s, 'snmp');
+      showView(s, 'creds');
+    }
+  }
+
+  function onSubtabClick(s, st) {
+    if (st.classList.contains('disabled')) return;
+    if (s.subMode !== 'ready') {
+      s.credCard = st.dataset.card || 'snmp';
+      selectCredCard(s, s.credCard);
+      showView(s, 'creds');
+      return;
+    }
+    // The CLI tab is an action, not a view: open the command line (console or
+    // SSH, whichever is set up) and leave the current view in place.
+    if (st.dataset.action === 'cli') { openCli(s); return; }
+    showView(s, st.dataset.view);
+  }
+
+  function selectCredCard(s, which) {
+    if (s.storageCard) s.storageCard.style.display = 'none';
+    if (s.productCard) s.productCard.style.display = 'none';
+    if (s.subMode === 'ready') return;
+    s.snmpCard.style.display = which === 'snmp' ? '' : 'none';
+    s.sshCard.style.display = which === 'ssh' ? '' : 'none';
+    s.consoleCard.style.display = which === 'console' ? '' : 'none';
+    s.subtabs.forEach((t) => t.classList.toggle('active', (t.dataset.card || 'snmp') === which));
+  }
+
+  function openOverlay(s, which) {
+    // An overlay always sits over the dashboard. Entering credentials is a
+    // detour on the way to one of these, and closing it should put you
+    // back on the switch rather than on the form you passed through.
+    if (s.subMode === 'ready' && s.view !== 'overview') showView(s, 'overview');
+    for (const key of ['techOverlay', 'cfgOverlay', 'termOverlay', 'graphOverlay']) {
+      if (s[key]) s[key].classList.toggle('open', key === which);
+    }
+    if (which === 'termOverlay' && s.fit) setTimeout(() => fitTerm(s), 30);
+  }
+
+  function closeOverlays(s) {
+    for (const key of ['techOverlay', 'cfgOverlay', 'termOverlay', 'graphOverlay']) {
+      if (s[key]) s[key].classList.remove('open');
+    }
+  }
+
+  function showView(s, view) {
+    s.view = view;
+    closeOverlays(s);
+    for (const st of s.subtabs) {
+      const hidden = st.style.display === 'none';
+      // An action tab (e.g. CLI) triggers something and owns no view, so it
+      // never shows as the selected tab.
+      st.classList.toggle('active', !hidden && !st.dataset.action && st.dataset.view === view &&
+        (s.subMode === 'ready' || (st.dataset.card || 'snmp') === (s.credCard || 'snmp')));
+    }
+    for (const k in s.views) s.views[k].classList.toggle('active', k === view);
+  }
+
+  /** Sub-tabs that depend on data are disabled until that data exists. */
+  function enableSubtab(s, view, on) {
+    const st = s.subtabs.find((x) => x.dataset.view === view);
+    if (st) st.classList.toggle('disabled', !on);
+  }
+
+  /** Tint the whole sub-tab, so the Health tab carries the same verdict
+   *  colour as the Overview badge rather than only a small dot. */
+  function subTint(s, view, sev) {
+    const st = s.subtabs.find((x) => x.dataset.view === view);
+    if (!st) return;
+    st.classList.remove('sev-ok', 'sev-warning', 'sev-critical', 'sev-info');
+    if (sev) st.classList.add('sev-' + sev);
+  }
+
+  /**
+   * The dot, the sub-tab tint and the switch tab all say the same thing,
+   * from the same value: the worst severity among the findings. Keeping
+   * them in one function is what stops the dot claiming "fine" while the
+   * badge says otherwise.
+   */
+  function applyHealthState(s, sev) {
+    const dot = sev === 'critical' ? 'err' : (sev === 'warning' ? 'busy' : 'on');
+    subDot(s, 'overview', dot);
+    subTint(s, 'overview', sev === 'info' ? 'ok' : sev);
+    setTab(s, sev === 'info' ? 'ok' : sev);
+  }
+
+  function subDot(s, view, cls) {
+    const st = s.subtabs.find((x) => x.dataset.view === view);
+    if (st) st.querySelector('.sdot').className = 'sdot' + (cls ? ' ' + cls : '');
+  }
+
+  function setTab(s, sev, label) {
+    s.dot.className = 'tab-dot' + (sev ? ' ' + sev : '');
+    if (!label) return;
+    // The switch's own name wins over the address it was reached at, and
+    // the address moves to the tooltip where it is still available.
+    const name = s.sysName || label;
+    s.label.textContent = name;
+    s.label.title = s.sysName && s.sysName !== label ? s.sysName + '  \u00b7  ' + label : label;
+  }
+
+  function showErr(node, text) {
+    node.textContent = text || '';
+    node.style.display = text ? 'block' : 'none';
+  }
+
+  function updateMibStatus(s) {
+    if (!s.mibStatus) return;
+    // The MIB database is loaded lazily (only when the MIB Explorer or add-panel
+    // autocomplete needs it), so "loading" must reflect an ACTUAL in-flight
+    // load - MIB.loading being set - not merely "not loaded yet". Showing
+    // "loading" before anything has been requested made the message appear to
+    // hang forever.
+    if (MIB.error) s.mibStatus.textContent = 'MIB database failed to load: ' + MIB.error;
+    else if (MIB.loaded) s.mibStatus.textContent = '';
+    else if (MIB.loading) s.mibStatus.textContent = 'loading MIB database\u2026';
+    else s.mibStatus.textContent = '';   // not requested yet: nothing to report
+  }
+
+  window.addEventListener('resize', () => {
+    const a = activeId && switches.get(activeId);
+    if (a && a.fit) fitTerm(a);
+  });
+
+  // =================================================================
+  // Health
+  // =================================================================
+  // =================================================================
+  // Health dashboard
+  // =================================================================
+  // The page is a grid of panels. Some are built in (they render whatever
+  // SNMP health and a tech-support capture provide); the rest are added by
+  // the user and hold any OID they care about. Panels can be reordered,
+  // resized, removed and individually excluded from auto-refresh, and the
+  // arrangement is stored per host on the server so it survives a reload.
+
+  const GRID_COLS = 12;
+  // A full health walk is ~44 tables; at 30s it was a periodic spike every half
+  // minute. 60s halves that while keeping the dashboard current - the user can
+  // still choose a shorter interval if they want faster updates.
+  const DEFAULT_INTERVAL = 300;
+
+  // Built-in panels. `needs` decides whether a panel has anything to show:
+  // a switch with no capture should not display an empty VLAN panel.
+  const BUILTIN = [
+    { key: 'summary', title: 'Details', span: 12, h: 0, needs: () => true },
+    { key: 'metrics', title: 'Key metrics', span: 12, h: 0, needs: () => true },
+    { key: 'events', title: 'Events', span: 12, h: 400, needs: () => true },
+    { key: 'hardware', title: 'Hardware', span: 12, h: 0,
+      needs: (s) => s.health && (s.health.psus.length || s.health.fans.length ||
+        s.health.sensors.length || s.health.stack.length || s.health.inventory.length) },
+    { key: 'interfaces', title: 'Interfaces', span: 12, h: 320,
+      needs: (s) => s.health && (s.health.interfaces.length || s.health.poePorts.length) },
+    { key: 'vlans', title: 'VLANs', span: 12, h: 0,
+      needs: (s) => s.health && s.health.vlans.length },
+    // Neighbours before spanning tree: what is attached is the more
+    // common question, and it is the context for reading the topology.
+    { key: 'auth', title: 'Sessions & authentication', span: 12, h: 300, needs: () => true },
+    { key: 'connected', title: 'Connected devices', span: 12, h: 320,
+      needs: (s) => s.health && (s.health.cdp.length || s.health.lldp.length || s.health.macTable.length) },
+    { key: 'stp', title: 'Spanning tree', span: 12, h: 420,
+      needs: (s) => s.health && (s.health.stpPorts.length || s.health.stpMode !== 'unknown') },
+    // SNMP configuration: the write side. Unlike the others this is
+    // interactive and does not come from the health poll, so it loads
+    // lazily (on expand / its own refresh) and is always offered.
+    { key: 'snmpcfg', title: 'SNMP configuration', span: 12, h: 0, needs: () => true },
+    // Standard IP ACLs: interactive write module (list / add / delete rules,
+    // bind to interfaces), loaded on demand like snmpcfg.
+    { key: 'acl', title: 'IP access lists', span: 12, h: 0, needs: () => true },
+    // IP Routing & DNS: global L3 status, the forwarding table, static routes,
+    // DNS client status, nameservers and static host mappings. Interactive
+    // (editable), always offered.
+    { key: 'routing', title: 'IP routing & DNS', span: 12, h: 0, needs: () => true },
+    // Packet capture: interactive like snmpcfg, driven by writes rather than
+    // the health poll, so always offered and loaded on demand.
+    { key: 'capture', title: 'Packet capture', span: 12, h: 0, needs: () => true },
+    // Flash files: its own interactive module (list / download / delete).
+    { key: 'flash', title: 'Flash files', span: 12, h: 0, needs: () => true }
+  ];
+
+  const builtinDef = (key) => BUILTIN.find((b) => b.key === key);
+
+  // Which health tables each panel actually shows, so one panel can be
+  // refreshed without re-walking the whole switch. Overview, metrics and
+  // findings describe the box as a whole, so they need a full collection.
+  const PANEL_TABLES = {
+    hardware: ['psus', 'fans', 'sensors', 'stack', 'inventory'],
+    interfaces: ['interfaces', 'poe', 'poePorts', 'vlans', 'vlansCurrent', 'portModes', 'portL2L3', 'dot1xPortCfg', 'dot1xHostMode', 'dot1xPortMethod',
+      'lagCreation', 'lagAgg', 'lagMembers', 'lagPortKey'],
+    // macTable is NOT listed here: it is large and fetched on demand (once per
+    // visit, time-guarded) by the connected panel's own render, so a panel
+    // refresh must not walk it again.
+    connected: ['cdp', 'lldp', 'bridgePorts'],
+    auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked',
+      'radiusServers', 'radiusStats', 'tacacsServers',
+      'dot1xHostStats', 'dot1xHostDiag', 'dot1xHostSession', 'vlans'],
+    stp: ['stpPorts', 'stpExtPorts', 'mstpPorts', 'mstpInstances',
+          'pvstPorts', 'pvstVlans', 'pvstInconsistencies', 'stpxInconsistencies']
+  };
+
+  // Open on the two panels that answer "how is this switch", and leave the
+  // rest folded. Everything is one click away, and a page that opens with
+  // eight tables is a page nobody reads.
+  const OPEN_BY_DEFAULT = new Set(['summary', 'metrics']);
+
+  function defaultPanels() {
+    return BUILTIN.map((b) => ({
+      id: 'b:' + b.key, kind: 'builtin', key: b.key,
+      title: b.title, span: b.span, h: b.h,
+      collapsed: !OPEN_BY_DEFAULT.has(b.key)
+    }));
+  }
+
+  function initHealth(s) {
+    s.panels = defaultPanels();
+    s.interval = DEFAULT_INTERVAL;
+
+    fillV3Menus(s);
+    s.versionInput.addEventListener('change', () => updateVersionFields(s));
+    s.v3Auth.addEventListener('change', () => updateVersionFields(s));
+    s.v3Priv.addEventListener('change', () => updateVersionFields(s));
+    updateVersionFields(s);
+    s.targetForm.addEventListener('submit', (e) => { e.preventDefault(); startHealth(s); });
+    s.refreshBtn.addEventListener('click', () => refreshAll(s));
+    s.addPanelBtn.addEventListener('click', () => openPanelDialog(s));
+    s.resetLayoutBtn.addEventListener('click', () => {
+      if (!s.host) return;
+      s.panels = defaultPanels();
+      s.renderedIds = null;
+      s.interval = DEFAULT_INTERVAL;
+      if (s.intervalInput) s.intervalInput.value = DEFAULT_INTERVAL;
+      fetch('/api/layout/' + encodeURIComponent(s.host), { method: 'DELETE' }).catch(() => {});
+      appLog('info', 'Dashboard layout reset', { host: s.host });
+      renderSwitch(s);
+    });
+
+    // The auto-refresh checkbox and interval input were removed from the UI;
+    // their listeners are wired only when the elements exist, so the dashboard
+    // keeps working as a manual Refresh-now view.
+    if (s.intervalInput) {
+      s.intervalInput.addEventListener('change', () => {
+        const v = Math.max(5, Math.min(3600, parseInt(s.intervalInput.value, 10) || DEFAULT_INTERVAL));
+        s.interval = v;
+        s.intervalInput.value = v;
+        saveLayout(s);
+        // This now sets the SERVER's poll rate for this switch, so persist it to
+        // state (the collector reloads per-switch intervals on a state change).
+        saveState();
+        if (s.autoTimer) startAuto(s);
+      });
+    }
+    if (s.autoInput) {
+      s.autoInput.addEventListener('change', () => {
+        if (s.autoInput.checked) startAuto(s); else stopAuto(s);
+      });
+    }
+  }
+
+  // ---------- auto-refresh ----------
+  /**
+   * A one-second tick rather than one long timer, so the label can count
+   * down: a silent gap gives no clue whether the page is live or stale.
+   */
+  function startAuto(s) {
+    stopAuto(s, true);
+    s.autoLeft = s.interval;
+    paintAuto(s);
+    s.autoTimer = setInterval(() => {
+      s.autoLeft -= 1;
+      if (s.autoLeft <= 0) { s.autoLeft = s.interval; refreshAll(s, true); }
+      paintAuto(s);
+    }, 1000);
+    appLog('info', 'Auto-refresh on', {
+      host: s.host, everySeconds: s.interval, panels: s.panels.length
+    });
+  }
+  function stopAuto(s, keepChecked) {
+    if (s.autoTimer) { clearInterval(s.autoTimer); s.autoTimer = null; }
+    if (s.autoInput && !keepChecked) s.autoInput.checked = false;
+    s.autoLeft = null;
+    paintAuto(s);
+  }
+  function paintAuto(s) {
+    if (!s.autoLabelEl) return;
+    s.autoLabelEl.textContent = s.autoLeft == null ? 'Auto-refresh' : 'Refreshing in ' + s.autoLeft + 's';
+  }
+
+  /**
+   * Refresh only what the user has asked for. `auto` restricts the work to
+   * panels still marked for refresh -- the point of the per-panel toggle is
+   * that an expensive walk can be left out of the loop while still being
+   * refreshable by hand.
+   */
+  /** Refresh everything. Individual panels have their own button. */
+  function refreshAll(s, auto) {
+    if (!s.target) return;
+    if (s.autoTimer) startAuto(s);   // any refresh restarts the countdown
+    if (s.panels.some((p) => p.kind === 'builtin')) {
+      // The browser no longer walks the switch on a timer - the server-side
+      // collector owns periodic collection (SERVER-STANDARD §0). A periodic
+      // refresh (auto) re-reads the server's latest snapshot; a manual Refresh
+      // (auto=false) nudges the server to poll now, then shows the result.
+      // Writes and on-demand loads still read the switch live - that is
+      // user-initiated and must reflect at once (MODULE-STANDARD §B6).
+      syncView(s, { nudge: !auto });
+    }
+    for (const p of s.panels) if (p.kind === 'oid') loadPanelData(s, p);
+  }
+
+  // The v3 menus come from the server so the two cannot drift apart: the
+  // list of protocols the UI offers is exactly the list it can build a
+  // session for.
+  const V3_MENUS = { loaded: null };
+  function loadV3Menus() {
+    if (!V3_MENUS.loaded) {
+      V3_MENUS.loaded = fetch('/api/snmp/v3-options')
+        .then((r) => r.json())
+        .catch(() => ({
+          auth: [{ value: 'none', label: 'None' }, { value: 'sha', label: 'SHA' }],
+          priv: [{ value: 'none', label: 'None' }, { value: 'aes128', label: 'AES-128' }]
+        }));
+    }
+    return V3_MENUS.loaded;
+  }
+
+  function fillV3Menus(s) {
+    loadV3Menus().then((menus) => {
+      const fill = (sel, items, preferred) => {
+        clear(sel);
+        for (const it of items) {
+          const o = document.createElement('option');
+          o.value = it.value; o.textContent = it.label;
+          sel.appendChild(o);
+        }
+        if (items.some((i) => i.value === preferred)) sel.value = preferred;
+      };
+      fill(s.v3Auth, menus.auth, 'sha');
+      fill(s.v3Priv, menus.priv, 'aes128');
+      updateVersionFields(s);
+    });
+  }
+
+  function updateVersionFields(s) {
+    const v3 = s.versionInput.value === '3';
+    s.communityField.classList.toggle('hidden', v3);
+    s.v3Fields.classList.toggle('visible', v3);
+    if (!v3) return;
+
+    // Password fields only matter when the matching method is in use, and
+    // the security level follows from the two choices rather than being a
+    // third thing to get wrong.
+    const auth = s.v3Auth.value !== 'none';
+    const priv = s.v3Priv.value !== 'none';
+    s.v3AuthKeyField.style.display = auth ? '' : 'none';
+    s.v3PrivKeyField.style.display = priv ? '' : 'none';
+
+    if (priv && !auth) {
+      s.v3Level.textContent = 'Privacy requires authentication \u2014 choose an authentication method, or set privacy to None.';
+      s.v3Level.style.color = 'var(--red)';
+    } else {
+      s.v3Level.textContent = 'Security level: ' +
+        (auth && priv ? 'authPriv' : (auth ? 'authNoPriv' : 'noAuthNoPriv'));
+      s.v3Level.style.color = '';
+    }
+  }
+  function buildTarget(s) {
+    const t = {
+      host: s.hostInput.value.trim(),
+      port: parseInt(s.portInput.value, 10) || 161,
+      version: s.versionInput.value
+    };
+    if (t.version === '3') {
+      t.v3 = {
+        username: s.v3User.value,
+        authProtocol: s.v3Auth.value, authKey: s.v3AuthKey.value,
+        privProtocol: s.v3Priv.value, privKey: s.v3PrivKey.value
+      };
+    } else t.community = s.communityInput.value || 'public';
+    return t;
+  }
+
+  function startHealth(s) {
+    const t = buildTarget(s);
+    if (!t.host) { showErr(s.targetError, 'Host is required.'); return; }
+    showErr(s.targetError, '');
+    // Verify the credentials are accepted before committing to the switch: one
+    // SNMP GET of sysUpTime with the entered credentials. A bad community or
+    // wrong v3 auth fails here, so the user gets an immediate, clear error
+    // instead of an empty dashboard that silently never populates.
+    const collectBtn = s.collectBtn;
+    if (collectBtn) { collectBtn.disabled = true; collectBtn.dataset.label = collectBtn.textContent; collectBtn.textContent = 'Checking\u2026'; }
+    fetch('/api/ping', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target: t }) })
+      .then((r) => r.json())
+      .then((res) => {
+        if (collectBtn) { collectBtn.disabled = false; if (collectBtn.dataset.label) collectBtn.textContent = collectBtn.dataset.label; }
+        if (!res || !res.reachable) {
+          showErr(s.targetError, 'The switch did not answer with these credentials' +
+            (res && res.error ? ' (' + res.error + ')' : '') + '. Check the host, SNMP version, and community or v3 settings.');
+          return;
+        }
+        proceedHealth(s, t);
+      })
+      .catch((e) => {
+        if (collectBtn) { collectBtn.disabled = false; if (collectBtn.dataset.label) collectBtn.textContent = collectBtn.dataset.label; }
+        showErr(s.targetError, 'Could not reach the local server to verify credentials: ' + e.message);
+      });
+  }
+
+  // Commit to the switch once its credentials are verified.
+  function proceedHealth(s, t) {
+    s.target = t; s.host = t.host;
+    s.sshHost.value = t.host;
+    setTab(s, 'connecting', t.host);
+    setSubtabMode(s, 'ready');
+    startProbe(s);
+    // The graphs start with whatever was recorded before, so a freshly
+    // opened tab is not a blank hour.
+    loadHistory(s);
+    // Traps drive refreshes, so the stream opens with the switch rather
+    // than with the panel: a linkDown while the Events panel is folded is
+    // exactly the one that should still update the dashboard.
+    startTrapStream(s);
+    startSyslogStream(s);
+    saveState();
+    repaintConfig(s);
+    startSyslogStream(s);
+    loadSyslog(s);
+    // First view: read the server's latest snapshot - no switch traffic. The
+    // server owns the recurring collection, so opening a switch just displays
+    // what it already has; syncView falls back to a one-off poll only if the
+    // collector has no snapshot for this switch yet (e.g. just added). A manual
+    // Refresh is the way to force a fresh poll.
+    restoreLayout(s).then(() => syncView(s).then(() => { if (!s.autoTimer) startAuto(s); }).catch(() => { if (!s.autoTimer) startAuto(s); }));
+  }
+
+  // ---------- layout persistence ----------
+  /**
+   * Everything needed to put the app back as it was: which switches were
+   * open and how to reach them. Saved whenever that set changes rather
+   * than on a timer, so closing the browser mid-thought loses nothing.
+   *
+   * Credentials are part of it -- an app that restores your switches but
+   * then asks for the community string has not restored anything. They are
+   * encrypted at rest; see the note in Settings for what that means.
+   */
+  let stateSaveTimer = null;
+  function saveState() {
+    if (stateSaveTimer) clearTimeout(stateSaveTimer);
+    // Adding a switch fires several of these in a row; one write will do.
+    stateSaveTimer = setTimeout(() => {
+      const list = [];
+      for (const sw of allSwitches()) {
+        if (sw.forgotten) continue;
+        if (!sw.target && !sw.consoleTarget) continue;
+        list.push({
+          host: sw.host || null,
+          target: sw.target || null,
+          // The per-switch poll interval drives the server's collector cadence
+          // for this switch (SERVER-STANDARD §3), so it is saved with the switch.
+          interval: Number(sw.interval) || null,
+          // Manual product-line override (null = auto-detect). Decides the MIB
+          // set and feature gating for this switch.
+          productOverride: sw.productOverride || null,
+          ssh: sw.sshUser && sw.sshUser.value ? {
+            host: sw.sshHost.value || sw.host, port: Number(sw.sshPort.value) || 22,
+            username: sw.sshUser.value, password: sw.sshPass.value
+          } : null,
+          console: sw.consoleTarget || null
+        });
+      }
+      fetch('/api/state', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ switches: list, activeId })
+      }).catch((e) => appLog('warn', 'Could not save state', { message: e.message }));
+    }, 400);
+  }
+
+  /**
+   * Say plainly how credentials are kept. Somebody deciding whether to let
+   * an app store a community string deserves the actual answer, not the
+   * word "securely".
+   */
+  // The product card on the Settings page: shows the detected line and its
+  // MIB-proven capabilities, and lets the user override the line (auto-detect
+  // can be wrong or absent). The override is persisted and drives feature
+  // gating and the MIB Explorer default. productPaint() is re-run whenever the
+  // detected product changes (a health collection arrives).
+  function initProductCard(s) {
+    const paint = () => {
+      if (!s.productSelect) return;
+      if (PRODUCTS && !s.productSelect.options.length) {
+        const auto = document.createElement('option');
+        auto.value = ''; auto.textContent = 'Auto-detect';
+        s.productSelect.appendChild(auto);
+        for (const p of PRODUCTS.products) {
+          const o = document.createElement('option');
+          o.value = p.line; o.textContent = p.label; s.productSelect.appendChild(o);
+        }
+      }
+      const detected = s.product && s.product.line;
+      if (s.productSelect.options.length) {
+        s.productSelect.options[0].textContent = 'Auto-detect' + (detected ? ' (' + detected + ')' : '');
+      }
+      s.productSelect.value = s.productOverride || '';
+      const eff = effectiveProduct(s);
+      const feats = (eff && eff.features) || {};
+      const caps = Object.keys(feats).filter((k) => feats[k]);
+      if (s.productNote) {
+        s.productNote.textContent = eff
+          ? (eff.label + (s.productOverride ? ' — set manually' : (detected ? ' — detected from the switch' : ' — default')) +
+             '.  MIB features: ' + (caps.length ? caps.map((c) => c.toUpperCase()).join(', ') : 'base set only') + '.')
+          : 'Product not detected yet — connect to the switch, or set it below.';
+      }
+    };
+    s.productPaint = paint;
+    if (s.productSelect) {
+      s.productSelect.addEventListener('change', () => {
+        s.productOverride = s.productSelect.value || null;
+        appLog('info', 'Product line set', { host: s.host, product: effectiveProductLine(s), override: !!s.productOverride });
+        saveState();
+        paint();
+        renderSwitch(s);   // re-evaluate panel visibility for the chosen product
+      });
+    }
+    loadProducts().then(paint);
+  }
+
+  function initStorageCard(s) {
+    const paint = () => {
+      if (!s.storageNote) return;
+      const info = storageInfo || {};
+      s.storageNote.textContent = info.passphrase
+        ? 'Switches and credentials are encrypted with a key derived from ' +
+          'SBS_PASSPHRASE, which is never written to disk. Without that ' +
+          'passphrase the saved file cannot be read.'
+        : 'Switches and credentials are encrypted (AES-256-GCM) in state.enc, with the ' +
+          'key in .state-key beside it, both readable only by your account. That protects ' +
+          'them from backups, syncing and copied folders \u2014 not from someone already ' +
+          'logged in as you. Set SBS_PASSPHRASE to require a passphrase instead.';
+    };
+    paint();
+    s.storagePaint = paint;
+    // Forget *this* switch: the card lives on a switch's settings page, so
+    // clearing every saved switch from it would be a surprise.
+    s.forgetBtn.addEventListener('click', () => {
+      s.forgotten = true;
+      saveState();
+      appLog('info', 'Switch forgotten', { host: s.host });
+      s.storageNote.textContent = s.host + ' will not be restored next time. It stays open ' +
+        'now; using it again saves it again.';
+      // A moment later the note goes back to describing the storage, so
+      // the page does not sit on a stale confirmation.
+      setTimeout(() => { s.forgotten = false; paint(); }, 8000);
+    });
+  }
+
+  /** Put back what was open last time. */
+  function restoreState() {
+    return fetch('/api/state').then((r) => r.json()).then((body) => {
+      storageInfo = body.storage || null;
+      for (const sw of switches.values()) if (sw.storagePaint) sw.storagePaint();
+      if (body.unreadable) {
+        appLog('warn', 'Saved state could not be decrypted; starting fresh', {});
+        return false;
+      }
+      const saved = body.state;
+      if (!saved || !Array.isArray(saved.switches) || !saved.switches.length) return false;
+      for (const entry of saved.switches) {
+        const sw = createSwitch();
+        if (entry.ssh) {
+          sw.sshHost.value = entry.ssh.host || '';
+          sw.sshPort.value = entry.ssh.port || 22;
+          sw.sshUser.value = entry.ssh.username || '';
+          sw.sshPass.value = entry.ssh.password || '';
+          sw.sshEverConnected = !!entry.ssh.username;
+        }
+        if (entry.console) sw.consoleTarget = entry.console;
+        if (entry.target) {
+          sw.target = entry.target;
+          sw.host = entry.host || entry.target.host;
+          applyTargetToForm(sw, entry.target);
+          setTab(sw, '', sw.host);
+          initHealth(sw);
+          // The per-switch interval drives the server's poll rate for this
+          // switch, so restore it from saved state (overriding the default
+          // initHealth set) and reflect it in the control.
+          if (Number.isFinite(entry.interval)) {
+            sw.interval = entry.interval;
+            if (sw.intervalInput) sw.intervalInput.value = entry.interval;
+          }
+          if (entry.productOverride) { sw.productOverride = entry.productOverride; if (sw.productPaint) sw.productPaint(); }
+          setSubtabMode(sw, 'ready');
+          startProbe(sw);
+          // Reopen = display the server's last poll (no SNMP); syncView
+          // auto-polls only if there is no snapshot for this switch yet.
+          restoreLayout(sw).then(() => syncView(sw).then(() => { if (!sw.autoTimer) startAuto(sw); }).catch(() => { if (!sw.autoTimer) startAuto(sw); }));
+        } else {
+          applyConsoleChoice(sw);
+        }
+      }
+      appLog('info', 'Restored the previous session', { switches: saved.switches.length });
+      return true;
+    }).catch((e) => {
+      appLog('warn', 'Could not read saved state', { message: e.message });
+      return false;
+    });
+  }
+
+  /** Put a saved target back on the SNMP form, so Settings shows it. */
+  function applyTargetToForm(s, target) {
+    s.hostInput.value = target.host || '';
+    s.portInput.value = target.port || 161;
+    s.versionInput.value = target.version || '2c';
+    if (target.community) s.communityInput.value = target.community;
+    if (target.v3) {
+      s.v3User.value = target.v3.username || '';
+      if (target.v3.authProtocol) s.v3Auth.value = target.v3.authProtocol;
+      if (target.v3.authKey) s.v3AuthKey.value = target.v3.authKey;
+      if (target.v3.privProtocol) s.v3Priv.value = target.v3.privProtocol;
+      if (target.v3.privKey) s.v3PrivKey.value = target.v3.privKey;
+    }
+    updateVersionFields(s);
+  }
+
+  let storageInfo = null;
+
+  function saveLayout(s) {
+    if (!s.host) return;
+    const panels = s.panels.map((p) => ({
+      id: p.id, kind: p.kind, key: p.key, title: p.title,
+      oid: p.oid, op: p.op, span: p.span, h: p.h, collapsed: !!p.collapsed
+    }));
+    fetch('/api/layout/' + encodeURIComponent(s.host), {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      // The console port belongs to the switch, not to the app: which
+      // cable goes to which device is exactly the thing worth remembering
+      // per switch rather than globally.
+      body: JSON.stringify({
+        panels,
+        refresh: { interval: s.interval, on: !!s.autoTimer },
+        console: s.consoleTarget || null
+      })
+    }).catch((e) => appLog('warn', 'Could not save layout', { message: e.message }));
+  }
+
+  function restoreLayout(s) {
+    if (!s.host) return Promise.resolve();
+    return fetch('/api/layout/' + encodeURIComponent(s.host))
+      .then((r) => r.json())
+      .then((body) => {
+        const l = body && body.layout;
+        if (!l) return;
+        if (l.console && l.console.path) {
+          s.consoleTarget = l.console;
+          applyConsoleChoice(s);
+        }
+        if (!Array.isArray(l.panels) || !l.panels.length) return;
+        // Drop panels this version no longer knows about, so a layout
+        // saved before Configuration moved to its own page does not
+        // resurrect an empty box.
+        s.panels = l.panels.filter((pn) => pn.kind !== 'builtin' || builtinDef(pn.key));
+        // A layout saved before a panel existed would otherwise hide it
+        // forever. Anything missing is inserted where it belongs in the
+        // default order rather than dumped at the end.
+        const have = new Set(s.panels.filter((pn) => pn.kind === 'builtin').map((pn) => pn.key));
+        BUILTIN.forEach((b, i) => {
+          if (have.has(b.key)) return;
+          const fresh = { id: 'b:' + b.key, kind: 'builtin', key: b.key, title: b.title,
+            span: b.span, h: b.h, collapsed: !OPEN_BY_DEFAULT.has(b.key) };
+          // Sit it after the last default-order panel that precedes it.
+          let at = s.panels.length;
+          for (let j = 0; j < s.panels.length; j++) {
+            const idx = BUILTIN.findIndex((x) => x.key === s.panels[j].key);
+            if (idx >= 0 && idx > i) { at = j; break; }
+          }
+          s.panels.splice(at, 0, fresh);
+          appLog('info', 'Added a panel that postdates the saved layout',
+            { host: s.host, panel: b.title });
+        });
+        if (l.refresh && l.refresh.interval) {
+          s.interval = l.refresh.interval;
+          if (s.intervalInput) s.intervalInput.value = l.refresh.interval;
+        }
+        appLog('info', 'Restored saved dashboard layout', { host: s.host, panels: s.panels.length });
+      })
+      .catch(() => { /* no saved layout is fine */ });
+  }
+
+  // ---------- data ----------
+  /**
+   * One spinner, in the middle of the page. It floats over whatever is
+   * already there rather than replacing it, so a refresh does not blank
+   * the dashboard you were reading, and there is nothing to read from it
+   * beyond "working".
+   */
+  function showSpinner(s, on) {
+    const host = s.views.overview;
+    if (!host) return;
+    let el_ = host.querySelector('.poll-spinner');
+    if (on) {
+      if (!el_) {
+        el_ = el('div', 'poll-spinner');
+        el_.appendChild(el('div', 'spinner'));
+        host.appendChild(el_);
+      }
+    } else if (el_) {
+      el_.remove();
+    }
+  }
+
+  /**
+   * A quiet reachability check, separate from the health poll. One GET of
+   * sysUpTime every 30 seconds is about as small as SNMP gets, so it can
+   * run regardless of whether auto-refresh is on -- the question "is this
+   * switch still there" should not cost a full collection to answer.
+   *
+   * The uptime it returns doubles as a reboot detector: an uptime lower
+   * than the last one means the switch restarted between probes.
+   */
+  const PROBE_MS = 30000;
+
+  /**
+   * Every reading the app takes becomes a point on the graphs, whether it
+   * came from the 30-second probe or from a full collection. A refresh you
+   * asked for is as real a sample as one taken on a timer, and dropping it
+   * would leave visible gaps in the line.
+   *
+   * An hour is kept. At one point per probe that is 120 samples; manual
+   * refreshes add more, so the cap is generous and the window is trimmed
+   * by time rather than by count.
+   */
+  /**
+   * How much history the browser holds. The graphs read from this, so it
+   * has to be long enough for the longest range on offer -- trimming to an
+   * hour would quietly discard the week that was just fetched, and the
+   * graph would draw a day while its label claimed a week.
+   *
+   * Bounded by count as well as by age: a switch left open for a month
+   * should not grow an array without limit.
+   */
+  const HISTORY_MS = 8 * 24 * 60 * 60 * 1000;
+  const HISTORY_MAX = 25000;
+
+  // History is persisted by the server-side collector now (SERVER-STANDARD §6),
+  // so the browser no longer batches or POSTs samples - it reads history back
+  // with loadHistory. recordSample keeps only an in-memory point for an instant
+  // graph update after a live write-settle walk.
+
+  /** Seed the graphs from what was recorded before this tab existed.
+   *  windowMs semantics: a positive number is a lookback window; 0 means
+   *  "all history" (no cutoff); undefined/null means "use the default 24h".
+   *  These must stay distinct — collapsing 0 into the default is what made
+   *  "All" quietly request only 24 hours, so it showed less than "7 days". */
+  function loadHistory(s, windowMs) {
+    if (!s.host) return Promise.resolve();
+    const since = (windowMs === 0)
+      ? 0
+      : (Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 24 * 60 * 60 * 1000);
+    return fetch('/api/history?host=' + encodeURIComponent(s.host) + '&since=' + since)
+      .then((r) => r.json())
+      .then((body) => {
+        const kept = (body.samples || []).filter((x) => Number.isFinite(x.t));
+        if (!kept.length) return;
+        // Anything already sampled in this tab wins: it is the same data
+        // and merging duplicates would draw the same minute twice.
+        const newest = kept[kept.length - 1].t;
+        const mine = (s.history || []).filter((x) => x.t > newest);
+        s.history = kept.concat(mine);
+        repaintPanel(s, 'metrics');
+      })
+      .catch(() => { /* graphs simply start from now */ });
+  }
+
+  function recordSample(s, values) {
+    const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
+    const sample = {
+      t: Date.now(),
+      cpu: num(values.cpu), poeW: num(values.poeW), cpuPps: num(values.cpuPps)
+    };
+    if (sample.cpu === null && sample.poeW === null && sample.cpuPps === null) return;
+    s.history = s.history || [];
+    // A collection and a probe can land within a moment of each other;
+    // two points at the same instant say nothing the first did not.
+    const last = s.history[s.history.length - 1];
+    if (last && sample.t - last.t < 1000) s.history.pop();
+    s.history.push(sample);
+    // No POST: the server-side collector persists history now. This local push
+    // only gives the graph an instant point after a live write-settle walk;
+    // loadHistory reconciles it against the server's store.
+    const cutoff = sample.t - HISTORY_MS;
+    while (s.history.length && (s.history[0].t < cutoff || s.history.length > HISTORY_MAX)) {
+      s.history.shift();
+    }
+    repaintPanel(s, 'metrics');
+  }
+
+  function startProbe(s) {
+    stopProbe(s);
+    if (!s.target) return;
+    s.probeTimer = setInterval(() => probeOnce(s), PROBE_MS);
+  }
+
+  function stopProbe(s) {
+    if (s.probeTimer) { clearInterval(s.probeTimer); s.probeTimer = null; }
+  }
+
+  function probeOnce(s) {
+    if (!s.target || s.probing) return;
+    // Hold the reachability probe too while a write is in flight, so nothing
+    // adds frames while the switch is busy writing its configuration.
+    if (s.writeBusy) return;
+    s.probing = true;
+    // Reachability comes from the SERVER's view - it polls the switch; the
+    // browser no longer pings it. Reboot is detected and logged server-side
+    // (an event), so the browser only reacts to the up/down transition here.
+    fetch('/api/collector/status')
+      .then((r) => r.json())
+      .then((body) => {
+        s.probing = false;
+        const row = (body.switches || []).find((x) => x.host === s.host);
+        if (!row) { paintReachability(s); return; }
+        const was = s.reachable;
+        s.reachable = !!row.reachable;
+        if (was === false && s.reachable) {
+          appLog('info', 'Switch is answering again', { host: s.host });
+          syncView(s);   // repaint from the now-fresh snapshot
+        } else if (was !== false && !s.reachable) {
+          appLog('warn', 'Switch stopped answering SNMP', { host: s.host, error: row.error });
+        }
+        paintReachability(s);
+      })
+      .catch(() => { s.probing = false; });
+    // Keep the metric graph current from the server's authoritative history.
+    loadHistory(s, s.graphRange);
+  }
+
+  /** Unreachable overrides the health verdict: stale data is not health. */
+  function paintReachability(s) {
+    if (!s.subtabs) return;
+    if (s.reachable === false) {
+      subDot(s, 'overview', 'err');
+      subTint(s, 'overview', 'critical');
+      setTab(s, 'critical');
+      if (s.healthStatus) {
+        clear(s.healthStatus);
+        s.healthStatus.appendChild(el('span', 'pill crit', 'not answering SNMP'));
+      }
+    } else if (s.health) {
+      applyHealthState(s, overallSeverity(s));
+    }
+  }
+
+  /**
+   * Traps: what the switch chose to interrupt us about. Same shape as the
+   * syslog panel -- a live list that fills as things happen -- because it
+   * answers the same kind of question and there is no reason for it to
+   * look different.
+   */
+  /** Live delivery, so a trap appears the moment the switch sends it. */
+  function startTrapStream(s) {
+    if (s.trapStream || !s.host) return;
+    try {
+      s.trapStream = new EventSource('/api/traps/stream?host=' + encodeURIComponent(s.host));
+    } catch (e) { return; }
+    s.trapStream.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+
+      // Keep the held copy current, not just the table. The trap-driven
+      // refresh repaints the panel a moment later, and a repaint from a
+      // stale copy would erase the very trap that caused it.
+      if (s.traps && Array.isArray(s.traps.messages)) {
+        s.traps.messages.unshift(m);
+        s.traps.total = (s.traps.total || 0) + 1;
+        if (s.traps.messages.length > 300) s.traps.messages.pop();
+      }
+      // Traps are off by default in the Events view. The held copy above is
+      // kept current regardless (so the count is right and ticking Traps on
+      // shows them immediately), but a live row is only inserted into the table
+      // when traps are actually being shown - otherwise a hidden trap would pop
+      // in and then vanish on the next repaint.
+      const showTraps = !s.eventSources || s.eventSources.trap;
+      if (showTraps && s.eventTable && s.eventTable.isConnected) {
+        const search = (s.trapSearch || '').toLowerCase();
+        if (!(search && m.name.toLowerCase().indexOf(search) < 0 &&
+          !m.varbinds.some((v) => String(v.value).toLowerCase().indexOf(search) >= 0))) {
+          const row = eventRow({
+            at: m.at, kind: 'trap', severity: m.severity, what: m.name,
+            detail: m.varbinds.map((v) => v.name.replace(/\.\d+$/, '') + ' ' + v.value).join('  \u00b7  ')
+          });
+          row.classList.add('syslog-new');   // background flash only, no layout shift
+          s.eventTable.insertBefore(row, s.eventTable.firstChild);
+          while (s.eventTable.children.length > 300) s.eventTable.lastChild.remove();
+          setTimeout(() => row.classList.remove('flash'), 1200);
+        }
+      } else if (!s.eventTable || !s.eventTable.isConnected) {
+        if (!s.traps) s.traps = null;
+      }
+      // A trap is the switch saying something changed; act on it regardless of
+      // whether it is shown.
+      onTrap(s, m);
+    };
+  }
+
+  /**
+   * A trap says something changed. Use it as a *trigger* to re-read the
+   * part of the switch it concerns, not as the value itself.
+   *
+   * The distinction matters. A trap is UDP with no retransmission, and it
+   * only arrives at all if the switch has been configured to send it, so a
+   * counter maintained from traps drifts silently the moment one is
+   * dropped and is simply absent on a switch nobody has configured. Polling
+   * stays the source of truth; traps decide *when* to poll, which is where
+   * the saving is -- the dashboard reacts in a second instead of waiting
+   * out the refresh interval, and the interval itself can be long because
+   * anything urgent announces itself.
+   *
+   * Refreshes are coalesced: a switch reloading sends a burst of linkUps
+   * and re-reading the interface table once at the end is enough.
+   */
+  const TRAP_SUBJECTS = [
+    // A link up/down affects the interface table (and the "X of Y up" figure
+    // derived from it), so re-read ONLY the interfaces panel - not the whole
+    // switch. A port flapping during a speed/auto-neg change would otherwise
+    // trigger a full re-walk of every table per flap, hammering the CPU.
+    { match: /link(up|down)/, panel: 'interfaces' },
+    // 802.1X port-status traps (fired when a port re-authenticates - e.g. after
+    // a speed/auto-neg bounce) must NOT re-walk the whole auth panel, which now
+    // includes the RADIUS/TACACS server tables and the heavy per-host dot1x
+    // counter tables. Re-read only the light dot1x session/lock tables.
+    { match: /dot1xportstatus|portstatusauthorized|portstatusunauthorized/, tables: ['dot1xHosts', 'dot1xLocked'] },
+    // A spanning-tree topology change mainly affects port roles/states and the
+    // forwarding table - it does NOT need a whole-switch walk. Refresh the
+    // interface panel only; the (on-demand) MAC table refreshes itself when the
+    // Connected panel is open. A burst of these during a port-channel change
+    // would otherwise each trigger a full poll.
+    { match: /topologychange|newroot/, panel: 'interfaces' },
+    // PoE and environment traps change derived totals across the picture, and a
+    // restart invalidates everything - these genuinely warrant a full re-read.
+    { match: /pethpse|poe|coldstart|warmstart|envmon|fan|temperature|power/, full: true },
+    // Other authentication traps re-read the auth panel's session tables only.
+    { match: /authentication|dot1x|locked/, tables: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked'] }
+  ];
+
+  // A flapping link must not turn into a collection per flap.
+  const TRAP_REFRESH_FLOOR_MS = 10000;
+
+  // Pull the affected interface's ifIndex out of a trap's varbinds. linkUp and
+  // linkDown bind the standard ifIndex object (1.3.6.1.2.1.2.2.1.1.<N>); its
+  // value, or the trailing N in the OID, is the port. Returns null if absent.
+  function trapIfIndex(m) {
+    for (const vb of (m && m.varbinds) || []) {
+      const oid = String(vb.oid || vb.name || '');
+      if (/1\.3\.6\.1\.2\.1\.2\.2\.1\.1\b/.test(oid) || /ifIndex/i.test(String(vb.name || ''))) {
+        const v = parseInt(vb.value, 10);
+        if (Number.isFinite(v)) return v;
+        const m2 = oid.match(/\.(\d+)$/);
+        if (m2) return parseInt(m2[1], 10);
+      }
+    }
+    return null;
+  }
+
+  function onTrap(s, m) {
+    const name = String(m && m.name || '').toLowerCase();
+    if (!name || !s.target) return;
+
+    // A restart invalidates everything on screen, not one panel.
+    if (/coldstart|warmstart/.test(name)) {
+      appLog('info', 'Trap reports the switch restarted; re-reading everything', {
+        host: s.host, trap: m.name
+      });
+      scheduleTrapRefresh(s, null);
+      return;
+    }
+
+    // A link up/down trap carries the affected port's ifIndex in its varbinds
+    // (the standard ifIndex object, 1.3.6.1.2.1.2.2.1.1.N). When we can read it,
+    // refresh JUST that port's row - the lightest possible reaction - instead of
+    // re-walking the interface panel. This is the switch telling us exactly what
+    // changed; we act on only that.
+    if (/link(up|down)/.test(name)) {
+      if (s._ifWriteUntil && Date.now() < s._ifWriteUntil) return;   // our own bounce
+      const ifx = trapIfIndex(m);
+      if (ifx != null) {
+        appLog('info', 'Link trap: refreshing one port', { host: s.host, ifIndex: ifx, trap: m.name });
+        // Debounce lightly per-port so a flapping link doesn't spam reads.
+        s._linkTrapSeen = s._linkTrapSeen || new Map();
+        const last = s._linkTrapSeen.get(ifx) || 0;
+        if (Date.now() - last > 2000) { s._linkTrapSeen.set(ifx, Date.now()); setTimeout(() => refreshOnePort(s, ifx, true), 800); }
+        return;
+      }
+      // No ifIndex in the trap: fall through to the panel-level refresh below.
+    }
+
+    for (const subject of TRAP_SUBJECTS) {
+      if (subject.match.test(name)) {
+        // When the app just made an interface change itself, the resulting port
+        // bounce (and its link / 802.1X re-auth traps) is expected and the
+        // editor does its own targeted re-read. Ignore the reactive refresh for
+        // a few seconds so a self-induced bounce does not trigger table walks.
+        if ((subject.panel === 'interfaces' || subject.tables) && s._ifWriteUntil && Date.now() < s._ifWriteUntil) {
+          return;
+        }
+        if (subject.full) scheduleTrapRefresh(s, '*');
+        else if (subject.tables) scheduleTrapRefresh(s, { tables: subject.tables });
+        else scheduleTrapRefresh(s, subject.panel);
+        return;
+      }
+    }
+  }
+
+  function scheduleTrapRefresh(s, key) {
+    s.trapPending = s.trapPending || new Set();
+    s.trapPendingTables = s.trapPendingTables || new Set();
+    if (key === null || key === '*') s.trapPending.add('*');
+    else if (key && key.tables) { for (const t of key.tables) s.trapPendingTables.add(t); }
+    else s.trapPending.add(key);
+    if (s.trapRefreshTimer) return;
+    const since = Date.now() - (s.lastTrapRefresh || 0);
+    const wait = Math.max(1500, TRAP_REFRESH_FLOOR_MS - since);
+    s.trapRefreshTimer = setTimeout(() => {
+      s.trapRefreshTimer = null;
+      s.lastTrapRefresh = Date.now();
+      const keys = Array.from(s.trapPending);
+      const tables = Array.from(s.trapPendingTables);
+      s.trapPending.clear(); s.trapPendingTables.clear();
+      appLog('info', 'Refreshed after a trap', { host: s.host, scope: keys.concat(tables).join(', ') });
+      if (keys.indexOf('*') >= 0) { loadHealth(s, true); return; }
+      // Specific-table refresh: walk only those tables and repaint the panels
+      // that use them (cheaper than a whole-panel refresh).
+      if (tables.length) { refreshTables(s, tables); }
+      for (const key of keys) {
+        const panel = s.panels.find((p) => p.kind === 'builtin' && p.key === key);
+        if (panel) refreshPanel(s, panel);
+      }
+    }, wait);
+  }
+
+  // Re-read just ONE interface's row (admin/oper status and operational speed)
+  // with a handful of GETs, update it in s.health.interfaces, and repaint the
+  // interfaces panel. Used after the app changes one port (speed/duplex/auto-
+  // neg/admin/PoE) so the table reflects the new state without re-walking every
+  // port. The port may renegotiate for a moment, so this is normally called a
+  // couple of seconds after the change.
+  const RLIF_COLS = {
+    rlifPresentAdminStatus: '1.3.6.1.4.1.9.6.1.101.54.43.1.7',
+    rlifPresentOperStatus: '1.3.6.1.4.1.9.6.1.101.54.43.1.8',
+    rlifPresentHighSpeed: '1.3.6.1.4.1.9.6.1.101.54.43.1.37'
+  };
+  function refreshOnePort(s, ifIndex, reactive) {
+    if (!s.target || ifIndex === null || ifIndex === undefined) return Promise.resolve();
+    // A reactive (trap-driven) read is skipped while a write is in progress, so
+    // an unrelated port's link trap can't fire a GET mid-write. Deliberate
+    // post-edit re-reads pass reactive=false and always run.
+    if (reactive && s.writeBusy) return Promise.resolve();
+    const oids = Object.values(RLIF_COLS).map((o) => o + '.' + ifIndex);
+    return apiPost('/api/snmp/get', { target: s.target, oids })
+      .then(({ body }) => {
+        if (!body || body.error || !s.health || !Array.isArray(s.health.interfaces)) return;
+        const row = s.health.interfaces.find((x) => String(x.index) === String(ifIndex));
+        if (!row) return;
+        const wanted = new Set(Object.keys(RLIF_COLS));
+        let changed = false;
+        for (const vb of (body.results || [])) {
+          if (vb.error) continue;
+          // Prefer the resolved column name from the server; fall back to the
+          // OID's second-to-last arc mapped through RLIF_COLS.
+          let name = vb.column;
+          if (!name || !wanted.has(name)) {
+            const parts = String(vb.oid || '').split('.');
+            const colOid = parts.slice(0, -1).join('.');
+            name = Object.keys(RLIF_COLS).find((k) => RLIF_COLS[k] === colOid);
+          }
+          if (!name || !wanted.has(name)) continue;
+          row[name] = (vb.display !== undefined && vb.display !== null && vb.display !== String(vb.value))
+            ? { value: vb.value, display: vb.display } : { value: vb.value };
+          changed = true;
+        }
+        if (changed) {
+          // Reconcile the keyed interfaces panel so only this row's changed
+          // cells patch (the shut button flips in place); fall back to a full
+          // repaint if it isn't a keyed panel.
+          const ip = s.panels && s.panels.find((x) => x.kind === 'builtin' && x.key === 'interfaces' && x._body);
+          if (!ip || !reconcilePanelInPlace(s, ip)) repaintPanel(s, 'interfaces');
+        }
+      })
+      .catch(() => {});
+  }
+
+  // Re-read specific SCALAR objects (by name -> base OID, instance .0) with a
+  // single batched GET and update s.health.scalars in place. Targeted panel
+  // refreshes skip scalars, so any setting stored as a scalar must be re-read
+  // this way after a write. Light (one GET) and exact. Reusable for any future
+  // scalar-based settings.
+  // Call after any config-changing write. Immediately re-reads the cheap
+  // running-vs-startup scalar so the "unsaved" badge updates at once (rather
+  // than waiting for the next health poll), and - if the config comparison
+  // overlay is open - auto-refreshes the line diff so the panel shows what
+  // changed. The expensive TFTP diff is only pulled when the overlay is open,
+  // and debounced so a burst of changes triggers one refresh, not many.
+  // Call this after EVERY successful configuration change, from any module.
+  // Pass the control(s) the user changed (a single node, or an array) and they
+  // are highlighted so the change is felt; omit them if there is no on-screen
+  // control to highlight (e.g. a row that vanishes). This one call is the single
+  // place that (a) flips the "unsaved" badge and (b) runs the changed-field
+  // highlight - so any new or existing module gets BOTH behaviours consistently
+  // just by calling markConfigDirty(s, theChangedControls) on success.
+  // Repaint the panels that show the "Config saved" badge. The badge card lives
+  // in the METRICS panel (the summary panel also reads the scalar for its
+  // identical-configs logic), so both must repaint for the badge to flip
+  // instantly - repainting only 'summary'/'health' left the visible badge stale
+  // until the next full poll (now 300s), which is why it felt slow.
+  function repaintConfigBadge(s) {
+    for (const key of ['metrics', 'summary']) {
+      const p = s.panels && s.panels.find((x) => x.kind === 'builtin' && x.key === key && x._body);
+      if (p) repaintPanel(s, key);
+    }
+    // The saved-config scalar feeds the overall severity (via liveAlerts), so the
+    // Attention tab/hero badge must re-evaluate too - otherwise a save clears the
+    // summary banner but leaves "Attention" stuck with nothing to explain it.
+    if (s.health) applyHealthState(s, overallSeverity(s));
+  }
+
+  function markConfigDirty(s, changed) {
+    if (!s || !s.target) return;
+    // Highlight the changed control(s). Accepts a node, an array, or nothing.
+    if (changed) { if (Array.isArray(changed)) flashValues(changed); else flashValue(changed); }
+    const repaintBadge = () => repaintConfigBadge(s);
+    // A change we just made means running now differs from startup, full stop -
+    // so flip the badge to "unsaved" immediately and treat that as AUTHORITATIVE.
+    // We deliberately do NOT follow up with a background scalar read: on this
+    // firmware the rlRunningCDBequalToStartupCDB flag updates at different speeds
+    // for different setting types (fast for interface settings, lagging for
+    // 802.1X), so a confirming read could momentarily return "saved" and revert
+    // the badge - exactly the inconsistency seen. The badge stays "unsaved"
+    // until a save (which sets it back optimistically), which is always correct:
+    // a write cannot leave running identical to startup.
+    if (s.health && s.health.scalars) {
+      s.health.scalars.rlRunningCDBequalToStartupCDB = { value: 2, display: 'false', oid: '1.3.6.1.4.1.9.6.1.101.1.13.0' };
+      repaintBadge();
+    }
+    // The line-by-line diff requires pulling BOTH full configs over TFTP, which
+    // is a copy operation on the switch - the single most CPU-heavy thing we can
+    // ask of it. Doing that automatically on every change (even debounced) was
+    // the dominant load. So we do NOT auto-fetch here. If the config comparison
+    // overlay is open, mark its current diff as stale and show a one-click
+    // "refresh" affordance; the user pulls the fresh diff only when they want it.
+    if (s.cfgOverlay && s.cfgOverlay.classList.contains('open')) {
+      s.cfgStale = true;
+      repaintConfig(s);
+    }
+  }
+
+  function refreshScalars(s, nameToOid) {
+    const names = Object.keys(nameToOid || {});
+    if (!s.target || !names.length) return Promise.resolve();
+    const oids = names.map((n) => nameToOid[n] + '.0');
+    return apiPost('/api/snmp/get', { target: s.target, oids })
+      .then(({ body }) => {
+        if (!body || body.error || !s.health) return;
+        s.health.scalars = s.health.scalars || {};
+        // Map each returned varbind back to its scalar NAME via the OID.
+        const oidToName = {};
+        for (const n of names) oidToName[nameToOid[n]] = n;
+        for (const vb of (body.results || [])) {
+          if (vb.error) continue;
+          const base = String(vb.oid || '').replace(/\.0$/, '');
+          const name = oidToName[base] || vb.column;
+          if (!name) continue;
+          // Always keep a display string: some panels read .display directly,
+          // so dropping it (when display equals the raw value) left them blank.
+          const disp = (vb.display !== undefined && vb.display !== null) ? vb.display : String(vb.value);
+          s.health.scalars[name] = { value: vb.value, display: disp };
+        }
+      })
+      .catch(() => {});
+  }
+
+  // Light re-read of just the port-channel (LAG) tables, merged into s.health,
+  // then repaint the interfaces panel. Returns the total member count across
+  // all channels (so a caller can tell whether a channel has re-formed). Keeps
+  // the switch load minimal - only the small LAG tables are walked.
+  function refreshLagTables(s) {
+    const tables = ['lagCreation', 'lagAgg', 'lagMembers', 'lagPortKey'];
+    return fetch('/api/health', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: s.target, only: tables }) })
+      .then((r) => r.json())
+      .then((body) => {
+        if (!body || body.error) return 0;
+        for (const key of body.keys || []) if (s.health) s.health[key] = body[key];
+        const ip = s.panels.find((p) => p.kind === 'builtin' && p.key === 'interfaces');
+        // Preserve the page scroll position across the repaint so a channel
+        // change does not jump the user to the top of the panel.
+        const restoreLag = scrollKeeper(s);
+        // Reconcile in place (keyed) so a channel change patches only the rows
+        // that changed - no teardown, no scroll jump; fall back to full repaint.
+        if (ip && ip._body) { if (!reconcilePanelInPlace(s, ip)) repaintPanel(s, 'interfaces'); }
+        restoreLag();
+        // Count CONFIGURED members across all channels: ports whose actor admin
+        // key points at a real aggregator (not their own ifIndex / 0). This
+        // reflects configured membership even when a member link is down (the
+        // active bitmap would miss those).
+        let total = 0;
+        const dvv = (c) => (c && (c.display !== undefined && c.display !== null && c.display !== '') ? c.display : (c && c.value !== undefined ? c.value : ''));
+        for (const r of (s.health && s.health.lagPortKey) || []) {
+          const k = String(dvv(r.dot3adAggPortActorAdminKey) || '').replace(/[,\s]/g, '');
+          if (k && k !== '0' && k !== String(r.index)) total++;
+        }
+        return total;
+      })
+      .catch(() => 0);
+  }
+
+  // Walk only the named tables and merge into s.health, then repaint affected
+  // panels. Used by trap-driven refreshes that need just a couple of tables.
+  // Which built-in panels depend on which health tables, so a targeted refresh
+  // repaints only the panels that actually changed - avoids reflowing (and
+  // visually jolting) unrelated panels on every small update.
+  const PANEL_TABLE_DEPS = {
+    interfaces: ['interfaces', 'poe', 'lagAgg', 'lagMembers', 'lagCreation', 'lagPortKey', 'bridgePorts', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode', 'vlans', 'vlansCurrent', 'portModes', 'portL2L3', 'portAccessVlan', 'portNativeVlan'],
+    vlans: ['vlans', 'vlansCurrent', 'interfaces', 'sviAddrs', 'portModes', 'portL2L3', 'voiceOUI', 'voiceLocalSrc', 'scalars'],
+    summary: ['vlans', 'interfaces', 'sviAddrs', 'scalars', 'poe'],
+    auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs'],
+    connected: ['macTable', 'interfaces', 'bridgePorts', 'dot1xHosts'],
+    stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts'],
+    routing: ['routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],
+    acl: ['aclNames', 'aclAces', 'aclTuples']
+  };
+  function panelDependsOn(key, changedTables) {
+    const deps = PANEL_TABLE_DEPS[key];
+    if (!deps) return true;   // unknown/other panel: repaint to be safe
+    return changedTables.some((t) => deps.indexOf(t) !== -1);
+  }
+
+  // Views that live OUTSIDE the panel grid (overlays, badges) but still derive
+  // their content from health data, and so must be re-rendered when that data
+  // changes - otherwise a message driven by a value (e.g. the config overlay's
+  // "differs from startup" banner, driven by the saved-state scalar) stays stuck
+  // showing an old state after the value updates. Each reconciler declares which
+  // health keys it depends on and how to re-render; reconcileViews() runs the
+  // ones whose data changed. Register new state-driven views here rather than
+  // scattering repaint calls, so every such message refreshes consistently.
+  const VIEW_RECONCILERS = [
+    {
+      // The config comparison: its badge and the overlay's unsaved/differs
+      // banner both read rlRunningCDBequalToStartupCDB and the fetched files.
+      keys: ['scalars'],
+      run: (s) => { repaintConfigBadge(s); if (s.cfgOverlay && s.cfgOverlay.classList.contains('open')) repaintConfig(s); }
+    }
+  ];
+  // Run every reconciler whose declared keys intersect the changed set. Pass
+  // changedKeys = null to run them all (e.g. after a full collection).
+  function reconcileViews(s, changedKeys) {
+    const all = !changedKeys;
+    const changed = new Set(changedKeys || []);
+    for (const rec of VIEW_RECONCILERS) {
+      if (all || rec.keys.some((k) => changed.has(k))) {
+        try { rec.run(s); } catch (e) { /* a view error must not break the refresh */ }
+      }
+    }
+  }
+
+  // ---- Self-managed module refresh (standard B1 family (c), B5) ----
+  // The keyed-panel modules refresh through refreshTables, which preserves scroll
+  // for them. The self-managed config modules (acl, snmpcfg, capture, flash) own
+  // their own fetch + DOM rebuild, so each one used to hand-roll the same
+  // "capture scroll, clear, rebuild, restore scroll" dance - and each was a place
+  // the scroll-preservation fix had to be applied separately. These two helpers
+  // own that dance once:
+  //
+  //   selfManagedRender(s, renderFn)  - runs renderFn (which clears and rebuilds a
+  //     container) with scroll captured before and restored after, so a rebuild
+  //     never jumps the page. Use this to wrap the body of any render function
+  //     that does clear()+rebuild in a self-managed module.
+  //
+  //   selfManagedReload(s, loaderFn)  - awaits loaderFn (the module's async
+  //     fetch+render) and returns a promise, so a write's runButtonAction settle
+  //     can wait for the reload to finish before showing Done (spinner holds until
+  //     the UI reflects the change, exactly like refreshTables does for keyed
+  //     panels). loaderFn is expected to preserve its own scroll via
+  //     selfManagedRender at its render step.
+  function selfManagedRender(s, renderFn) {
+    const restore = scrollKeeper(s);
+    try { renderFn(); } finally { restore(); }
+  }
+  function selfManagedReload(s, loaderFn) {
+    if (typeof loaderFn !== 'function') return Promise.resolve();
+    try { return Promise.resolve(loaderFn()).catch(() => {}); }
+    catch (e) { return Promise.resolve(); }
+  }
+
+  function refreshTables(s, tables) {
+    if (!s.target || !tables.length) return Promise.resolve();
+    // Don't run a partial walk on top of a full collection or a config write -
+    // two walks hitting the same agent at once adds to the switch's CPU input
+    // rate. Defer briefly and retry; the full collection will refresh these
+    // tables anyway, so a short wait is harmless. The returned promise resolves
+    // when the deferred walk (and its repaint) finish, so a caller can wait for
+    // the UI to actually reflect the change.
+    if (s._healthInFlight || s.writeBusy) {
+      if (!s._deferredTables) s._deferredTables = new Set();
+      for (const t of tables) s._deferredTables.add(t);
+      if (!s._deferredWaiters) s._deferredWaiters = [];
+      const waiter = new Promise((res) => s._deferredWaiters.push(res));
+      if (!s._deferTimer) {
+        s._deferTimer = setTimeout(() => {
+          s._deferTimer = null;
+          const pending = s._deferredTables ? Array.from(s._deferredTables) : [];
+          s._deferredTables = null;
+          const waiters = s._deferredWaiters || []; s._deferredWaiters = null;
+          const done = pending.length ? refreshTables(s, pending) : Promise.resolve();
+          done.then(() => { for (const w of waiters) w(); });
+        }, 1500);
+      }
+      return waiter;
+    }
+    return fetch('/api/health', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: s.target, only: tables }) })
+      .then((r) => r.json())
+      .then((body) => {
+        if (!body || body.error) return;
+        const changed = body.keys || [];
+        for (const key of changed) {
+          if (!s.health) continue;
+          if (key === 'scalars') {
+            // Merge scalars (the partial read only covers the health batch) so
+            // we don't drop the system scalars, and feed the metrics graph. The
+            // view reconcilers below refresh anything that reads these scalars.
+            s.health.scalars = Object.assign({}, s.health.scalars, body.scalars || {});
+            const cpuCell = s.health.scalars.rlCpuUtilDuringLast5Minutes;
+            recordSample(s, {
+              cpu: cpuCell ? (cpuCell.value !== undefined ? cpuCell.value : cpuCell.display) : null,
+              poeW: body.summary && body.summary.poeUsedW,
+              cpuPps: body.summary && body.summary.cpuInputPps
+            });
+          } else {
+            s.health[key] = body[key];
+          }
+        }
+        // Repaint panels whose data changed. A converted panel reconciles its
+        // keyed tables in place (no teardown, no reflow, no scroll move); an
+        // unconverted one does a full repaint, so we still preserve the page
+        // scroll position for those as a fallback.
+        const restoreRt = scrollKeeper(s);
+        for (const p of s.panels) {
+          if (p.kind !== 'builtin' || !p._body || !panelDependsOn(p.key, changed)) continue;
+          const forceFull = (PANEL_FULL_REPAINT_TABLES[p.key] || []).some((t) => changed.indexOf(t) !== -1);
+          if (forceFull || !reconcilePanelInPlace(s, p)) repaintPanel(s, p.key);
+        }
+        restoreRt();
+        // Reconcile non-panel views (overlays, badges) whose data just changed,
+        // so their state-driven messages reflect the new values.
+        reconcileViews(s, changed);
+      })
+      .catch(() => {});
+  }
+
+  function stopTrapStream(s) {
+    if (s.trapStream) { try { s.trapStream.close(); } catch (e) {} s.trapStream = null; }
+  }
+
+  /** The sessions this app is holding, for the authentication panel. */
+  function loadSessions(s) {
+    return fetch('/api/sessions')
+      .then((r) => r.json())
+      .then((body) => {
+        s.appSessions = body.sessions || [];
+        repaintPanel(s, 'auth');
+      })
+      .catch(() => {});
+  }
+
+  // Apply a full health object (from a live walk OR the server snapshot) to the
+  // dashboard: carry forward on-demand tables, store it, and repaint. The one
+  // place that turns a health payload into rendered panels, so a live load and
+  // a snapshot read render identically.
+  function applyFullHealth(s, body) {
+    // On-demand tables (MAC table, the ACL panel's three raw tables) are not in
+    // the regular poll, so a fresh full health has them empty. Carry the last
+    // fetched copy forward rather than wiping it - otherwise an open panel that
+    // needs it would re-fetch on every update ("ACL/MAC reloads on every open").
+    if (s.health) {
+      for (const k of ['macTable', 'aclNames', 'aclAces', 'aclTuples']) {
+        if ((!body[k] || !body[k].length) && s.health[k] && s.health[k].length) body[k] = s.health[k];
+      }
+    }
+    s.health = body;
+    // The server-detected product line (C1200 / C1300 / C1300X) drives the MIB
+    // Explorer default and feature gating. Keep a prior value if a refresh
+    // comes back without one.
+    if (body.product && body.product.line) { s.product = body.product; if (s.productPaint) s.productPaint(); }
+    paintTopoButton();
+    const named = body.scalars && body.scalars.sysName;
+    s.sysName = named
+      ? String(named.display !== undefined && named.display !== null ? named.display : named.value).trim()
+      : '';
+    renderSwitch(s);
+    reconcileViews(s, null);   // a full collection refreshed everything
+    loadSessions(s);
+  }
+
+  // Viewer sync: show the server's latest snapshot WITHOUT the browser walking
+  // the switch. opts.nudge asks the server to poll now first (manual Refresh /
+  // first open); otherwise the cached snapshot is read. Metric history is read
+  // from the server's store (loadHistory), not sampled by the browser.
+  function syncView(s, opts) {
+    if (!s.host) return Promise.resolve();
+    const nudge = !!(opts && opts.nudge);
+    if (nudge && s.refreshBtn) { showSpinner(s, true); s.refreshBtn.disabled = true; }
+    const req = nudge
+      ? fetch('/api/collect/now', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target: s.target }) })
+          .then((r) => r.json().then((b) => ({ at: b && b.at, data: b && b.data, error: b && b.error })))
+      : fetch('/api/collector/snapshot?host=' + encodeURIComponent(s.host))
+          .then((r) => (r.status === 404 ? { none: true } : r.json()));
+    return req.then((res) => {
+      if (nudge && s.refreshBtn) { showSpinner(s, false); s.refreshBtn.disabled = false; }
+      if (res.none) {
+        // No snapshot yet (switch just added / collector hasn't polled). Nudge
+        // once to populate; if a nudge already came back empty, wait a cycle.
+        return nudge ? undefined : syncView(s, { nudge: true });
+      }
+      if (res.error && !res.data) {
+        s.reachable = false;
+        appLog('warn', 'Switch not answering (server view)', { host: s.host, error: res.error });
+        paintReachability(s);
+        return;
+      }
+      if (res.data) {
+        s.reachable = true;
+        applyFullHealth(s, res.data);
+        s.snapshotAt = res.at || Date.now();
+        loadHistory(s, s.graphRange);
+      }
+    }).catch((e) => {
+      if (nudge && s.refreshBtn) { showSpinner(s, false); s.refreshBtn.disabled = false; }
+      appLog('error', 'View sync failed', { host: s.host, message: e.message });
+    });
+  }
+
+  function loadHealth(s, quiet) {
+    if (!s.target) return Promise.resolve();
+    // Never walk the switch while a config copy/save or an SNMP write is in
+    // flight. A config copy is CPU-heavy on the switch, and piling a full
+    // multi-table health walk on top of it can destabilise a fragile agent
+    // (observed as a crash after a community add + config save). The caller's
+    // own completion handlers refresh health once the write finishes.
+    if (s.writeBusy) { if (!quiet) showSpinner(s, false); return Promise.resolve(); }
+    // Coalesce REACTIVE (quiet) full loads so a burst of triggers - several
+    // traps during a port-channel change, a config save, the auto-timer all
+    // landing close together - doesn't run the whole-switch walk over and over.
+    // A quiet load is skipped if one is already in flight, or finished within
+    // the last 12s. User-initiated loads (quiet=false) always run.
+    if (quiet) {
+      if (s._healthInFlight) return Promise.resolve();
+      if (s._lastFullHealth && Date.now() - s._lastFullHealth < 12000) return Promise.resolve();
+    }
+    s._healthInFlight = true;
+    subDot(s, 'overview', 'busy');
+    if (!quiet) showSpinner(s, true);
+    s.refreshBtn.disabled = true;
+    if (!s.health) {
+      clear(s.grid);
+    }
+    return fetch('/api/health', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: s.target })
+    })
+      .then((r) => r.json().then((b) => ({ ok: r.ok, body: b })))
+      .then(({ ok, body }) => {
+        s.refreshBtn.disabled = false;
+        showSpinner(s, false);
+        if (!ok || body.error) {
+          const m = (body && body.error) || 'Health collection failed.';
+          appLog('error', 'Health collection failed', { host: s.host, message: m });
+          setTab(s, 'critical', s.host);
+          subDot(s, 'overview', 'err');
+          subTint(s, 'overview', 'critical');
+          s.healthStatus.textContent = 'error: ' + m;
+          if (!s.health) { clear(s.grid); s.grid.appendChild(el('div', 'empty-state', m)); }
+          return;
+        }
+        // Render exactly as a snapshot read does. History is the server's job
+        // now (the collector records every poll), so a live walk no longer
+        // samples into the graph here - loadHistory reads it back from the
+        // server's store.
+        applyFullHealth(s, body);
+      })
+      .catch((e) => {
+        s.refreshBtn.disabled = false;
+        showSpinner(s, false);
+        appLog('error', 'Health request failed', { host: s.host, message: e.message });
+        subDot(s, 'overview', 'err');
+        s.healthStatus.textContent = 'request failed: ' + e.message;
+      })
+      .finally(() => { s._healthInFlight = false; s._lastFullHealth = Date.now(); });
+  }
+
+  /** Refresh one panel: its OID, its tables, or the whole switch. */
+  function refreshPanel(s, p, btn) {
+    if (!s.target) return;
+    if (p.kind === 'oid') { loadPanelData(s, p); return; }
+    // Syslog comes from the receiver in this app, not from the switch.
+    if (p.key === 'events') { loadEvents(s, p); return; }
+    if (p.key === 'auth') { loadSessions(s); }
+    // Interactive, write-driven panels don't come from the health poll; a
+    // refresh just re-paints them rather than walking the whole switch.
+    if (p.key === 'capture' || p.key === 'flash') { if (p._body) paintPanelBody(s, p); return; }
+
+    const tables = PANEL_TABLES[p.key];
+    if (!tables) { loadHealth(s); return; }   // whole-switch panel
+
+    if (btn) { btn.disabled = true; btn.classList.add('spin'); }
+    appLog('info', 'Refreshing panel', { host: s.host, panel: p.title, tables: tables.join(',') });
+    fetch('/api/health', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: s.target, only: tables })
+    })
+      .then((r) => r.json().then((b) => ({ ok: r.ok, body: b })))
+      .then(({ ok, body }) => {
+        if (btn) { btn.disabled = false; btn.classList.remove('spin'); }
+        if (!ok || body.error) {
+          appLog('error', 'Panel refresh failed', { host: s.host, panel: p.title, message: body.error });
+          return;
+        }
+        // Merge only what was asked for; the rest of the page keeps the
+        // values from its last full collection.
+        for (const key of body.keys || []) s.health[key] = body[key];
+        const keep = p._body ? p._body.scrollTop : 0;
+        paintPanelBody(s, p);
+        if (p._body) p._body.scrollTop = keep;
+      })
+      .catch((e) => {
+        if (btn) { btn.disabled = false; btn.classList.remove('spin'); }
+        appLog('error', 'Panel refresh failed', { host: s.host, panel: p.title, message: e.message });
+      });
+  }
+
+  function loadPanelData(s, panel) {
+    if (!s.target || panel.kind !== 'oid') return;
+    panel.loading = true;
+    paintPanelBody(s, panel);
+    const path = panel.op === 'walk' ? '/api/snmp/walk' : '/api/snmp/get';
+    const payload = panel.op === 'walk' ? { oid: panel.oid } : { oids: [panel.oid] };
+    fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ target: s.target }, payload))
+    })
+      .then((r) => r.json().then((b) => ({ ok: r.ok, body: b })))
+      .then(({ ok, body }) => {
+        panel.loading = false;
+        if (!ok || body.error) {
+          panel.error = body.error || 'request failed';
+          panel.results = null;
+        } else {
+          panel.error = null;
+          panel.results = body.results;
+          panel.at = new Date();
+        }
+        paintPanelBody(s, panel);
+      })
+      .catch((e) => {
+        panel.loading = false; panel.error = e.message; panel.results = null;
+        paintPanelBody(s, panel);
+      });
+  }
+
+  // ---------- rendering ----------
+  const SEV_ORDER = { critical: 0, warning: 1, info: 2, ok: 3 };
+  const stateClass = (v) => /normal|^on\b|^up|^ok$/i.test(v) ? 'good'
+    : (/critical|shutdown|notFunctioning|faulty|fail/i.test(v) ? 'crit'
+    : (/notPresent|notAvailable|^off|^down/i.test(v) ? 'idle' : 'warn'));
+
+  // ============================================================================
+  // Keyed table reconciliation engine
+  // ----------------------------------------------------------------------------
+  // The dashboard's single source of truth is s.health; panels render tables
+  // from it. The naive model - on any change, clear the panel body and rebuild
+  // every row - is correct but heavy: it tears down hundreds of DOM nodes to
+  // reflect one changed cell, which reflows the layout and bounces the viewport.
+  //
+  // keyedTable renders a table ONCE and then reconciles in place: given a fresh
+  // row set, it matches rows by a stable key, updates only the cells whose
+  // content actually changed, and adds/removes rows as needed - touching nothing
+  // else. A cell that did not change keeps its exact DOM node (and its event
+  // handlers), so the viewport cannot move and editable controls are undisturbed.
+  //
+  // Cell specs are the same shapes the legacy table() builder accepts:
+  //   plain string/number            -> text cell
+  //   { v, pill }                    -> coloured status pill
+  //   { v, click:{open} }            -> row-opens-detail link cell
+  //   { actions }                    -> port action buttons (via portActionsCell)
+  //   { vlanDelete } / { rowActions }-> module-specific action cells
+  //   { cellNode }                   -> a caller-built DOM node (buttons, etc.)
+  // Value cells diff by their value; node-bearing cells (cellNode/actions/...)
+  // carry an explicit `sig` string the caller sets to whatever determines their
+  // content (e.g. a shut button's admin state). When sig is unchanged the node
+  // is kept as-is; when it changes - or when no sig is given - the cell is
+  // rebuilt. `key` on each row gives its identity; `_flash:true` on a cell
+  // highlights it after an update.
+  // ============================================================================
+
+  // Build one <td> for a cell spec. Extracted so the first render and every
+  // later patch produce identical DOM. `s` is the session (action cells need it).
+  function ktRenderCell(s, c) {
+    // A raw DOM node (the legacy snmpTable style) or an explicit { node } spec:
+    // wrap it in a cell. If the node is an action group, its clicks must not
+    // bubble to a row-click handler.
+    if (c instanceof Node) {
+      const isAct = c.classList && (c.classList.contains('tbl-acts') || c.classList.contains('tbl-act-btn'));
+      const td = el('td', isAct ? 'tbl-act' : '');
+      if (isAct) td.addEventListener('click', (e) => e.stopPropagation());
+      td.appendChild(c);
+      return td;
+    }
+    if (c && c.node instanceof Node) {
+      const td = el('td', c.actCell ? 'tbl-act' : '');
+      if (c.actCell) td.addEventListener('click', (e) => e.stopPropagation());
+      td.appendChild(c.node);
+      return td;
+    }
+    if (c && c.actions) {
+      const cell = portActionsCell(s, c.actions);
+      cell.addEventListener('click', (e) => e.stopPropagation());
+      return cell;
+    }
+    if (c && c.vlanDelete) {
+      const td = el('td', 'tbl-act');
+      td.addEventListener('click', (e) => e.stopPropagation());
+      buildVlanDeleteCell(s, td, c.vlanDelete);
+      return td;
+    }
+    if (c && c.cellNode) {
+      const td = el('td', 'tbl-act');
+      td.addEventListener('click', (e) => e.stopPropagation());
+      td.appendChild(c.cellNode);
+      return td;
+    }
+    if (c && c.rowActions) {
+      const td = el('td', 'port-actions');
+      td.addEventListener('click', (e) => e.stopPropagation());
+      if (s._aaaRowAction) s._aaaRowAction(td, c.rowActions);
+      return td;
+    }
+    if (c && c.click) {
+      const td = el('td', 'col-value');
+      td.appendChild(el('span', 'port-link', c.v === undefined || c.v === null ? '' : c.v));
+      return td;
+    }
+    const pillText = c && c.pill ? String(c.v === undefined || c.v === null ? '' : c.v).trim() : '';
+    if (c && c.pill && pillText) {
+      const td = document.createElement('td');
+      td.appendChild(el('span', 'pill ' + stateClass(pillText), c.v));
+      return td;
+    }
+    if (c && c.pill) return el('td', 'col-value', '');
+    const text = (c && typeof c === 'object')
+      ? (c.v === undefined || c.v === null ? '' : c.v)
+      : (c === undefined || c === null ? '' : c);
+    return el('td', 'col-value', typeof text === 'object' ? '' : text);
+  }
+
+  // A stable signature of a cell's rendered content, used to decide whether a
+  // patch needs to touch the DOM. Value cells hash their shape + value; cells
+  // that carry a live DOM node use the caller-supplied `sig` (and when none is
+  // given, a random signature forces a rebuild every time, which is safe).
+  function ktCellSig(c) {
+    if (c === null || c === undefined) return 't:';
+    if (c instanceof Node) return 'dom:\u0000rand' + Math.random();   // raw node: always rebuild unless wrapped with a sig
+    if (typeof c !== 'object') return 't:' + c;
+    // Cells carrying a live DOM node diff by a caller-supplied sig; without one
+    // they rebuild every reconcile (safe default).
+    if (c.actions || c.cellNode || c.vlanDelete || c.rowActions || (c.node instanceof Node)) {
+      return 'n:' + (c.sig !== undefined ? c.sig : ('\u0000rand' + Math.random()));
+    }
+    const kind = c.pill ? 'p' : (c.click ? 'c' : 'v');
+    const val = c.v === undefined || c.v === null ? '' : c.v;
+    return kind + ':' + val;
+  }
+
+  // Whether a row is clickable, and wiring its handler - matches table()'s rule.
+  // A cell's row-detail "click" spec - but only plain-object cell specs count.
+  // A raw DOM node (e.g. a <button>) has a native .click METHOD, so it must be
+  // excluded or it would be mistaken for a { click } cell.
+  function ktClickOf(cells) {
+    const c = cells.find((x) => x && typeof x === 'object' && !(x instanceof Node) && x.click);
+    return c ? c.click : null;
+  }
+  function ktWireRow(s, tr, rowCells, onRowClick) {
+    const rowDetail = ktClickOf(rowCells);
+    tr._ktRowKey = tr._ktKey;
+    if (rowDetail) {
+      tr.classList.add('row-clickable');
+      if (typeof rowDetail.open === 'function') {
+        tr.title = 'Show details';
+        tr._ktOpen = () => rowDetail.open();
+      } else {
+        tr.title = 'Show interface detail, counters, and switchport settings';
+        tr._ktOpen = () => openPortDetail(s, rowDetail);
+      }
+      tr.addEventListener('click', () => { if (tr._ktOpen) tr._ktOpen(); });
+    } else if (onRowClick) {
+      // Row-level edit action (the SNMP config / ACL edit-row pattern): the whole
+      // row is clickable to edit, addressed by key so it survives reconciles.
+      tr.classList.add('row-clickable');
+      tr.title = 'Edit';
+      tr.addEventListener('click', () => onRowClick(tr._ktRowKey, tr));
+    }
+  }
+
+  // Create a keyed, reconcilable table. Returns { node, reconcile(newRows) }.
+  //   cols     : header labels (array)
+  //   rows     : array of { key, cells:[...] }
+  // The node is a .table-scroll wrapper, same as table(), so it drops in
+  // wherever a table() result went.
+  function keyedTable(s, cols, rows, opts) {
+    opts = opts || {};
+    const ROW_CAP = opts.cap || 250;        // max rows shown before a "Show all"
+    const pageSize = opts.pageSize || 0;    // >0 paginates; 0 = no pagination
+    const onRowClick = opts.onRowClick;     // (key, tr) => edit this row
+    const wrap = el('div', 'table-scroll');
+    const t = el('table', 'data-table');
+    const thead = el('thead'); const htr = document.createElement('tr');
+    for (const x of cols) htr.appendChild(el('th', (x === '' ? 'tbl-act-h' : ''), x));
+    thead.appendChild(htr); t.appendChild(thead);
+    const tb = el('tbody'); t.appendChild(tb);
+    const controls = el('div', 'kt-controls');   // pager / show-all live here
+    wrap.appendChild(t); wrap.appendChild(controls);
+    // Legacy snmpTable exposed these for editor-row anchoring; keep them.
+    wrap._tbody = tb; wrap._colspan = cols.length;
+
+    let allRows = rows.slice();   // the full logical row set (reconcile replaces it)
+    let page = 0;
+    let showAll = false;          // non-paginated: reveal rows past the cap
+
+    const flash = (td) => { td.classList.add('value-changed'); setTimeout(() => { td.classList.remove('value-changed'); }, 1700); };
+
+    // Build one <tr> for a row spec, recording per-cell signatures for diffing.
+    const buildRow = (row) => {
+      const tr = document.createElement('tr');
+      tr._ktKey = String(row.key);
+      tr._ktSigs = [];
+      ktWireRow(s, tr, row.cells, onRowClick);
+      row.cells.forEach((c) => {
+        const td = ktRenderCell(s, c);
+        tr.appendChild(td);
+        tr._ktSigs.push(ktCellSig(c));
+        if (c && c._flash) flash(td);
+      });
+      return tr;
+    };
+
+    // Patch an existing <tr> in place from a fresh row spec.
+    const patchRow = (tr, row) => {
+      const tds = tr.children;
+      row.cells.forEach((c, i) => {
+        const sig = ktCellSig(c);
+        if (tr._ktSigs[i] !== sig) {
+          const td = ktRenderCell(s, c);
+          if (tds[i]) tr.replaceChild(td, tds[i]); else tr.appendChild(td);
+          tr._ktSigs[i] = sig;
+          if (c && c._flash) flash(td);
+        } else if (c && c._flash && tds[i]) { flash(tds[i]); }
+      });
+      // Always refresh the row-open closure (captures current row values) and
+      // the row-edit key, so a reconciled row never fires a stale handler.
+      const detail = ktClickOf(row.cells);
+      tr._ktOpen = detail ? (typeof detail.open === 'function' ? () => detail.open() : () => openPortDetail(s, detail)) : null;
+      tr._ktRowKey = String(row.key);
+      const wasClk = tr.classList.contains('row-clickable');
+      const clickable = !!detail || !!onRowClick;
+      if (clickable && !wasClk) tr.classList.add('row-clickable');
+      if (!clickable && wasClk) tr.classList.remove('row-clickable');
+    };
+
+    // Which rows are visible right now (pagination / cap applied).
+    const visibleSlice = () => {
+      if (pageSize > 0) { const start = page * pageSize; return allRows.slice(start, start + pageSize); }
+      if (!showAll && allRows.length > ROW_CAP) return allRows.slice(0, ROW_CAP);
+      return allRows;
+    };
+
+    // Render the pager / show-all control to match the current state.
+    const renderControls = () => {
+      clear(controls);
+      if (pageSize > 0 && allRows.length > pageSize) {
+        const pageCount = Math.ceil(allRows.length / pageSize);
+        if (page > pageCount - 1) page = pageCount - 1; if (page < 0) page = 0;
+        const start = page * pageSize;
+        const pager = el('div', 'tbl-pager');
+        const prev = el('button', 'btn btn-small', '\u2039 Prev'); prev.type = 'button'; prev.disabled = page === 0;
+        const next = el('button', 'btn btn-small', 'Next \u203a'); next.type = 'button'; next.disabled = page >= pageCount - 1;
+        const lbl = el('span', 'tbl-pager-lbl', 'Showing ' + (start + 1) + '\u2013' + Math.min(start + pageSize, allRows.length) + ' of ' + allRows.length.toLocaleString() + '  \u00b7  page ' + (page + 1) + '/' + pageCount);
+        prev.addEventListener('click', () => { if (page > 0) { page--; syncRows(); reflowTallPanels(s); } });
+        next.addEventListener('click', () => { if (page < pageCount - 1) { page++; syncRows(); reflowTallPanels(s); } });
+        pager.appendChild(prev); pager.appendChild(lbl); pager.appendChild(next);
+        controls.appendChild(pager);
+      } else if (pageSize === 0 && !showAll && allRows.length > ROW_CAP) {
+        const note = el('div', 'panel-note', 'Showing ' + ROW_CAP.toLocaleString() + ' of ' + allRows.length.toLocaleString() + ' rows.  ');
+        note.style.marginBottom = '6px';
+        const more = el('button', 'raw-toggle', 'Show all'); more.type = 'button';
+        more.addEventListener('click', () => { showAll = true; syncRows(); renderControls(); reflowTallPanels(s); });
+        note.appendChild(more); controls.appendChild(note);
+      }
+    };
+
+    // Reconcile the tbody to exactly the visible slice: patch matched rows, add
+    // new, remove gone, reorder. The engine's core.
+    const syncRows = () => {
+      const slice = visibleSlice();
+      const existing = new Map();
+      for (const tr of Array.from(tb.children)) { if (tr._ktKey !== undefined) existing.set(tr._ktKey, tr); }
+      let anchor = null;   // rows go after this (null = tbody start)
+      for (const row of slice) {
+        const key = String(row.key);
+        let tr = existing.get(key);
+        if (!tr) {
+          tr = buildRow(row);
+          if (anchor) { if (anchor.nextSibling) tb.insertBefore(tr, anchor.nextSibling); else tb.appendChild(tr); }
+          else if (tb.firstChild) tb.insertBefore(tr, tb.firstChild); else tb.appendChild(tr);
+        } else {
+          existing.delete(key);
+          patchRow(tr, row);
+          const want = anchor ? anchor.nextSibling : tb.firstChild;
+          if (want !== tr) { if (anchor) { if (anchor.nextSibling) tb.insertBefore(tr, anchor.nextSibling); else tb.appendChild(tr); } else tb.insertBefore(tr, tb.firstChild); }
+        }
+        anchor = tr;
+      }
+      for (const tr of existing.values()) tr.remove();   // drop rows not in the slice
+    };
+
+    syncRows();
+    renderControls();
+
+    // Public reconcile: swap in a fresh full row set and re-render.
+    function reconcile(newRows) {
+      allRows = newRows.slice();
+      if (pageSize > 0) { const pc = Math.max(1, Math.ceil(allRows.length / pageSize)); if (page > pc - 1) page = pc - 1; }
+      syncRows();
+      renderControls();
+    }
+
+    // Expose an anchor lookup so callers can mount an inline editor row beneath a
+    // data row (the SNMP config panels do this), addressed by row key.
+    wrap._rowByKey = (key) => Array.from(tb.children).find((tr) => tr._ktKey === String(key)) || null;
+
+    return { node: wrap, reconcile };
+  }
+
+  // ---- panel integration -----------------------------------------------------
+  // A converted panel calls mountKeyedTable(s, p, id, cols, rows) wherever it
+  // would have done body.appendChild(table(cols, rows)). On a normal (full) paint
+  // it builds the keyed table, remembers it on the panel under `id`, and appends
+  // its node. On a reconcile pass (s._ktReconcile set) it instead updates the
+  // already-mounted table in place and appends nothing - so the body is never
+  // cleared and the viewport cannot move. `rows` are { key, cells } objects.
+  //
+  // Panels that have not been converted keep using table(); they simply do a
+  // full repaint as before. This lets the conversion happen panel by panel.
+  function mountKeyedTable(s, p, id, cols, rows, opts) {
+    p._kt = p._kt || {};
+    if (s._ktSeen) s._ktSeen.add(id);   // record tables produced this pass
+    const mounted = p._kt[id] && p._body && p._body.contains(p._kt[id].node);
+    if (s._ktReconcile) {
+      // A table that appeared, or whose column count changed, is a structural
+      // change - signal a full repaint rather than an in-place patch.
+      if (!mounted || (p._kt[id].cols || 0) !== cols.length) s._ktStructural = true;
+      if (mounted && (p._kt[id].cols || 0) === cols.length) {
+        p._kt[id].reconcile(rows);
+        return p._kt[id].node;
+      }
+    }
+    const kt = keyedTable(s, cols, rows, opts);
+    kt.cols = cols.length;
+    p._kt[id] = kt;
+    return kt.node;   // caller appends it (full-paint path)
+  }
+
+  // Place a keyed table into `container`, correctly across BOTH full paint and
+  // in-place reconcile. This exists because `body.appendChild(mountKeyedTable(...))`
+  // is only safe for a panel with ONE table: on a reconcile, mountKeyedTable
+  // reconciles the existing node in place and returns it, and re-appending that
+  // already-attached node MOVES it to the end of the container - so a panel with
+  // several interleaved tables piles them all at the bottom, detached from their
+  // section titles (the routing-panel "tables jump to the bottom" bug). mountInto
+  // appends only when the node is not already in the container, leaving an
+  // in-place-reconciled node exactly where it sits. Every panel that mounts more
+  // than one keyed table MUST use this instead of a bare appendChild.
+  function mountInto(container, s, p, id, cols, rows, opts) {
+    const node = mountKeyedTable(s, p, id, cols, rows, opts);
+    if (node && container && node.parentNode !== container) container.appendChild(node);
+    return node;
+  }
+
+  // Turn plain cell-arrays into keyed rows for mountKeyedTable. keyFn(row,i)->key.
+  function keyedRowsFrom(cellArrays, dataRows, keyFn) {
+    return cellArrays.map((cells, i) => ({ key: String(keyFn(dataRows[i], i)), cells: cells }));
+  }
+
+  // A one-shot keyed table for panels that manage their OWN container and
+  // rebuild it wholesale on their own refresh (SNMP config, ACL) - they don't
+  // participate in the panel reconcile system, so they just need the standard
+  // table markup. Rows are plain cell-arrays (cells may be values or DOM nodes,
+  // the legacy snmpTable style). onRowClick(i, tr) is supported for edit rows.
+  // Returns the node; keeps _tbody/_colspan/_rowByKey for editor anchoring.
+  function plainTable(s, cols, rows, onRowClick) {
+    const krows = rows.map((cells, i) => ({ key: 'r' + i, cells: cells }));
+    const kt = keyedTable(s, cols, krows, onRowClick ? { onRowClick: (key, tr) => onRowClick(parseInt(String(key).slice(1), 10), tr) } : undefined);
+    return kt.node;
+  }
+
+  // Reconcile a panel in place: re-run its paint logic with the reconcile flag
+  // set, so its mountKeyedTable calls patch the existing tables instead of
+  // rebuilding. Returns true if the panel handled it (is converted), false if it
+  // has no mounted keyed tables yet (caller should fall back to a full repaint).
+  // panelIsConverted lists the keys that use keyed tables for every table they
+  // render; a converted panel is safe to reconcile without a full repaint.
+  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl']);   // filled in as each is converted
+  // A converted panel may still have unkeyed sections (auth's AAA servers). When
+  // a refresh changes a table those read, full-repaint instead of reconciling.
+  const PANEL_FULL_REPAINT_TABLES = {
+    auth: ['radius', 'radiusServers', 'radiusStats', 'tacacs', 'tacacsServers', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode']
+    // (routing's scalar-driven status pills update in place during reconcile -
+    // see paintRoutingPanel - so it does not need a forced full repaint.)
+  };
+  function reconcilePanelInPlace(s, p) {
+    if (!p || !p._body || p.collapsed) return false;
+    if (!KEYED_PANELS.has(p.key)) return false;
+    const prev = s._ktReconcile, prevSeen = s._ktSeen, prevStruct = s._ktStructural;
+    s._ktReconcile = true;
+    s._ktSeen = new Set();
+    s._ktStructural = false;
+    let ok = true;
+    try { paintBuiltin(s, p.key, p._body, p); }
+    catch (e) { ok = false; appLog('error', 'Panel reconcile failed', { panel: p.title, message: e.message }); }
+    // A table mounted before but not produced this pass has disappeared - also
+    // structural.
+    if (ok && p._kt) {
+      for (const id of Object.keys(p._kt)) {
+        if (!s._ktSeen.has(id) && p._body.contains(p._kt[id].node)) { s._ktStructural = true; break; }
+      }
+    }
+    const structural = s._ktStructural;
+    s._ktReconcile = prev; s._ktSeen = prevSeen; s._ktStructural = prevStruct;
+    if (!ok) return false;
+    if (structural) { repaintPanel(s, p.key); return true; }
+    return true;
+  }
+
+  // The dashboard reflects live SNMP only. A tech-support capture is a
+  // point-in-time text dump collected on demand; mixing it in made it
+  // ambiguous whether a panel was showing the switch now or an hour ago.
+  // The single source of truth for "what alerts are active right now". The
+  // switch's baked-in alerts (h.alerts) are a snapshot from collection time, but
+  // the saved-config state changes live (an optimistic save, a light refresh) -
+  // so the CONFIG alert must be re-derived from the current scalar rather than
+  // trusted from the snapshot. EVERY consumer - the Attention badge severity AND
+  // the findings list the user reads - goes through here, so the badge can never
+  // disagree with the messages shown (the bug where "Attention" showed with no
+  // reason, because the badge counted a stale CONFIG alert the findings dropped).
+  function liveAlerts(s) {
+    const h = s.health;
+    if (!h || !Array.isArray(h.alerts)) return [];
+    const list = h.alerts.slice().filter((x) => String(x.area).toLowerCase() !== 'config');
+    if (switchSaysUnsaved(s)) {
+      list.push({ severity: 'warning', area: 'Config', message: 'Running configuration differs from startup - changes will be lost on reload.' });
+    }
+    return list;
+  }
+
+  function overallSeverity(s) {
+    if (!s.health) return 'ok';
+    const real = liveAlerts(s).filter((x) => x.severity !== 'ok');
+    return ['critical', 'warning', 'info'].find((x) => real.some((y) => y.severity === x)) || 'ok';
+  }
+
+  /**
+   * A panel whose contents do not fit gets given its full height and moved
+   * to the end of the grid, so the page scrolls once instead of the page
+   * scrolling past a box that scrolls too. Scrolling inside a scroll is
+   * the worst way to read a table.
+   *
+   * A panel the user has sized by hand is left exactly as they set it.
+   */
+  function reflowTallPanels(s, opts) {
+    if (!s.grid || s.reflowing) return;
+    // A panel whose contents overflow gets its full height (auto-grow) so you
+    // don't scroll inside a scroll. It is NEVER moved: panels stay exactly
+    // where they are and only change position when the user drags/reorders
+    // them. (Earlier this function relocated overflowing panels to the bottom,
+    // which made modules like Events "bounce" down on a refresh.)
+    s.reflowing = true;
+    for (const p of s.panels) {
+      const box = p._box;
+      if (!box || !box.isConnected || p.collapsed || p.userSized) continue;
+      const body = p._body;
+      if (!body) continue;
+      const overflows = body.scrollHeight > body.clientHeight + 4;
+      if (overflows && !p.autoGrow) {
+        p.autoGrow = true;
+      } else if (!overflows && p.autoGrow && !p.h) {
+        p.autoGrow = false;
+      }
+      box.classList.toggle('auto-grow', !!p.autoGrow);
+      if (p.autoGrow) box.style.height = '';
+    }
+    s.reflowing = false;
+  }
+
+  function renderSwitch(s) {
+    if (!s.health) return;
+    // A refresh landing mid-drag would rebuild the grid under the pointer
+    // and throw away the resize in progress. Defer until the drag ends.
+    if (s.grid && s.grid.querySelector('.panel.resizing')) {
+      s.renderPending = true;
+      return;
+    }
+    const sev = overallSeverity(s);
+    setTab(s, sev, s.host || 'switch');
+    applyHealthState(s, sev);
+
+    s.healthStatus.textContent = 'SNMP last checked: ' + new Date(s.health.collectedAt).toLocaleTimeString() +
+      (s.health.failed.length ? '  \u00b7  ' + s.health.failed.length + ' OID(s) unavailable' : '');
+
+    // On a refresh the panels themselves have not changed, only their
+    // contents. Rebuilding every shell threw away scroll positions inside
+    // tables and churned the whole grid every 30 seconds, so repaint the
+    // bodies in place when the set of visible panels is the same.
+    const visible = s.panels.filter((p) => {
+      const def = p.kind === 'builtin' ? builtinDef(p.key) : null;
+      if (def && def.needs && !def.needs(s)) return false;     // runtime: no data
+      if (def && !productSupports(s, def)) return false;       // MIB: product lacks the feature
+      return true;
+    });
+    const sameSet = s.renderedIds &&
+      s.renderedIds.length === visible.length &&
+      visible.every((p, i) => s.renderedIds[i] === p.id);
+
+    if (sameSet) {
+      // Preserve the dashboard scroll container's position too: repainting a
+      // panel body briefly changes its height, which otherwise jolts the view on
+      // every background refresh. (The window does not scroll here - .scroll-body
+      // does - so scrollKeeper restores the right element.)
+      const restoreRs = scrollKeeper(s);
+      for (const p of visible) {
+        if (p.kind === 'oid') continue;     // owns its own refresh cycle
+        const keepScroll = p._body ? p._body.scrollTop : 0;
+        paintPanelBody(s, p);
+        if (p._body) p._body.scrollTop = keepScroll;
+      }
+      reflowTallPanels(s);
+      restoreRs();
+      return;
+    }
+
+    clear(s.grid);
+    for (const p of visible) s.grid.appendChild(buildPanel(s, p));
+    s.renderedIds = visible.map((p) => p.id);
+    reflowTallPanels(s);
+    if (!s.grid.children.length) {
+      s.grid.appendChild(el('div', 'empty-state',
+        'Every panel has been removed. Use "+ Add panel" to bring one back.'));
+    }
+  }
+
+  /**
+   * A collapsed panel keeps its header and gives up its height, so the
+   * grid closes over it instead of leaving a hole. The pixel height is
+   * remembered so expanding restores what it was.
+   */
+  function applyCollapsed(box, p) {
+    box.classList.toggle('collapsed', !!p.collapsed);
+    if (p.collapsed) {
+      box.style.height = '';
+    } else if (p.h) {
+      box.style.height = p.h + 'px';
+    }
+  }
+
+  function buildPanel(s, p) {
+    const box = el('div', 'panel');
+    box.style.gridColumn = 'span ' + Math.max(2, Math.min(GRID_COLS, p.span || 12));
+    if (p.h) { box.style.height = p.h + 'px'; }
+    box.dataset.id = p.id;
+
+    const head = el('div', 'panel-head');
+    // Only the grip starts a drag. With the whole header draggable, a
+    // press on the title was the beginning of a drag gesture as far as the
+    // browser was concerned, and it suppressed the click that followed --
+    // which is why folding a panel often took two attempts.
+    const grip = el('span', 'grip', '\u2630');
+    grip.draggable = true;
+    grip.title = 'Drag to reorder';
+    head.appendChild(grip);
+    // The title is the obvious thing to click to fold a panel, and a
+    // bigger target than the caret.
+    const titleEl = el('span', 'panel-title clickable', p.title);
+    titleEl.title = 'Show or hide this panel';
+    head.appendChild(titleEl);
+
+    // Refresh just this panel. For most built-ins that means re-walking
+    // only the tables it shows; for the whole-switch panels there is
+    // nothing smaller to ask for, so it is a full collection.
+    const rb = el('button', 'panel-act', '\u27F3');
+    rb.type = 'button';
+    rb.title = 'Refresh this panel';
+    rb.addEventListener('click', (e) => { e.stopPropagation(); refreshPanel(s, p, rb); });
+    head.appendChild(rb);
+
+    if (p.kind === 'oid') {
+      const ed = el('button', 'panel-act', '\u270E');
+      ed.type = 'button'; ed.title = 'Edit panel';
+      ed.addEventListener('click', (e) => { e.stopPropagation(); openPanelDialog(s, p); });
+      head.appendChild(ed);
+    }
+
+    // Collapse to just the header. Sits between refresh and close because
+    // that is where the eye already is, and it is remembered with the rest
+    // of the layout so a folded panel stays folded.
+    const min = el('button', 'panel-act', p.collapsed ? '\u25B8' : '\u25BE');
+    min.type = 'button';
+    min.title = p.collapsed ? 'Expand panel' : 'Minimise panel';
+    const toggle = (e) => {
+      e.stopPropagation();
+      p.collapsed = !p.collapsed;
+      applyCollapsed(box, p);
+      min.textContent = p.collapsed ? '\u25B8' : '\u25BE';
+      min.title = p.collapsed ? 'Expand panel' : 'Minimise panel';
+      // A collapsed panel is not painted -- there is nothing to see and
+      // building a thousand table rows for a folded box is waste. So an
+      // expanding panel has to be filled now, or it opens empty.
+      if (!p.collapsed) {
+        paintPanelBody(s, p);
+        reflowTallPanels(s, { keepOrder: true });
+      }
+      saveLayout(s);
+    };
+    min.addEventListener('click', toggle);
+    // The whole header folds the panel, not just the text of the title.
+    // The title is a line of text a few pixels tall inside a header three
+    // times that; clicking the obvious target and having nothing happen is
+    // the app's fault, not the operator's.
+    head.addEventListener('click', (e) => {
+      // The buttons and the grip do their own jobs.
+      if (e.target.closest('.panel-act') || e.target.closest('.grip')) return;
+      toggle(e);
+    });
+    head.appendChild(min);
+
+    const rm = el('button', 'panel-act', '\u2715');
+    rm.type = 'button'; rm.title = 'Remove panel';
+    rm.addEventListener('click', (e) => {
+      e.stopPropagation();
+      s.panels = s.panels.filter((x) => x.id !== p.id);
+      s.renderedIds = null;
+      saveLayout(s);
+      renderSwitch(s);
+    });
+    head.appendChild(rm);
+    box.appendChild(head);
+
+    const body = el('div', 'panel-body');
+    box.appendChild(body);
+    p._box = box;
+    applyCollapsed(box, p);
+    p._body = body;
+    paintPanelBody(s, p);
+
+    // ---- drag to reorder ----
+    grip.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('text/plain', p.id);
+      e.dataTransfer.effectAllowed = 'move';
+      box.classList.add('dragging');
+    });
+    grip.addEventListener('dragend', () => box.classList.remove('dragging'));
+    box.addEventListener('dragover', (e) => { e.preventDefault(); box.classList.add('drag-over'); });
+    box.addEventListener('dragleave', () => box.classList.remove('drag-over'));
+    box.addEventListener('drop', (e) => {
+      e.preventDefault();
+      box.classList.remove('drag-over');
+      const from = e.dataTransfer.getData('text/plain');
+      if (!from || from === p.id) return;
+      const fi = s.panels.findIndex((x) => x.id === from);
+      const ti = s.panels.findIndex((x) => x.id === p.id);
+      if (fi < 0 || ti < 0) return;
+      const [moved] = s.panels.splice(fi, 1);
+      s.panels.splice(ti, 0, moved);
+      s.renderedIds = null;
+      saveLayout(s);
+      renderSwitch(s);
+    });
+
+    // ---- resize ----
+    // Three grab areas rather than one corner: the right edge for width,
+    // the bottom edge for height, the corner for both. A 16px corner is
+    // hard to find and, since most panels start full width, dragging it
+    // right does nothing -- which reads as "resize is broken".
+    const startResize = (e, mode) => {
+      e.preventDefault(); e.stopPropagation();
+      const handle = e.currentTarget;
+      try { handle.setPointerCapture(e.pointerId); } catch (err) { /* older engines */ }
+      const gridW = s.grid.getBoundingClientRect().width;
+      const colW = gridW / GRID_COLS;
+      const startX = e.clientX, startY = e.clientY;
+      const startSpan = p.span || GRID_COLS;
+      const startH = p.h || box.getBoundingClientRect().height;
+
+      box.classList.add('resizing');
+      const badge = el('div', 'resize-badge', '');
+      box.appendChild(badge);
+      const paint = () => {
+        badge.textContent = (p.span || GRID_COLS) + '/' + GRID_COLS + ' wide  \u00b7  ' +
+          Math.round(p.h || box.getBoundingClientRect().height) + 'px tall';
+      };
+      paint();
+
+      const move = (ev) => {
+        p.userSized = true;
+        p.autoGrow = false;
+        box.classList.remove('auto-grow');
+        if (mode !== 'height') {
+          const span = Math.max(2, Math.min(GRID_COLS, startSpan + Math.round((ev.clientX - startX) / colW)));
+          box.style.gridColumn = 'span ' + span;
+          p.span = span;
+        }
+        if (mode !== 'width') {
+          const h = Math.max(120, startH + (ev.clientY - startY));
+          box.style.height = h + 'px';
+          p.h = Math.round(h);
+        }
+        paint();
+      };
+      const up = () => {
+        handle.removeEventListener('pointermove', move);
+        handle.removeEventListener('pointerup', up);
+        window.removeEventListener('pointerup', up);
+        box.classList.remove('resizing');
+        badge.remove();
+        saveLayout(s);
+        // Apply anything that arrived while the pointer was down.
+        if (s.renderPending) { s.renderPending = false; renderSwitch(s); }
+      };
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('pointerup', up);
+      window.addEventListener('pointerup', up);
+    };
+
+    for (const [cls, mode, tip] of [
+      ['panel-resize-x', 'width', 'Drag to change width'],
+      ['panel-resize-y', 'height', 'Drag to change height'],
+      ['panel-resize', 'both', 'Drag to resize']
+    ]) {
+      const handle = el('div', cls, '');
+      handle.title = tip;
+      handle.addEventListener('pointerdown', (e) => startResize(e, mode));
+      box.appendChild(handle);
+    }
+
+    return box;
+  }
+
+  /**
+   * The highest value seen in the samples held. A rate is a snapshot of
+   * one instant, and the instant you happened to look is rarely the
+   * interesting one -- a switch punting 40,000 packets per second in
+   * bursts reads as idle between them.
+   */
+  /**
+   * The most recent sample for a metric. The cards are painted from the
+   * last collection, but the probe keeps reading every 30 seconds -- so
+   * without this the headline figure sits at whatever it was when the
+   * collection ran and looks stuck, while the graph beneath it moves.
+   */
+  function latestOf(history, key) {
+    for (let i = (history || []).length - 1; i >= 0; i--) {
+      const v = history[i][key];
+      if (v !== null && v !== undefined && Number.isFinite(v)) return v;
+    }
+    return null;
+  }
+
+  function peakOf(history, key, windowMs) {
+    const since = windowMs ? Date.now() - windowMs : 0;
+    let peak = null, at = null, samples = 0;
+    for (const sample of history || []) {
+      if (sample.t < since) continue;
+      const v = sample[key];
+      if (v === null || v === undefined || !Number.isFinite(v)) continue;
+      samples++;
+      if (peak === null || v > peak) { peak = v; at = sample.t; }
+    }
+    return peak === null ? null : { peak, at, samples };
+  }
+
+  /** "4m 12s" rather than 252. */
+  function secs(n) {
+    const v = Number(n) || 0;
+    if (v < 60) return v + 's';
+    if (v < 3600) return Math.floor(v / 60) + 'm ' + (v % 60) + 's';
+    return Math.floor(v / 3600) + 'h ' + Math.floor((v % 3600) / 60) + 'm';
+  }
+
+  /**
+   * A sparkline: the shape of the last hour, drawn small enough to sit on
+   * a metric card. Values speak for themselves; the line says whether the
+   * value is going anywhere.
+   */
+  // Downsample a time series to at most `maxPoints` by time-bucketing: the
+  // series is divided into equal time windows and each window contributes its
+  // PEAK value (so a spike is never averaged away) at its own timestamp. The
+  // card sparkline uses this - a glanceable 100px line needs the shape, not
+  // every one of a week's ~20k points; the full graph still draws them all.
+  function downsampleSeries(pts, maxPoints) {
+    if (!pts || pts.length <= maxPoints) return pts || [];
+    const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+    const span = (t1 - t0) || 1;
+    const bucketMs = span / maxPoints;
+    const out = [];
+    let bucketEnd = t0 + bucketMs, best = null;
+    for (const p of pts) {
+      if (p.t > bucketEnd && best) { out.push(best); best = null; while (p.t > bucketEnd) bucketEnd += bucketMs; }
+      if (best === null || p.v > best.v) best = p;
+    }
+    if (best) out.push(best);
+    return out;
+  }
+
+  function sparkline(samples, opts) {
+    let pts = (samples || []).filter((p) =>
+      p && p.v !== null && p.v !== undefined && Number.isFinite(p.v));
+    if (pts.length < 3) return null;
+    const rawCount = pts.length;
+    // A 100px-wide card line needs no more than ~120 points; downsample by time
+    // so a week of 30s data (~20k points) doesn't render thousands of segments
+    // into 100px. The full graph (drawGraph) does not downsample.
+    if (!(opts && opts.full)) pts = downsampleSeries(pts, 120);
+    const w = 100, h = 22;
+    const vals = pts.map((p) => p.v);
+    const min = Math.min.apply(null, vals);
+    const max = Math.max.apply(null, vals);
+    // A flat line should look flat, not like noise amplified to full scale.
+    const span = (max - min) < 1e-6 ? 1 : (max - min);
+    // Spaced by the clock, not by sample number: readings arrive on a
+    // timer and whenever someone hits refresh, so a burst of manual
+    // refreshes would otherwise stretch a few seconds across half the
+    // graph and make a quiet hour look eventful.
+    const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+    const tspan = (t1 - t0) || 1;
+    const path = pts.map((p, i) =>
+      (i ? 'L' : 'M') + (((p.t - t0) / tspan) * w).toFixed(1) + ' ' +
+      (h - ((p.v - min) / span) * (h - 3) - 1.5).toFixed(1)
+    ).join(' ');
+
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    svg.setAttribute('preserveAspectRatio', 'none');
+    svg.setAttribute('class', 'spark' + (opts && opts.cls ? ' ' + opts.cls : ''));
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    line.setAttribute('d', path);
+    svg.appendChild(line);
+    svg.setAttribute('title', rawCount + ' samples over ' +
+      secs(Math.round(tspan / 1000)) + ' \u00b7 ' +
+      (opts && opts.unit ? min + '-' + max + ' ' + opts.unit : min + '-' + max));
+    return svg;
+  }
+
+  /**
+   * The two actions worth having on a port. Both write to the switch, so
+   * both ask first, name the port in the question, and report what the
+   * port looked like afterwards rather than assuming it worked.
+   */
+  // Per-interface detail popout. Shows the static per-port fields already held
+  // from the walk, then fetches the full live counter set on demand (so these
+  // 17 counters are never walked for every port on every refresh — only pulled
+  // for the one port the user opened).
+  // Each row lists its OID variants in preference order; fetchPortCounters uses
+  // the first that the switch actually answers. The vendor rlifPresent* columns
+  // come first (populated on C1200/C1300), then the standard ifXTable/ifTable
+  // equivalents (same ifIndex). This matters because the C1300X firmware
+  // (4.10.3.26) does NOT implement the rlifPresent counter columns - it returns
+  // noSuchInstance for them (confirmed on the wire) - but does populate the
+  // standard interface counters. Trying both, in order, means counters show on
+  // every line without branching on product (the switch decides).
+  const PORT_COUNTERS = [
+    ['In octets', 'rlifPresentHCInOctets', 'rlifPresentInOctets', 'ifHCInOctets', 'ifInOctets'],
+    ['Out octets', 'rlifPresentHCOutOctets', 'rlifPresentOutOctets', 'ifHCOutOctets', 'ifOutOctets'],
+    ['In unicast', 'rlifPresentHCInUcastPkts', 'rlifPresentInUcastPkts', 'ifHCInUcastPkts', 'ifInUcastPkts'],
+    ['Out unicast', 'rlifPresentHCOutUcastPkts', 'rlifPresentOutUcastPkts', 'ifHCOutUcastPkts', 'ifOutUcastPkts'],
+    ['In multicast', 'rlifPresentHCInMulticastPkts', 'rlifPresentInMulticastPkts', 'ifHCInMulticastPkts', 'ifInMulticastPkts'],
+    ['Out multicast', 'rlifPresentHCOutMulticastPkts', 'rlifPresentOutMulticastPkts', 'ifHCOutMulticastPkts', 'ifOutMulticastPkts'],
+    ['In broadcast', 'rlifPresentHCInBroadcastPkts', 'rlifPresentInBroadcastPkts', 'ifHCInBroadcastPkts', 'ifInBroadcastPkts'],
+    ['Out broadcast', 'rlifPresentHCOutBroadcastPkts', 'rlifPresentOutBroadcastPkts', 'ifHCOutBroadcastPkts', 'ifOutBroadcastPkts'],
+    ['In discards', 'rlifPresentInDiscards', 'ifInDiscards'],
+    ['Out discards', 'rlifPresentOutDiscards', 'ifOutDiscards'],
+    ['In errors', 'rlifPresentInErrors', 'ifInErrors'],
+    ['Out errors', 'rlifPresentOutErrors', 'ifOutErrors'],
+    ['Unknown protos', 'rlifPresentInUnknownProtos', 'ifInUnknownProtos'],
+    ['Out queue len', 'rlifPresentOutQLen', 'ifOutQLen']
+  ];
+
+  // A generic read-only detail popout: a title, a list of [label, value] pairs,
+  // and optional named sub-sections each with their own pairs. Reused for
+  // per-host 802.1X counters and similar.
+  // Reusable edit popout with the same tabbed layout as the interface detail:
+  // a "Configuration" tab (filled by fillConfig(pane)) and, when fillCounters
+  // is provided, a "Counters" tab. Used so every table opens the SAME kind of
+  // popout on row-click. fillConfig / fillCounters receive the pane element to
+  // append into. Returns nothing; manages its own close.
+  function openEditPopout(s, title, fillConfig, fillCounters, opts) {
+    opts = opts || {};
+    const prev = document.querySelector('.port-detail-back');
+    if (prev) prev.remove();
+    const back = el('div', 'port-detail-back');
+    const pop = el('div', 'port-detail');
+    const close = () => back.remove();
+    back.addEventListener('click', (e) => { if (e.target === back) close(); });
+    const head = el('div', 'port-detail-head');
+    head.appendChild(el('h3', '', title));
+    const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
+    x.addEventListener('click', close); head.appendChild(x);
+    pop.appendChild(head);
+
+    const hasCounters = typeof fillCounters === 'function';
+    if (hasCounters) {
+      const tabs = el('div', 'pd-tabs');
+      const cfgBtn = el('button', 'pd-tab active', opts.configLabel || 'Configuration'); cfgBtn.type = 'button';
+      const ctrBtn = el('button', 'pd-tab', opts.countersLabel || 'Counters'); ctrBtn.type = 'button';
+      tabs.appendChild(cfgBtn); tabs.appendChild(ctrBtn); pop.appendChild(tabs);
+      const cfgPane = el('div', 'pd-pane');
+      const ctrPane = el('div', 'pd-pane'); ctrPane.style.display = 'none';
+      pop.appendChild(cfgPane); pop.appendChild(ctrPane);
+      const show = (cfg) => { cfgPane.style.display = cfg ? '' : 'none'; ctrPane.style.display = cfg ? 'none' : ''; cfgBtn.classList.toggle('active', cfg); ctrBtn.classList.toggle('active', !cfg); };
+      cfgBtn.addEventListener('click', () => show(true));
+      ctrBtn.addEventListener('click', () => show(false));
+      fillConfig(cfgPane, close);
+      fillCounters(ctrPane, close);
+    } else {
+      const pane = el('div', 'pd-pane');
+      pop.appendChild(pane);
+      fillConfig(pane, close);
+    }
+    back.appendChild(pop);
+    document.body.appendChild(back);
+  }
+
+  function openDetailDialog(s, title, pairs, sections) {
+    const prev = document.querySelector('.port-detail-back');
+    if (prev) prev.remove();
+    const back = el('div', 'port-detail-back');
+    const pop = el('div', 'port-detail');
+    const close = () => back.remove();
+    back.addEventListener('click', (e) => { if (e.target === back) close(); });
+    const head = el('div', 'port-detail-head');
+    head.appendChild(el('h3', '', title));
+    const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
+    x.addEventListener('click', close); head.appendChild(x);
+    pop.appendChild(head);
+    const grid = (ps) => {
+      const dl = el('dl', 'port-detail-grid');
+      for (const [k, v] of ps) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
+      return dl;
+    };
+    pop.appendChild(grid(pairs));
+    if (sections) for (const name in sections) {
+      pop.appendChild(el('div', 'port-detail-sub', name));
+      pop.appendChild(grid(sections[name]));
+    }
+    back.appendChild(pop);
+    document.body.appendChild(back);
+  }
+
+  // A popout with any number of tabs. tabs: [{ label, fill(pane, close), onShow }].
+  // Returns { close, showTab }. Panes are created lazily-filled up front but only
+  // the first is visible; onShow (optional) fires each time a tab is selected
+  // (used by the counters tab to know when it is visible).
+  function openTabbedPopout(s, title, tabs, popTimers) {
+    const prev = document.querySelector('.port-detail-back');
+    if (prev) prev.remove();
+    const back = el('div', 'port-detail-back');
+    const pop = el('div', 'port-detail');
+    const close = () => { for (const t of (popTimers || [])) clearInterval(t); back.remove(); };
+    back.addEventListener('click', (e) => { if (e.target === back) close(); });
+    document.addEventListener('keydown', function esc(e) { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); } });
+    const head = el('div', 'port-detail-head');
+    head.appendChild(el('h3', '', title));
+    const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
+    x.addEventListener('click', close); head.appendChild(x);
+    pop.appendChild(head);
+
+    const strip = el('div', 'pd-tabs');
+    const panes = [];
+    const btns = [];
+    const show = (i) => {
+      panes.forEach((p, j) => { p.style.display = i === j ? '' : 'none'; });
+      btns.forEach((b, j) => b.classList.toggle('active', i === j));
+      const t = tabs[i]; if (t && t.onShow) t.onShow();
+    };
+    tabs.forEach((t, i) => {
+      const b = el('button', 'pd-tab' + (i === 0 ? ' active' : ''), t.label); b.type = 'button';
+      b.addEventListener('click', () => show(i));
+      strip.appendChild(b); btns.push(b);
+    });
+    pop.appendChild(strip);
+    tabs.forEach((t, i) => {
+      const pane = el('div', 'pd-pane'); if (i !== 0) pane.style.display = 'none';
+      pop.appendChild(pane); panes.push(pane);
+      t.pane = pane;
+      t.fill(pane, close);
+    });
+    back.appendChild(pop);
+    document.body.appendChild(back);
+    return { close, showTab: show, panes };
+  }
+
+  function openPortDetail(s, detail, opts) {
+    opts = opts || {};
+    const hasIf = detail.ifIndex !== null && detail.ifIndex !== undefined;
+    const popTimers = [];
+    const tabs = [];
+    // Extra leading tabs (e.g. a port channel's Membership tab) go first.
+    for (const t of (opts.leadingTabs || [])) tabs.push(t);
+
+    // ---- Port tab: identity fields + PoE ----
+    // ---- Port tab: identity fields + PoE, then physical settings below ----
+    tabs.push({ label: 'Port', fill: (pane) => {
+      const defs = el('dl', 'port-detail-grid');
+      const addField = (k, v) => { if (v === undefined || v === null || v === '') return; defs.appendChild(el('dt', '', k)); defs.appendChild(el('dd', '', String(v))); };
+      for (const k in (detail.fields || {})) addField(k, detail.fields[k]);
+      if (detail.poe) { for (const k in detail.poe) addField('PoE ' + k, detail.poe[k]); }
+      if (defs.children.length) pane.appendChild(defs);
+      // Physical interface settings (on-demand) stacked under the identity grid.
+      if (hasIf) {
+        pane.appendChild(el('div', 'port-detail-sub', 'Interface settings'));
+        const setWrap = el('div');
+        setWrap.appendChild(el('div', 'card-sub', 'Loading settings\u2026'));
+        pane.appendChild(setWrap);
+        fetchIfSettings(s, detail.ifIndex).then((st) => { clear(setWrap); setWrap.appendChild(buildInterfaceSettings(s, detail, st)); })
+          .catch((e) => { clear(setWrap); setWrap.appendChild(el('div', 'sw-err', 'Could not read settings: ' + e.message)); });
+      }
+      if (!defs.children.length && !hasIf) pane.appendChild(el('div', 'card-sub', 'No port details available.'));
+    } });
+
+    // ---- Switchport tab ----
+    if (hasIf && detail.sw) {
+      tabs.push({ label: 'Switchport', fill: (pane) => { pane.appendChild(buildSwitchportEditor(s, detail)); } });
+    }
+
+    // ---- 802.1X tab ----
+    if (detail.dot1x && hasIf) {
+      tabs.push({ label: '802.1X', fill: (pane) => { pane.appendChild(buildDot1xEditor(s, detail)); } });
+    }
+
+    // ---- Voice VLAN tab: per-port candidacy + QoS mode. Only when Voice VLAN is
+    // in OUI-based mode (adminState=3) - per-port candidacy is an OUI-mode concept;
+    // in auto/disabled modes the port isn't configured here. ----
+    const voiceAdmScalar = s.health && s.health.scalars && s.health.scalars.vlanVoiceAdminState;
+    const voiceOuiMode = voiceAdmScalar && parseInt(voiceAdmScalar.value, 10) === 3;
+    if (hasIf && voiceOuiMode) {
+      tabs.push({ label: 'Voice VLAN', fill: (pane) => {
+        const wrap = el('div');
+        wrap.appendChild(el('div', 'card-sub', 'Loading Voice VLAN settings\\u2026'));
+        pane.appendChild(wrap);
+        fetchIfSettings(s, detail.ifIndex, ['voiceEnable', 'voiceSecure', 'voiceQos', 'voiceMembership'])
+          .then((st) => { clear(wrap); wrap.appendChild(buildVoiceVlanEditor(s, detail, st)); })
+          .catch((e) => { clear(wrap); wrap.appendChild(el('div', 'sw-err', 'Could not read Voice VLAN settings: ' + e.message)); });
+      } });
+    }
+
+    // ---- ACL tab: ACLs bound to this interface (input/output + default) ----
+    if (hasIf) {
+      tabs.push({ label: 'ACL', fill: (pane) => { buildIfAclBinding(s, detail, pane); } });
+    }
+
+    // ---- Counters tab: live counters + clear ----
+    if (hasIf) {
+      tabs.push({ label: 'Counters', onShow: () => {}, fill: (pane, close) => {
+        const ctrWrap = el('div', 'port-detail-counters');
+        ctrWrap.appendChild(el('div', 'card-sub', 'Loading live counters\u2026'));
+        fetchPortCounters(s, detail.ifIndex, ctrWrap);
+        pane.appendChild(ctrWrap);
+        const ctrTimer = setInterval(() => {
+          if (!document.body.contains(ctrWrap)) { clearInterval(ctrTimer); return; }
+          if (pane.style.display !== 'none') fetchPortCounters(s, detail.ifIndex, ctrWrap, true);
+        }, 10000);
+        popTimers.push(ctrTimer);
+        const cActions = el('div', 'snmp-form-actions'); cActions.style.marginTop = '8px';
+        const clearBtn = el('button', 'btn btn-small btn-amber', 'Clear counters'); clearBtn.type = 'button';
+        const cMsg = el('div', 'sw-msg');
+        clearBtn.addEventListener('click', (ev) => {
+          clear(cMsg);
+          runButtonAction(ev.currentTarget, {
+            failLabel: 'Clear counters', spinLabel: 'Clearing\u2026',
+            run: () => clearPortCounters(s, detail.ifIndex),
+            ok: (res) => res && res.ok,
+            error: (res) => { cMsg.appendChild(el('div', 'sw-err', 'Could not clear counters: ' + ((res && res.error) || 'failed'))); return (res && res.error) || 'failed'; },
+            settle: () => { clear(ctrWrap); ctrWrap.appendChild(el('div', 'card-sub', 'Loading live counters\u2026')); setTimeout(() => fetchPortCounters(s, detail.ifIndex, ctrWrap), 800); return Promise.resolve(); }
+          });
+        });
+        cActions.appendChild(clearBtn); pane.appendChild(cActions); pane.appendChild(cMsg);
+      } });
+    }
+
+    openTabbedPopout(s, (opts.title || ('Interface ' + detail.name)), tabs, popTimers);
+  }
+
+  // Physical interface settings editor: speed, duplex, auto-negotiation, flow
+  // control, MDI/MDIX, and the port description (ifAlias). All are SNMP SETs to
+  // swIfTable columns (and ifAlias). Speed/duplex only take effect when auto-neg
+  // is disabled, so those two are disabled in the UI while auto-neg is on.
+  const IFSET = {
+    speed:  { oid: '1.3.6.1.4.1.9.6.1.101.43.1.1.15' },
+    duplex: { oid: '1.3.6.1.4.1.9.6.1.101.43.1.1.3' },
+    autoneg:{ oid: '1.3.6.1.4.1.9.6.1.101.43.1.1.16' },
+    flow:   { oid: '1.3.6.1.4.1.9.6.1.101.43.1.1.14' },
+    mdix:   { oid: '1.3.6.1.4.1.9.6.1.101.43.1.1.28' },
+    alias:  { oid: '1.3.6.1.2.1.31.1.1.1.18' },
+    caps:   { oid: '1.3.6.1.4.1.9.6.1.101.43.1.1.46' },  // swIfPortCapabilities (BITS)
+    // Per-port Voice VLAN table. The diagnostic showed the GUI-added port lives in
+    // vlanVoiceOUIBasedPortTable (.12.5) - the .4 table is empty on this firmware.
+    // A working port has VlanIndex (.2) set to the voice VLAN BEFORE Enable (.1);
+    // VlanIndex is Unsigned32 ('Gauge'), not Integer.
+    voiceEnable: { oid: '1.3.6.1.4.1.9.6.1.101.48.54.12.5.1.1' },  // Enable (TruthValue)
+    voiceVlanIdx: { oid: '1.3.6.1.4.1.9.6.1.101.48.54.12.5.1.2' }, // VlanIndex (Unsigned32)
+    voiceSecure: { oid: '1.3.6.1.4.1.9.6.1.101.48.54.12.5.1.3' },  // Secure (TruthValue)
+    voiceMembership: { oid: '1.3.6.1.4.1.9.6.1.101.48.54.12.5.1.4' }, // CurrentMembership (ro)
+    voiceQos: { oid: '1.3.6.1.4.1.9.6.1.101.48.54.12.5.1.5' }      // QosMode (src(1)/all(2))
+  };
+  // AutoNegCapabilitiesBits positions -> the speeds they imply.
+  const CAP_BITS = {
+    2: 10, 3: 10,          // tenHalf / tenFull -> 10 Mb/s
+    4: 100, 5: 100,        // fastHalf / fastFull -> 100 Mb/s
+    6: 1000, 7: 1000,      // gigaHalf / gigaFull -> 1 Gb/s
+    8: '10g',              // tenGigaFull -> 10 Gb/s (admin value 10)
+    9: 5000,               // fiveGigaFull
+    10: 2500,              // twoPointFiveGigaFull
+    11: 25000, 12: 40000, 13: 50000, 14: 100000, 15: 200000
+  };
+  // swIfSpeedAdminMode values. The MIB says "bits per second" but the switch
+  // rejects bps values with WrongValue, and notes "A value of 10 is returned
+  // for 10G" - so the encoding is Mb/s, with 10G special-cased as the literal
+  // 10. (10 Mb/s is not offered: these switches are GE/2.5GE/10GE, and 10 is
+  // claimed by 10G.)
+  const SPEED_OPTS = [{ label: 'auto/unset', value: 0 },
+    { label: '100 Mb/s', value: 100 }, { label: '1 Gb/s', value: 1000 },
+    { label: '2.5 Gb/s', value: 2500 }, { label: '5 Gb/s', value: 5000 }, { label: '10 Gb/s', value: 10 }];
+  const DUPLEX_OPTS = [{ label: 'full', value: 3 }, { label: 'half', value: 2 }, { label: 'none', value: 1 }];
+  const AUTONEG_OPTS = [{ label: 'enabled', value: 1 }, { label: 'disabled', value: 2 }];
+  const FLOW_OPTS = [{ label: 'on', value: 1 }, { label: 'off', value: 2 }, { label: 'auto-negotiation', value: 3 }];
+  const MDIX_OPTS = [{ label: 'auto', value: 3 }, { label: 'normal', value: 2 }, { label: 'cross', value: 1 }];
+
+  // Fetch this one port's physical settings + alias on demand (not polled in
+  // bulk). Returns { speed, duplex, autoneg, flow, mdix, alias }.
+  // Decode a swIfPortCapabilities BITS varbind into a Set of supported speed
+  // values (matching the SPEED_OPTS values: 100, 1000, 2500, 5000, and '10' for
+  // 10G). BITS are MSB-first: byte 0 bit 7 is bit position 0. Returns null if
+  // the value can't be decoded (so the caller offers all speeds rather than
+  // wrongly hiding them).
+  function decodeCapsToSpeeds(vb) {
+    let bytes = null;
+    const raw = vb && (vb.value !== undefined ? vb.value : vb.display);
+    if (raw == null) return null;
+    if (Array.isArray(raw)) bytes = raw;
+    else if (typeof raw === 'string') {
+      const hex = raw.replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '');
+      if (hex.length >= 2 && hex.length % 2 === 0) {
+        bytes = []; for (let i = 0; i < hex.length; i += 2) bytes.push(parseInt(hex.substr(i, 2), 16));
+      } else {
+        // Maybe a plain integer rendered as a string.
+        const n = parseInt(raw, 10);
+        if (Number.isFinite(n)) bytes = [(n >> 8) & 0xff, n & 0xff];
+      }
+    } else if (typeof raw === 'number') {
+      bytes = [(raw >> 8) & 0xff, raw & 0xff];
+    }
+    if (!bytes || !bytes.length) return null;
+    const speeds = new Set();
+    for (let byteIdx = 0; byteIdx < bytes.length; byteIdx++) {
+      for (let bit = 0; bit < 8; bit++) {
+        const pos = byteIdx * 8 + bit;                 // BITS position
+        const set = (bytes[byteIdx] >> (7 - bit)) & 1; // MSB-first
+        if (set && CAP_BITS[pos] !== undefined) {
+          const sp = CAP_BITS[pos];
+          speeds.add(sp === '10g' ? 10 : sp);          // 10G admin value is 10
+        }
+      }
+    }
+    return speeds.size ? speeds : null;
+  }
+
+  async function fetchIfSettings(s, ifx, fields) {
+    // fields: optional list of keys to read (speed/duplex/autoneg/flow/mdix/
+    // alias). Omitted = all. Keeping the GET to only the fields that matter
+    // keeps the control-plane load minimal after a targeted edit.
+    const want = fields && fields.length ? new Set(fields) : null;
+    const all = { speed: IFSET.speed.oid, duplex: IFSET.duplex.oid, autoneg: IFSET.autoneg.oid,
+      flow: IFSET.flow.oid, mdix: IFSET.mdix.oid, alias: IFSET.alias.oid, caps: IFSET.caps.oid,
+      voiceEnable: IFSET.voiceEnable.oid, voiceSecure: IFSET.voiceSecure.oid,
+      voiceMembership: IFSET.voiceMembership.oid, voiceQos: IFSET.voiceQos.oid };
+    const oids = Object.entries(all).filter(([k]) => !want || want.has(k)).map(([, oid]) => oid + '.' + ifx);
+    const { body: b } = await apiPost('/api/snmp/get', { target: s.target, oids });
+    const out = { speed: null, duplex: null, autoneg: null, flow: null, mdix: null, alias: '', speeds: null,
+      voiceEnable: null, voiceSecure: null, voiceMembership: null, voiceQos: null };
+    const col = (oid) => oid.split('.').slice(0, -1).join('.');
+    const map = { [IFSET.speed.oid]: 'speed', [IFSET.duplex.oid]: 'duplex', [IFSET.autoneg.oid]: 'autoneg',
+      [IFSET.flow.oid]: 'flow', [IFSET.mdix.oid]: 'mdix', [IFSET.alias.oid]: 'alias', [IFSET.caps.oid]: 'caps',
+      [IFSET.voiceEnable.oid]: 'voiceEnable', [IFSET.voiceSecure.oid]: 'voiceSecure',
+      [IFSET.voiceMembership.oid]: 'voiceMembership', [IFSET.voiceQos.oid]: 'voiceQos' };
+    for (const vb of ((b && b.results) || [])) {
+      if (vb.error) continue;
+      const k = map[col(String(vb.oid || ''))];
+      if (!k) continue;
+      if (k === 'alias') out.alias = vb.value != null ? String(vb.value) : '';
+      else if (k === 'caps') {
+        // Decode the BITS value into the set of supported speeds. The value may
+        // arrive as a hex string, a byte array, or a number; handle each.
+        out.speeds = decodeCapsToSpeeds(vb);
+      } else { const n = parseInt(vb.value, 10); out[k] = Number.isFinite(n) ? n : null; }
+    }
+    return out;
+  }
+
+  function buildInterfaceSettings(s, detail, st) {
+    const box = el('div', 'port-detail-settings');
+    detail.alias = st.alias;   // used by the Apply diff
+    const sel = (opts, cur) => { const e = el('select'); for (const o of opts) { const op = el('option', '', o.label); op.value = String(o.value); if (o.value === cur) op.selected = true; e.appendChild(op); } return e; };
+    const grid = el('div', 'snmp-form-grid');
+
+    const aliasIn = el('input'); aliasIn.type = 'text'; aliasIn.maxLength = 64;
+    aliasIn.value = detail.alias != null ? detail.alias : '';
+    aliasIn.placeholder = 'port description';
+    grid.appendChild(field('Description', aliasIn));
+
+    const autoSel = sel(AUTONEG_OPTS, st.autoneg);
+    grid.appendChild(field('Auto-negotiation', autoSel));
+    // Offer only speeds the port actually supports (from swIfPortCapabilities).
+    // Always keep 'auto/unset' (0) and the current value, even if the caps read
+    // failed or didn't include it, so the dropdown never hides the real state.
+    const supported = st.speeds instanceof Set ? st.speeds : null;
+    const speedOpts = SPEED_OPTS.filter((o) => o.value === 0 || o.value === st.speed ||
+      !supported || supported.has(o.value));
+    const speedSel = sel(speedOpts, st.speed);
+    const speedField = field('Speed', speedSel); grid.appendChild(speedField);
+    const duplexSel = sel(DUPLEX_OPTS, st.duplex);
+    const duplexField = field('Duplex', duplexSel); grid.appendChild(duplexField);
+    // Speed/duplex only apply when auto-neg is disabled.
+    const syncAuto = () => {
+      const on = parseInt(autoSel.value, 10) === 1;
+      speedSel.disabled = on; duplexSel.disabled = on;
+      speedField.title = on ? 'Disable auto-negotiation to set a fixed speed' : '';
+      duplexField.title = on ? 'Disable auto-negotiation to set a fixed duplex' : '';
+    };
+    autoSel.addEventListener('change', syncAuto); syncAuto();
+
+    const flowSel = sel(FLOW_OPTS, st.flow);
+    grid.appendChild(field('Flow control', flowSel));
+    const mdixSel = sel(MDIX_OPTS, st.mdix);
+    grid.appendChild(field('MDI/MDIX', mdixSel));
+    box.appendChild(grid);
+
+    const { actions, apply, msg } = applyActions('Apply');
+    const setOne = (oid, type, value) => snmpSet(s, { oid, type, value });
+    // Build the ordered diff of changed fields -> SET steps. Returns [] when
+    // nothing changed. Kept as a function so the no-changes case can short-circuit
+    // before the action runs.
+    const buildSteps = (ix) => {
+      const newAuto = parseInt(autoSel.value, 10);
+      const newSpeed = parseInt(speedSel.value, 10);
+      const newDuplex = parseInt(duplexSel.value, 10);
+      const newFlow = parseInt(flowSel.value, 10);
+      const newMdix = parseInt(mdixSel.value, 10);
+      const newAlias = aliasIn.value;
+      const steps = [];
+      // Order: set auto-neg first (it gates speed/duplex), then the rest.
+      if (newAuto !== st.autoneg) steps.push(['autoneg', IFSET.autoneg.oid + '.' + ix, 'Integer', newAuto, newAuto]);
+      if (newAuto === 2) {   // only meaningful when auto-neg disabled
+        if (newSpeed !== st.speed) steps.push(['speed', IFSET.speed.oid + '.' + ix, 'Integer', newSpeed, newSpeed]);
+        if (newDuplex !== st.duplex) steps.push(['duplex', IFSET.duplex.oid + '.' + ix, 'Integer', newDuplex, newDuplex]);
+      }
+      if (newFlow !== st.flow) steps.push(['flow', IFSET.flow.oid + '.' + ix, 'Integer', newFlow, newFlow]);
+      if (newMdix !== st.mdix) steps.push(['mdix', IFSET.mdix.oid + '.' + ix, 'Integer', newMdix, newMdix]);
+      if (newAlias !== (detail.alias != null ? detail.alias : '')) steps.push(['alias', IFSET.alias.oid + '.' + ix, 'OctetString', newAlias, newAlias]);
+      return steps;
+    };
+    const ctlByName = { autoneg: autoSel, speed: speedSel, duplex: duplexSel, flow: flowSel, mdix: mdixSel, alias: aliasIn };
+    // The write button: two-tap confirm (a speed/duplex change bounces the link),
+    // then runButtonAction owns the spinner->done/revert lifecycle (standard B6).
+    // run() performs the ordered batch; settle() does the computed re-read and the
+    // delayed row refreshes. The detailed per-field failure list still goes to the
+    // inline msg div (more useful than a generic toast for a multi-field apply).
+    withConfirm(apply, (ev) => {
+      const ix = detail.ifIndex;
+      clear(msg);
+      const steps = buildSteps(ix);
+      if (!steps.length) { msg.appendChild(el('div', 'card-sub', 'No changes.')); return; }
+      runButtonAction(ev.currentTarget, {
+        failLabel: 'Apply',
+        run: async () => {
+          s.writeBusy = true;
+          // Suppress the reactive link-trap refresh for a short window - we
+          // re-read what we need ourselves after the port bounces.
+          s._ifWriteUntil = Date.now() + 12000;
+          const failures = [];
+          for (const [name, oid, type, value] of steps) {
+            try { await setOne(oid, type, value); }
+            catch (e) { failures.push(name + ': ' + e.message); }
+          }
+          s.writeBusy = false;
+          const changed = new Set(steps.map((x) => x[0]));
+          // A successful SET tells us the new value, so local state is taken from
+          // what we set; we only RE-READ fields the switch may have coerced as a
+          // side effect (toggling auto-neg can change effective speed/duplex, a
+          // speed the port can't do may be rounded).
+          if (changed.has('autoneg')) st.autoneg = steps.find((x) => x[0] === 'autoneg')[4];
+          if (changed.has('speed')) st.speed = steps.find((x) => x[0] === 'speed')[4];
+          if (changed.has('duplex')) st.duplex = steps.find((x) => x[0] === 'duplex')[4];
+          if (changed.has('flow')) st.flow = steps.find((x) => x[0] === 'flow')[4];
+          if (changed.has('mdix')) st.mdix = steps.find((x) => x[0] === 'mdix')[4];
+          if (changed.has('alias')) { const a = steps.find((x) => x[0] === 'alias')[4]; st.alias = a; detail.alias = a; }
+
+          const reread = new Set();
+          if (changed.has('autoneg')) { reread.add('speed'); reread.add('duplex'); }
+          if (changed.has('speed')) reread.add('speed');
+          if (changed.has('duplex')) reread.add('duplex');
+          return { ok: failures.length === 0, failures: failures,
+            changedControls: steps.map((x) => ctlByName[x[0]]).filter(Boolean),
+            reread: Array.from(reread), ix: ix };
+        },
+        ok: (res) => res && res.ok,
+        error: (res) => {
+          const list = (res && res.failures) || [];
+          const text = 'Some changes were rejected \u2014 ' + list.join('; ');
+          msg.appendChild(el('div', 'sw-err', text));
+          return text;
+        },
+        onApplied: (res) => markConfigDirty(s, res.changedControls),
+        settle: async (res) => {
+          if (res.reread.length) {
+            try {
+              const fresh = await fetchIfSettings(s, res.ix, res.reread);
+              for (const k of res.reread) if (fresh[k] !== null && fresh[k] !== undefined) st[k] = fresh[k];
+            } catch (e) { /* non-fatal */ }
+          }
+          // Reflect local state in the controls (no further reads).
+          autoSel.value = String(st.autoneg); speedSel.value = String(st.speed);
+          duplexSel.value = String(st.duplex); flowSel.value = String(st.flow);
+          mdixSel.value = String(st.mdix); aliasIn.value = st.alias || '';
+
+          syncAuto();
+          // Update just this port's row in the main table. A short delay lets the
+          // link settle; a second read a few seconds later catches the final
+          // negotiated speed after renegotiation.
+          setTimeout(() => refreshOnePort(s, res.ix), 2500);
+          setTimeout(() => refreshOnePort(s, res.ix), 6000);
+        }
+      });
+    });
+    box.appendChild(actions); box.appendChild(msg);
+    return box;
+  }
+
+  // Per-port Voice VLAN editor (vlanVoicePortTable .4), on its own tab. Secure
+  // mode is a REQUIRED choice when enabling a port (the switch needs it set), so
+  // it has no silent default - the user picks Off/Secure. QoS mode is a dropdown.
+  // Enabling also sets the companion VlanIndex (Unsigned32) to the current Voice
+  // VLAN. One Apply diffs all the voice columns, via runButtonAction.
+  function buildVoiceVlanEditor(s, detail, st) {
+    const box = el('div', 'port-detail-settings');
+    const ix = detail.ifIndex;
+    const grid = el('div', 'snmp-form-grid');
+    const voiceSel = selectInput([{ label: 'Disabled', value: 2 }, { label: 'Enabled', value: 1 }], (st.voiceEnable === 1 ? 1 : 2));
+    const memb = (st.voiceMembership === 1) ? ' (active)' : '';
+    grid.appendChild(field('Voice VLAN' + memb, voiceSel));
+    // Secure mode is not exposed; a port is always added in standard (off) mode.
+    // It is still set (to off) as part of the atomic row write when enabling.
+    const voiceQosSel = selectInput([{ label: 'Telephony source MAC', value: 1 }, { label: 'All', value: 2 }], (st.voiceQos === 2 ? 2 : 1));
+    grid.appendChild(field('QoS mode', voiceQosSel));
+    box.appendChild(grid);
+
+    const { actions, apply, msg } = applyActions('Apply');
+    const voiceVid = () => parseInt((s.health && s.health.scalars && (s.health.scalars.vlanVoiceAdminVid || {}).value), 10);
+    withConfirm(apply, (ev) => {
+      clear(msg);
+      const newVoice = parseInt(voiceSel.value, 10);
+      const newQos = parseInt(voiceQosSel.value, 10);
+      const newSecure = 2;   // always standard (off); secure mode is not exposed
+      // Build the ordered diff. When enabling: VlanIndex (Gauge) -> Secure -> QoS
+      // -> Enable. Secure/QoS also apply on their own when already enabled.
+      const steps = [];
+      const curSecure = (st.voiceSecure === 1 ? 1 : (st.voiceSecure === 2 ? 2 : null));
+      const curQos = (st.voiceQos === 2 ? 2 : 1);
+      const curVoice = (st.voiceEnable === 1 ? 1 : 2);
+      const enabling = (newVoice === 1 && curVoice !== 1);
+      if (enabling) {
+        const vid = voiceVid();
+        if (Number.isFinite(vid) && vid >= 1 && vid <= 4094) steps.push(['vlan', IFSET.voiceVlanIdx.oid + '.' + ix, 'Gauge', vid]);
+      }
+      if (Number.isFinite(newSecure) && (newSecure !== curSecure || enabling)) steps.push(['secure', IFSET.voiceSecure.oid + '.' + ix, 'Integer', newSecure]);
+      if (Number.isFinite(newQos) && (newQos !== curQos || enabling)) steps.push(['qos', IFSET.voiceQos.oid + '.' + ix, 'Integer', newQos]);
+      if (newVoice !== curVoice) steps.push(['enable', IFSET.voiceEnable.oid + '.' + ix, 'Integer', newVoice]);
+      if (!steps.length) { msg.appendChild(el('div', 'card-sub', 'No changes.')); return; }
+      runButtonAction(ev.currentTarget, {
+        failLabel: 'Apply',
+        run: async () => {
+          // Send the whole row in ONE PDU. Setting Enable in its own PDU returns
+          // WrongValue even when the companion columns already hold a working
+          // port's exact values - the firmware validates the row atomically, the
+          // way the GUI sets it. One multi-varbind SET matches that.
+          const vb = steps.map(([, oid, type, value]) => ({ oid, type, value }));
+          try {
+            const res = await snmpSetResult(s, vb);
+            const err = res && res.body && res.body.error;
+            return { ok: res && res.ok && !err, failures: err ? [err] : [] };
+          } catch (e) { return { ok: false, failures: [e.message] }; }
+        },
+        ok: (res) => res && res.ok,
+        error: (res) => { const t = 'Some changes were rejected \u2014 ' + ((res && res.failures) || []).join('; '); msg.appendChild(el('div', 'sw-err', t)); return t; },
+        onApplied: () => markConfigDirty(s),
+        settle: () => fetchIfSettings(s, ix, ['voiceEnable', 'voiceSecure', 'voiceQos', 'voiceMembership']).then((fresh) => {
+          for (const k of ['voiceEnable', 'voiceSecure', 'voiceQos', 'voiceMembership']) if (fresh[k] !== null && fresh[k] !== undefined) st[k] = fresh[k];
+          voiceSel.value = String(st.voiceEnable === 1 ? 1 : 2);
+          voiceQosSel.value = String(st.voiceQos === 2 ? 2 : 1);
+        }).catch(() => {})
+      });
+    });
+    box.appendChild(actions); box.appendChild(msg);
+    return box;
+  }
+
+  // The switchport mode/VLAN editor inside the port dialog. Shows the current
+  // configuration and, on "Edit", an inline form: mode (access/trunk), the
+  // access VLAN, or the trunk native + tagged VLANs — all chosen from VLANs
+  // that already exist on the switch. Writes use the SNMP SET sequence proven
+  // against this firmware (VlanIndex objects as Gauge, native folded into the
+  // allowed bitmap, mode flipped last).
+  function buildSwitchportEditor(s, detail) {
+    const sw = detail.sw;
+    const box = el('div', 'sw-editor');
+
+    // Routed (L3) ports have no switchport mode to set.
+    if (sw.l2l3 === 'L3') {
+      box.appendChild(el('div', 'card-sub', 'This is a routed (L3) port — it has no switchport mode.'));
+      return box;
+    }
+
+    const vlans = sw.allVlans.length ? sw.allVlans : [1];
+    const grid = el('div', 'snmp-form-grid');
+
+    // Mode selector — shown immediately, no edit button.
+    const modeSel = el('select');
+    for (const m of ['access', 'trunk']) { const o = el('option', '', m); o.value = m; if (m === sw.mode) o.selected = true; modeSel.appendChild(o); }
+    grid.appendChild(field('Mode', modeSel));
+
+    // Access VLAN (single).
+    const accSel = el('select');
+    for (const v of vlans) { const o = el('option', '', String(v)); o.value = String(v); accSel.appendChild(o); }
+    if (sw.mode === 'access' && sw.untagged[0]) accSel.value = String(sw.untagged[0]);
+    const accField = field('Access VLAN', accSel);
+    grid.appendChild(accField);
+
+    // Trunk native (single).
+    const natSel = el('select');
+    for (const v of vlans) { const o = el('option', '', String(v)); o.value = String(v); natSel.appendChild(o); }
+    if (sw.mode === 'trunk' && sw.untagged[0]) natSel.value = String(sw.untagged[0]);
+    const natField = field('Native (untagged)', natSel);
+    grid.appendChild(natField);
+
+    // Trunk tagged (multi).
+    const tagSel = el('select'); tagSel.multiple = true; tagSel.size = Math.min(6, Math.max(2, vlans.length));
+    for (const v of vlans) {
+      const o = el('option', '', String(v)); o.value = String(v);
+      if (sw.mode === 'trunk' && sw.tagged.indexOf(v) !== -1) o.selected = true;
+      tagSel.appendChild(o);
+    }
+    const tagField = field('Tagged VLANs (ctrl/cmd-click)', tagSel);
+    grid.appendChild(tagField);
+
+    box.appendChild(grid);
+
+    const syncMode = () => {
+      const trunk = modeSel.value === 'trunk';
+      accField.style.display = trunk ? 'none' : '';
+      natField.style.display = trunk ? '' : 'none';
+      tagField.style.display = trunk ? '' : 'none';
+    };
+    modeSel.addEventListener('change', syncMode); syncMode();
+
+    // Inline, non-blocking uplink caution (no browser prompt).
+    if (sw.uplink) {
+      box.appendChild(el('div', 'sw-warn',
+        'Caution: this port is ' + sw.uplink + '. Changing its mode or VLANs may cut your management connection to the switch.'));
+    }
+
+    const { actions, apply: save, msg } = applyActions('Apply', { msgClass: 'sw-msg' });
+    box.appendChild(actions);
+    box.appendChild(msg);
+
+    save.addEventListener('click', (ev) => {
+      const cfg = { ifIndex: detail.ifIndex, mode: modeSel.value };
+      if (cfg.mode === 'trunk') {
+        cfg.native = parseInt(natSel.value, 10);
+        cfg.tagged = Array.from(tagSel.selectedOptions).map((o) => parseInt(o.value, 10)).filter(Number.isFinite);
+      } else {
+        cfg.access = parseInt(accSel.value, 10);
+      }
+      clear(msg);
+      runButtonAction(ev.currentTarget, {
+        failLabel: 'Save switchport', spinLabel: 'Saving\u2026',
+        run: () => applySwitchportConfig(s, cfg),
+        ok: (res) => res && res.ok,
+        error: (res) => {
+          const box2 = el('div', 'sw-err');
+          box2.appendChild(el('div', '', 'Some steps failed:'));
+          const pre = el('pre'); pre.className = 'diff'; pre.textContent = (res && res.log ? res.log.join('\n') : 'unknown error');
+          box2.appendChild(pre); msg.appendChild(box2);
+          return 'some steps failed';
+        },
+        onApplied: () => {
+          markConfigDirty(s, [modeSel, cfg.mode === 'access' ? accSel : natSel]);
+          sw.mode = cfg.mode;
+          if (cfg.mode === 'access') { sw.untagged = [cfg.access]; sw.tagged = []; }
+          else {
+            sw.untagged = [cfg.native];
+            sw.tagged = Array.from(new Set([cfg.native].concat(cfg.tagged))).sort((a, b) => a - b);
+          }
+          s._vlanFlashSet = new Set();
+          if (cfg.mode === 'access') { if (cfg.access) s._vlanFlashSet.add(Number(cfg.access)); }
+          else { if (cfg.native) s._vlanFlashSet.add(Number(cfg.native)); for (const t of (cfg.tagged || [])) s._vlanFlashSet.add(Number(t)); }
+        },
+        settle: () => new Promise((res) => setTimeout(() => refreshTables(s, ['interfaces', 'portModes', 'portL2L3', 'vlansCurrent', 'vlans', 'portAccessVlan', 'portNativeVlan']).then(res, res), 1200))
+      });
+    });
+
+    return box;
+  }
+
+  // The production write. Returns { ok, log:[] }. Sends the SET sequence proven
+  // against this firmware: VlanIndex as Gauge, native always in the allowed
+  // bitmap, mode flipped last so a rejected VLAN write can't leave a port in a
+  // new mode with no membership.
+  async function applySwitchportConfig(s, cfg) {
+    const log = [];
+    if (!s.target) return { ok: false, log: ['Not connected.'] };
+    // Suspend health polling during the write: this firmware has crashed when a
+    // full multi-table walk lands on top of a config-touching SNMP write.
+    const ownsBusy = !s.writeBusy;
+    if (ownsBusy) s.writeBusy = true;
+    const if_ = cfg.ifIndex;
+    const steps = [];
+    if (cfg.mode === 'trunk') {
+      steps.push(['native', [{ oid: 'vlanTrunkPortModeNativeVlanId.' + if_, type: 'Gauge', value: cfg.native }]]);
+      const allowed = Array.from(new Set([cfg.native].concat(cfg.tagged || []))).sort((a, b) => a - b);
+      for (const [name, hex] of vlanListBlocks(allowed)) {
+        steps.push([name, [{ oid: name + '.' + if_, type: 'OctetString', valueHex: hex }]]);
+      }
+      steps.push(['mode=trunk', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 12 }]]);
+    } else {
+      steps.push(['access-vlan', [{ oid: 'vlanAccessPortModeVlanId.' + if_, type: 'Gauge', value: cfg.access }]]);
+      steps.push(['mode=access', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 11 }]]);
+    }
+    let ok = true;
+    for (const [title, vbs] of steps) {
+      try {
+        const { ok: rOk, status, body } = await snmpSetResult(s, vbs);
+        if (!rOk || (body && body.error)) { ok = false; log.push(title + ': ERROR ' + ((body && body.error) || ('HTTP ' + status))); continue; }
+        const bad = (body.results || []).find((v) => v.error);
+        if (bad) { ok = false; log.push(title + ': ' + bad.oid + ' ' + bad.error); }
+        else log.push(title + ': ok');
+      } catch (e) { ok = false; log.push(title + ': ' + e.message); }
+    }
+
+    if (ownsBusy) s.writeBusy = false;
+    appLog(ok ? 'info' : 'error', 'Switchport config applied', { host: s.host, ifIndex: if_, mode: cfg.mode, ok });
+    return { ok, log };
+  }
+
+  // 802.1X per-port editor: shows current port-control, status, and host-mode,
+  // and lets a write-capable session change port-control and host-mode. These
+  // are SNMP SETs to dot1xAuthAuthControlledPortControl and swIfHostMode.
+  const DOT1X_CONTROL_OID = '1.0.8802.1.1.1.1.2.1.1.6';   // dot1xAuthAuthControlledPortControl
+  const SWIF_HOSTMODE_OID = '1.3.6.1.4.1.9.6.1.101.43.1.1.30'; // swIfHostMode
+  const GUEST_VLAN_PORTS_OID = '1.3.6.1.4.1.9.6.1.101.95.5';   // rldot1xGuestVlanPorts (PortList scalar)
+  const PORT_METHOD_OID = '1.3.6.1.4.1.9.6.1.101.95.10.1.1';   // rldot1xAuthenticationPortMethod (per-port)
+  const CONTROL_OPTS = [{ label: 'force-unauthorized', value: 1 }, { label: 'auto', value: 2 }, { label: 'force-authorized', value: 3 }];
+  const HOSTMODE_OPTS = [{ label: 'single', value: 1 }, { label: 'multiple', value: 2 }, { label: 'multiple-auth', value: 3 }];
+
+  function buildDot1xEditor(s, detail) {
+    const box = el('div', 'port-detail-dot1x');
+    const d = detail.dot1x;
+    // Current state, always shown.
+    const dl = el('dl', 'port-detail-grid');
+    const row = (k, v) => { if (v) { dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', v)); } };
+    row('Port-control', d.control || '(not set)');
+    row('Status', d.status || '(unknown)');
+    row('Host-mode', d.hostMode || '(not set)');
+    box.appendChild(dl);
+
+    // The editor is always shown (like the switchport editor in this same
+    // popout); a write without sufficient access fails with a clear error from
+    // the switch rather than being hidden. Only shown for ports the switch
+    // actually reports 802.1X config for.
+    const grid = el('div', 'snmp-form-grid');
+    const ctlSel = el('select');
+    for (const o of CONTROL_OPTS) { const op = el('option', '', o.label); op.value = String(o.value); if (o.value === d.controlCode) op.selected = true; ctlSel.appendChild(op); }
+    grid.appendChild(field('Port-control', ctlSel));
+    const hmSel = el('select');
+    for (const o of HOSTMODE_OPTS) { const op = el('option', '', o.label); op.value = String(o.value); if (o.value === d.hostModeCode) op.selected = true; hmSel.appendChild(op); }
+    grid.appendChild(field('Host-mode', hmSel));
+
+    // Authentication methods on this port (802.1X / MAC / Web). MAC = MAB (MAC
+    // Authentication Bypass). The switch stores this as one enum encoding the
+    // combination (rldot1xAuthenticationPortMethod), same scheme as the global
+    // trap matrix. Decode it into three checkboxes; re-encode on apply.
+    const PORT_METHOD_ENUM = { 1: ['eapol'], 2: ['mac', 'eapol'], 3: ['mac'], 4: ['web'], 5: ['web', 'eapol'], 6: ['web', 'mac'], 7: ['web', 'mac', 'eapol'] };
+    const methodToEnum = (set) => {
+      for (const v of Object.keys(PORT_METHOD_ENUM)) { const ms = PORT_METHOD_ENUM[v]; if (ms.length === set.size && ms.every((m) => set.has(m))) return Number(v); }
+      return null;
+    };
+    const curMethodSet = new Set(PORT_METHOD_ENUM[d.methodCode] || (d.methodCode == null ? ['eapol'] : []));
+    const methodCbs = {};
+    const methodBox = el('div', 'dot1x-method-row');
+    for (const [m, label] of [['eapol', '802.1X'], ['mac', 'MAC (MAB)'], ['web', 'Web']]) {
+      const lab = el('label', 'check-label');
+      const cb = el('input'); cb.type = 'checkbox'; cb.checked = curMethodSet.has(m);
+      methodCbs[m] = cb;
+      lab.appendChild(cb); lab.appendChild(el('span', '', label));
+      methodBox.appendChild(lab);
+    }
+    grid.appendChild(field('Auth methods', methodBox));
+
+    // Guest VLAN enable for this port. Driven by the rldot1xGuestVlanPorts
+    // PortList bitmap (a scalar): this port's bit set = guest VLAN enabled.
+    const gvBitmap = (s.health && s.health.scalars && s.health.scalars.rldot1xGuestVlanPorts) || null;
+    const gvHex = gvBitmap ? String(gvBitmap.value !== undefined ? gvBitmap.value : gvBitmap.display || '').replace(/0x|\s|\(hex\)|"/gi, '') : '';
+    const portNum = Number(detail.ifIndex);
+    const gvWasOn = portBitSet(gvHex, portNum);
+    const gvCb = el('input'); gvCb.type = 'checkbox'; gvCb.checked = gvWasOn;
+    const gvWrap = el('label', 'snmp-field-check'); gvWrap.appendChild(gvCb); gvWrap.appendChild(el('span', '', 'Guest VLAN enabled'));
+    grid.appendChild(gvWrap);
+    box.appendChild(grid);
+
+    const { actions, apply, msg } = applyActions('Apply');
+    const ctlOid = DOT1X_CONTROL_OID + '.' + detail.ifIndex;
+    const hmOid = SWIF_HOSTMODE_OID + '.' + detail.ifIndex;
+    const setOne = (oid, value) => snmpSet(s, { oid, type: 'Integer', value });
+    // Re-read the live port-control and host-mode for this port and refresh the
+    // popout's display, so it reflects what the switch actually holds now.
+    const reread = async () => {
+      try {
+        const { ok, body } = await apiPost('/api/snmp/get', { target: s.target, oids: [ctlOid, hmOid] });
+        if (ok && body && !body.error) {
+          const CTL = { 1: 'force-unauth', 2: 'auto', 3: 'force-auth' };
+          const HM = { 1: 'single', 2: 'multiple', 3: 'multiple-auth' };
+          for (const vb of (body.results || [])) {
+            if (vb.error) continue;
+            const n = parseInt(vb.value, 10);
+            if (!Number.isFinite(n)) continue;
+            // Distinguish by the OID: the port-control OID is the IEEE arc
+            // (1.0.8802…); host-mode is the Cisco arc. Match on the oid field,
+            // which carries the numeric OID (the name field does not).
+            const oidStr = String(vb.oid || vb.name || '');
+            if (oidStr.indexOf('1.0.8802') >= 0) { d.controlCode = n; d.control = CTL[n] || d.control; }
+            else { d.hostModeCode = n; d.hostMode = HM[n] || d.hostMode; }
+          }
+          // Reflect the re-read values in the dropdowns and the display grid.
+          ctlSel.value = String(d.controlCode); hmSel.value = String(d.hostModeCode);
+          const dds = dl.querySelectorAll('dd');
+          if (dds[0]) dds[0].textContent = d.control || '(not set)';
+          if (dds[2]) dds[2].textContent = d.hostMode || '(not set)';
+        }
+      } catch (e) { /* non-fatal: the table refresh still runs */ }
+    };
+
+    withConfirm(apply, (ev) => {
+      clear(msg);
+      const newCtl = parseInt(ctlSel.value, 10);
+      const newHm = parseInt(hmSel.value, 10);
+      const ctlChanged = newCtl !== d.controlCode;
+      const hmChanged = newHm !== d.hostModeCode;
+      const gvChanged = gvCb.checked !== gvWasOn;
+      const newMethodSet = new Set(['eapol', 'mac', 'web'].filter((m) => methodCbs[m].checked));
+      const newMethod = methodToEnum(newMethodSet);
+      const methodChanged = newMethod != null && newMethod !== d.methodCode;
+      if (!ctlChanged && !hmChanged && !gvChanged && !methodChanged) { msg.appendChild(el('div', 'card-sub', 'No changes.')); return; }
+      runButtonAction(ev.currentTarget, {
+        failLabel: '802.1X change',
+        run: async () => {
+          s.writeBusy = true;
+          try {
+            if (hmChanged) {
+              if (d.controlCode !== 3) await setOne(ctlOid, 3);
+              await setOne(hmOid, newHm);
+              if (newCtl !== 3) await setOne(ctlOid, newCtl);
+            } else if (ctlChanged) {
+              await setOne(ctlOid, newCtl);
+            }
+            if (methodChanged) await setOne(PORT_METHOD_OID + '.' + detail.ifIndex, newMethod);
+            if (gvChanged) {
+              const newHex = setPortBit(gvHex, portNum, gvCb.checked);
+              try { await snmpSet(s, { oid: GUEST_VLAN_PORTS_OID + '.0', type: 'OctetString', valueHex: newHex }); }
+              catch (e) { throw new Error('guest VLAN: ' + e.message); }
+            }
+            s.writeBusy = false;
+            const changedControls = [];
+            if (ctlChanged) changedControls.push(ctlSel);
+            if (hmChanged) changedControls.push(hmSel);
+            if (methodChanged) for (const m of ['eapol', 'mac', 'web']) changedControls.push(methodCbs[m]);
+            if (gvChanged) changedControls.push(gvCb);
+            return { ok: true, changedControls: changedControls, gvChanged: gvChanged };
+          } catch (e) { s.writeBusy = false; return { ok: false, error: e.message }; }
+        },
+        ok: (r) => r && r.ok,
+        error: (r) => { msg.appendChild(el('div', 'sw-err', '802.1X change failed: ' + ((r && r.error) || 'failed'))); reread(); return (r && r.error) || 'failed'; },
+        onApplied: (r) => markConfigDirty(s, r.changedControls),
+        settle: async (r) => {
+          await reread();
+          if (r.gvChanged) { await refreshScalars(s, { rldot1xGuestVlanPorts: GUEST_VLAN_PORTS_OID }); }
+          return refreshTables(s, ['dot1xPortCfg', 'dot1xHostMode', 'dot1xPortMethod']);
+        }
+      });
+    });
+
+    box.appendChild(actions); box.appendChild(msg);
+    return box;
+  }
+
+  // Walk/GET the 802.1X-relevant OIDs for a port and present the raw values, so
+  // the exact index encoding and which tables the switch populates are visible.
+  // Walk every LAG-related table and present the raw values so a CLI-configured
+  // channel member can be inspected (the exact actor key, state, attached ids).
+
+
+  // Build a minimal q-bridge PortList octet string with a single port's bit
+  // set. Encoding (same MSB-first scheme as the VLAN-list bitmaps): octet 0
+  // covers ports 1-8, MSB = lowest port. Only as many octets as needed to reach
+  // the port are emitted; the agent treats missing trailing octets as zero.
+  function buildPortListBit(portNum) {
+    const byteCount = Math.floor((portNum - 1) / 8) + 1;
+    const buf = new Uint8Array(byteCount);
+    const bit = portNum - 1;
+    buf[Math.floor(bit / 8)] |= (0x80 >> (bit % 8));
+    let hex = '';
+    for (const b of buf) hex += b.toString(16).padStart(2, '0');
+    return hex;
+  }
+
+  // Reset one port's MIB counters via rlIfClearPortMibCounters (a read-write
+  // PortList scalar: each set bit = a port whose counters are cleared). On this
+  // switch the physical-port ifIndex equals the front-panel port number, so the
+  // ifIndex is used for the bit position.
+  async function clearPortCounters(s, ifIndex) {
+    if (!s.target) return { ok: false, error: 'Not connected.' };
+    const ownsBusy = !s.writeBusy;
+    if (ownsBusy) s.writeBusy = true;
+    let out;
+    try {
+      const { ok, status, body } = await snmpSetResult(s, { oid: 'rlIfClearPortMibCounters.0', type: 'OctetString', valueHex: buildPortListBit(ifIndex) });
+      if (!ok || (body && body.error)) out = { ok: false, error: (body && body.error) || ('HTTP ' + status) };
+      else {
+        const bad = (body.results || []).find((v) => v.error);
+        out = bad ? { ok: false, error: bad.error } : { ok: true };
+      }
+    } catch (e) { out = { ok: false, error: e.message }; }
+    if (ownsBusy) s.writeBusy = false;
+    appLog(out.ok ? 'info' : 'error', 'Clear port counters', { host: s.host, ifIndex, ok: out.ok });
+    return out;
+  }
+
+  // Create a VLAN via the standard Q-BRIDGE dot1qVlanStaticTable (the same
+  // table the app reads). RowStatus createAndGo(4) and the name go in one SET,
+  // keyed by the VLAN id. Returns { ok, error }.
+  // This switch does not create VLANs through the standard Q-BRIDGE
+  // dot1qVlanStaticRowStatus (that returns InconsistentValue). Cisco Small
+  // Business switches create VLANs by setting the VLAN's bit in the static
+  // VLAN-list bitmap (rldot1qVlanStaticList*, under the static(0) list index).
+  // The 4094 VLAN space is split across four 1024-bit bitmaps.
+  const VLAN_LIST_OIDS = [
+    '1.3.6.1.4.1.9.6.1.101.48.69.1.2',  // 1..1024
+    '1.3.6.1.4.1.9.6.1.101.48.69.1.3',  // 1025..2048
+    '1.3.6.1.4.1.9.6.1.101.48.69.1.4',  // 2049..3072
+    '1.3.6.1.4.1.9.6.1.101.48.69.1.5'   // 3073..4094
+  ];
+  const VLAN_LIST_STATIC = 0;   // rldot1qVlanStaticListIndex = static(0)
+  // Robustly pull hex bytes out of a varbind cell whose display may be
+  // "0A 00 .. (hex)", a plain hex string, or a byte string.
+  function normalizeHex(cell) {
+    const s = String(cell && (cell.display !== undefined && cell.display !== null ? cell.display : cell.value) || '');
+    const hex = s.replace(/0x|\s|\(hex\)|:|"/gi, '');
+    return /^[0-9a-f]*$/i.test(hex) ? hex.toLowerCase() : '';
+  }
+
+  async function createVlan(s, vlanId, name) {
+    if (!s.target) return { ok: false, error: 'Not connected.' };
+    if (!Number.isFinite(vlanId) || vlanId < 2 || vlanId > 4094) return { ok: false, error: 'VLAN id must be 2-4094.' };
+    const ownsBusy = !s.writeBusy;
+    if (ownsBusy) s.writeBusy = true;
+    let out;
+    try {
+      // Which 1024-block, and the VLAN's position within it (1-based for the bit
+      // helper, which treats bit 1 as the top bit of byte 0).
+      const block = Math.floor((vlanId - 1) / 1024);
+      const posInBlock = ((vlanId - 1) % 1024) + 1;
+      const listOid = VLAN_LIST_OIDS[block] + '.' + VLAN_LIST_STATIC;
+      // Read the current bitmap for this block, set the VLAN's bit, write back
+      // at full width (matches what the switch holds).
+      let curHex = '';
+      try { const r = await snmpGet(s, [listOid]); const cell = r[0]; curHex = cell ? normalizeHex(cell) : ''; } catch (e) { curHex = ''; }
+      curHex = curHex.padEnd(256, '0');
+      const newHex = setPortBit(curHex, posInBlock, true);
+      await snmpSet(s, { oid: listOid, type: 'OctetString', valueHex: newHex });
+      // Name it (best-effort; the VLAN now exists so the name SET is accepted).
+      if (name && name.length) { try { await snmpSet(s, { oid: 'dot1qVlanStaticName.' + vlanId, type: 'OctetString', value: name }); } catch (e) { /* VLAN created; name optional */ } }
+      out = { ok: true };
+    } catch (e) { out = { ok: false, error: e.message }; }
+    if (ownsBusy) s.writeBusy = false;
+    appLog(out.ok ? 'info' : 'error', 'Create VLAN', { host: s.host, vlanId, ok: out.ok });
+    return out;
+  }
+
+  // Delete a VLAN: RowStatus destroy(6) on its row.
+  async function deleteVlan(s, vlanId) {
+    if (!s.target) return { ok: false, error: 'Not connected.' };
+    if (vlanId === 1) return { ok: false, error: 'The default VLAN cannot be deleted.' };
+    // Never delete the VLAN that carries our own connection to the switch.
+    const sviIfx = await vlanSviIfIndex(s, vlanId);
+    if (sviIfx != null && isManagementIf(s, sviIfx)) {
+      return { ok: false, error: 'this is the management VLAN (it carries this app\u2019s connection to the switch). Deleting it would cut off access, so it is locked.' };
+    }
+    const ownsBusy = !s.writeBusy;
+    if (ownsBusy) s.writeBusy = true;
+    let out;
+    try {
+      // A VLAN with an IPv4 SVI cannot be removed from the static list while the
+      // SVI exists, so tear the SVI down first (static address and/or DHCP
+      // client), then clear the VLAN bit. This is safe here - the management SVI
+      // was already excluded above.
+      if (sviIfx != null) { try { await teardownSvi(s, sviIfx); } catch (e) { /* best effort; the bitmap write will report if it still blocks */ } }
+      // Clear the VLAN's bit in the static list. Read the CURRENT full bitmap
+      // first and write it back at the same width (the switch rejects a bitmap
+      // whose length does not match what it holds - that is the InconsistentValue).
+      const block = Math.floor((vlanId - 1) / 1024);
+      const posInBlock = ((vlanId - 1) % 1024) + 1;
+      const listOid = VLAN_LIST_OIDS[block] + '.' + VLAN_LIST_STATIC;
+      let curHex = '';
+      try { const r = await snmpGet(s, [listOid]); const cell = r[0]; curHex = cell ? normalizeHex(cell) : ''; } catch (e) { curHex = ''; }
+      // Pad to the full 128-byte (1024-bit) width the switch expects for this
+      // list, so clearing one bit returns a same-width bitmap.
+      curHex = curHex.padEnd(256, '0');
+      const newHex = setPortBit(curHex, posInBlock, false);
+      await snmpSet(s, { oid: listOid, type: 'OctetString', valueHex: newHex });
+      out = { ok: true };
+    } catch (e) {
+      // InconsistentValue on delete usually means the VLAN is still in use
+      // (member ports, or an IPv4 SVI). Make that actionable.
+      let msg = e.message;
+      if (/InconsistentValue/i.test(msg)) msg = 'the switch refused it - the VLAN may still have member ports or an IPv4 interface. Remove those first (open the VLAN and clear its IPv4 tab / unassign ports), then delete.';
+      out = { ok: false, error: msg };
+    }
+    if (ownsBusy) s.writeBusy = false;
+    appLog(out.ok ? 'info' : 'error', 'Delete VLAN', { host: s.host, vlanId, ok: out.ok });
+    return out;
+  }
+
+  // Refresh the panels that show VLANs after a create/delete, from the switch.
+  // vlanNameTable (base 48.21): authoritative VLAN tag -> L3 ifIndex mapping.
+  const VLAN_NAME = {
+    tag:     '1.3.6.1.4.1.9.6.1.101.48.21.1.2',  // vlanNameTag
+    ifIndex: '1.3.6.1.4.1.9.6.1.101.48.21.1.3'   // vlanNameIfIndex
+  };
+  // Look up a VLAN's SVI (L3) ifIndex. On this platform the SVI appears in the
+  // interface table (rlifPresentTable) as a row whose NAME is the VLAN id, and
+  // that row's index IS the real ifIndex (e.g. 100997) that rsIpAddrTable keys
+  // on - vlanNameTable is empty here, so we read it from the interface table.
+  // Prefer the already-loaded health data; fall back to a targeted walk.
+  async function vlanSviIfIndex(s, vlanId) {
+    const want = String(vlanId);
+    // 1. From the in-memory interface list (no switch traffic). Interface cells
+    // are { value, display } objects; read the display/value defensively.
+    const cellStr = (c) => (c == null ? '' : String(c.display !== undefined && c.display !== null ? c.display : (c.value !== undefined ? c.value : c)));
+    const ifs = (s.health && s.health.interfaces) || [];
+    for (const r of ifs) {
+      const nm = cellStr(r.rlifPresentName).trim();
+      if (nm === want) { const ix = parseInt(r.index, 10); if (Number.isFinite(ix)) return ix; }
+    }
+    // 2. Fall back to walking the name column and matching.
+    try {
+      const { body } = await apiPost('/api/snmp/walk', { target: s.target, oid: '1.3.6.1.2.1.31.1.1.1.1', mode: 'getbulk' });  // ifName
+      for (const r of ((body && body.results) || [])) {
+        if (String(r.display !== undefined ? r.display : r.value).trim() === want) { const ix = parseInt(String(r.index), 10); if (Number.isFinite(ix)) return ix; }
+      }
+    } catch (e) { /* fall through */ }
+    return null;
+  }
+
+  // SVI IP table (rsIpAddrTable, base 26.1), indexed by the IP address.
+  const SVI_IP = {
+    ifIndex: '1.3.6.1.4.1.9.6.1.101.26.1.1.2',  // rsIpAdEntIfIndex
+    netmask: '1.3.6.1.4.1.9.6.1.101.26.1.1.3',  // rsIpAdEntNetMask
+    status:  '1.3.6.1.4.1.9.6.1.101.26.1.1.6',  // rsIpAdEntStatus (RowStatus)
+    owner:   '1.3.6.1.4.1.9.6.1.101.26.1.1.10'  // rsIpAdEntOwner static(1)/dhcp(2)/internal(3)/default(4)
+  };
+  const SVI_OWNER = { 1: 'static', 2: 'dhcp', 3: 'internal', 4: 'default' };
+  // DHCP client action table (rlDhcpClActionTable, base 76.3), indexed by ifIndex.
+  const DHCP_CL = {
+    status:   '1.3.6.1.4.1.9.6.1.101.76.3.1.2',  // rlDhcpClActionStatus (RowStatus to enable)
+    hostName: '1.3.6.1.4.1.9.6.1.101.76.3.1.3'
+  };
+  // Prefix length -> dotted netmask.
+  function prefToMask(p) { p = Math.max(0, Math.min(32, p | 0)); const m = p === 0 ? 0 : (0xffffffff << (32 - p)) >>> 0; return [24, 16, 8, 0].map((sh) => (m >>> sh) & 0xff).join('.'); }
+  // Dotted netmask -> prefix length.
+  function maskToPref(mask) { const m = String(mask).split('.').map(Number); if (m.length !== 4) return null; let bits = 0; for (const o of m) bits += (o.toString(2).match(/1/g) || []).length; return bits; }
+
+  // Edit a VLAN: rename, SVI IP address, and ACL binding (no direction).
+  function openVlanEditor(s, vlan) {
+    const tabs = [];
+
+    // ---- General tab: rename ----
+    tabs.push({ label: 'General', fill: (pane) => {
+      const form = el('div', 'snmp-form acl-form');
+      const sec = formSection('VLAN ' + vlan.id);
+      const nameIn = el('input'); nameIn.type = 'text'; nameIn.maxLength = 32; nameIn.value = vlan.name || '';
+      sec.body.appendChild(field('Name', nameIn));
+      form.appendChild(sec.sec);
+      const { actions, apply } = applyActions('Save name');
+      const msg = el('div', 'port-detail-msg');
+      withConfirm(apply, (ev) => {
+        clear(msg);
+        runButtonAction(ev.currentTarget, {
+          failLabel: 'Rename VLAN',
+          run: () => snmpSet(s, { oid: 'dot1qVlanStaticName.' + vlan.id, type: 'OctetString', value: (nameIn.value || '').trim() }).then(() => ({ ok: true }), (e) => ({ ok: false, error: e.message })),
+          ok: (r) => r && r.ok,
+          error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not rename \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+          onApplied: () => { markConfigDirty(s, nameIn); s._vlanFlash = vlan.id; },
+          settle: () => refreshVlanPanels(s, { vlansOnly: true })
+        });
+      });
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+    } });
+
+    // ---- IPv4 tab: the VLAN's SVI address (static or DHCP) ----
+    // The SVI ifIndex is resolved from the authoritative vlanNameTable (tag ->
+    // ifIndex), not guessed from the interface-table row, which is what caused
+    // the earlier wrong-SVI match.
+    tabs.push({ label: 'IPv4', fill: async (pane) => {
+      pane.appendChild(el('div', 'card-sub', 'Reading IPv4 interface\u2026'));
+      const ifx = await vlanSviIfIndex(s, vlan.id);
+      clear(pane);
+      buildSviEditor(s, vlan, ifx, pane);
+    } });
+
+    // ---- ACL tab: bind an ACL to the VLAN (default action only, no direction) ----
+    tabs.push({ label: 'ACL', fill: async (pane) => {
+      pane.appendChild(el('div', 'card-sub', 'Reading ACL binding\u2026'));
+      const ifx = await vlanSviIfIndex(s, vlan.id);
+      clear(pane);
+      if (ifx != null) buildIfAclBinding(s, { ifIndex: ifx }, pane, { ifType: IFTYPE_VLAN, noDirection: true });
+      else pane.appendChild(el('div', 'card-sub', 'This VLAN has no L3 interface yet. Add an IPv4 address on the IPv4 tab first, then an ACL can be bound to it.'));
+    } });
+
+    openTabbedPopout(s, 'VLAN ' + vlan.id + (vlan.name ? ' \u00b7 ' + vlan.name : ''), tabs, []);
+  }
+
+  // SVI IP editor: shows the current address (if any) and lets you set/replace
+  // or remove it. Writing a management SVI wrong can cut access, so this reads
+  // first and is explicit about what it will change.
+  // The VLAN IPv4 (SVI) editor. Reads the address table, filters to real user
+  // addresses on THIS VLAN's L3 interface (owner static/dhcp - internal/default
+  // are system addresses and must be ignored, which is what produced the bogus
+  // "0.193.134.170"), and offers Static or DHCP. When the VLAN has no SVI yet it
+  // shows an "Add IPv4 SVI" button rather than a pre-filled form.
+  async function buildSviEditor(s, vlan, sviIfIndex, pane) {
+    // The management SVI (carrying this app's connection) is read-only: changing
+    // or removing its address would cut off access to the switch.
+    if (isManagementIf(s, sviIfIndex)) {
+      const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
+      let ipLine = s.target.host;
+      for (const a of ((s.health && s.health.sviAddrs) || [])) { if (String(a.index) === String(s.target.host)) { const m = String(cv(a.rsIpAdEntNetMask) || ''); const p = m ? m.split('.').reduce((n, o) => n + ((parseInt(o, 10) || 0).toString(2).match(/1/g) || []).length, 0) : null; ipLine = s.target.host + (p ? '/' + p : ''); break; } }
+      pane.appendChild(el('div', 'aaa-sub', 'Management interface'));
+      pane.appendChild(el('div', 'card-sub', 'This VLAN\u2019s IPv4 interface (' + ipLine + ') carries this app\u2019s connection to the switch. It is locked to prevent accidentally cutting off access.'));
+      return;
+    }
+    pane.appendChild(el('div', 'card-sub', 'Reading IPv4 interface\u2026'));
+    // Find any user address whose ifIndex matches this SVI, skipping system
+    // (internal/default) owners.
+    let cur = null;   // { ip, mask, owner }
+    let dhcpOn = false;
+    try {
+      const [ifx, masks, owners, dhcp] = await Promise.all([
+        apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.ifIndex, mode: 'getbulk' }),
+        apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.netmask, mode: 'getbulk' }),
+        apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.owner, mode: 'getbulk' }),
+        apiPost('/api/snmp/walk', { target: s.target, oid: DHCP_CL.status, mode: 'getbulk' })
+      ]);
+      const maskByIp = {}, ownerByIp = {};
+      for (const r of ((masks.body && masks.body.results) || [])) maskByIp[String(r.index)] = String(r.display !== undefined ? r.display : r.value);
+      for (const r of ((owners.body && owners.body.results) || [])) ownerByIp[String(r.index)] = parseInt(r.value, 10);
+      for (const r of ((ifx.body && ifx.body.results) || [])) {
+        const ip = String(r.index);
+        const owner = ownerByIp[ip];
+        // Only real user addresses, on this SVI. A DHCP interface without a
+        // lease has a 0.x placeholder - treat that as "DHCP, no address yet"
+        // (dhcpOn below handles the display) rather than a real current address.
+        if (sviIfIndex != null && parseInt(r.value, 10) === parseInt(sviIfIndex, 10) && (owner === 1 || owner === 2) && isRealIp(ip)) {
+          cur = { ip, mask: maskByIp[ip] || null, owner };
+          break;
+        }
+      }
+      // Is DHCP client enabled on this SVI's ifIndex?
+      for (const r of ((dhcp.body && dhcp.body.results) || [])) { if (parseInt(String(r.index), 10) === parseInt(sviIfIndex, 10)) dhcpOn = true; }
+    } catch (e) { /* show the add path */ }
+    clear(pane);
+
+    // No SVI yet: offer an explicit "Add IPv4 SVI" button.
+    if (!cur && !dhcpOn) {
+      pane.appendChild(el('div', 'card-sub', 'VLAN ' + vlan.id + ' has no IPv4 interface configured.'));
+      if (sviIfIndex == null) pane.appendChild(el('div', 'sw-err', 'Could not resolve this VLAN\u2019s L3 ifIndex (needed to add an address).'));
+      const addRow = el('div', 'snmp-form-actions'); addRow.style.marginTop = '10px';
+      const addBtn = el('button', 'btn btn-small btn-blue', 'Add IPv4 SVI'); addBtn.type = 'button';
+      addBtn.disabled = sviIfIndex == null;
+      addBtn.addEventListener('click', () => { clear(pane); sviConfigForm(s, vlan, sviIfIndex, pane, null, false); });
+      addRow.appendChild(addBtn); pane.appendChild(addRow);
+      return;
+    }
+    // Existing SVI: show the config form pre-filled.
+    sviConfigForm(s, vlan, sviIfIndex, pane, cur, dhcpOn);
+  }
+
+
+  // The SVI configuration form - Static (IP + prefix) or DHCP.
+  function sviConfigForm(s, vlan, sviIfIndex, pane, cur, dhcpOn) {
+    const form = el('div', 'snmp-form acl-form');
+    const sec = formSection('IPv4 interface');
+    if (cur) sec.body.appendChild(el('div', 'card-sub', 'Current: ' + cur.ip + ' / ' + (cur.mask || '?') + ' (' + (SVI_OWNER[cur.owner] || 'static') + ')'));
+    else if (dhcpOn) sec.body.appendChild(el('div', 'card-sub', 'Current: DHCP (awaiting lease)'));
+    // Mode: Static or DHCP.
+    const modeSel = selectInput([{ label: 'Static', value: 'static' }, { label: 'DHCP', value: 'dhcp' }], dhcpOn ? 'dhcp' : 'static');
+    sec.body.appendChild(field('Addressing', modeSel));
+    const ipIn = el('input'); ipIn.type = 'text'; ipIn.placeholder = '192.168.1.1'; if (cur) ipIn.value = cur.ip;
+    const ipField = field('IP address', ipIn);
+    sec.body.appendChild(ipField);
+    const prefIn = el('input'); prefIn.type = 'number'; prefIn.min = '1'; prefIn.max = '32'; prefIn.value = cur && cur.mask ? String(maskToPref(cur.mask) || 24) : '24';
+    const prefField = field('Prefix length', prefIn);
+    sec.body.appendChild(prefField);
+    const syncMode = () => { const dhcp = modeSel.value === 'dhcp'; ipField.style.display = dhcp ? 'none' : ''; prefField.style.display = dhcp ? 'none' : ''; };
+    modeSel.addEventListener('change', syncMode); syncMode();
+    form.appendChild(sec.sec);
+
+    const { actions, apply } = applyActions(cur || dhcpOn ? 'Update IPv4' : 'Add IPv4');
+    const msg = el('div', 'port-detail-msg');
+    withConfirm(apply, (ev) => {
+      clear(msg);
+      const mode = modeSel.value;
+      if (mode === 'static' && !ipv4ToHex(ipIn.value)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
+      runButtonAction(ev.currentTarget, {
+        failLabel: 'Set IPv4 interface',
+        run: async () => {
+          try {
+            if (mode === 'dhcp') {
+              if (cur && cur.owner === 1) { try { await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 }); } catch (e) { /* ignore */ } }
+              await snmpSet(s, { oid: DHCP_CL.status + '.' + sviIfIndex, type: 'Integer', value: 4 });
+            } else {
+              if (dhcpOn) { try { await snmpSet(s, { oid: DHCP_CL.status + '.' + sviIfIndex, type: 'Integer', value: 6 }); } catch (e) { /* ignore */ } }
+              const ip = (ipIn.value || '').trim();
+              const mask = prefToMask(parseInt(prefIn.value, 10));
+              if (cur && cur.ip !== ip) { try { await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 }); } catch (e) { /* ignore */ } }
+              await snmpSet(s, [
+                { oid: SVI_IP.status + '.' + ip, type: 'Integer', value: 1 },
+                { oid: SVI_IP.ifIndex + '.' + ip, type: 'Integer', value: parseInt(sviIfIndex, 10) },
+                { oid: SVI_IP.netmask + '.' + ip, type: 'IpAddress', value: mask }
+              ]);
+            }
+            return { ok: true };
+          } catch (e) { return { ok: false, error: e.message }; }
+        },
+        ok: (r) => r && r.ok,
+        error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not set the IPv4 interface \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+        onApplied: () => { markConfigDirty(s, [modeSel, ipIn, prefIn]); s._vlanFlash = vlan.id; },
+        settle: () => refreshSvi(s)
+      });
+    });
+    form.appendChild(actions); form.appendChild(msg);
+    // Remove button when something is configured.
+    if (cur || dhcpOn) {
+      const rm = actBtnConfirm('Remove IPv4', async () => {
+        try {
+          if (dhcpOn) await snmpSet(s, { oid: DHCP_CL.status + '.' + sviIfIndex, type: 'Integer', value: 6 });
+          if (cur) await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 });
+          markConfigDirty(s); refreshSvi(s);
+          const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove();
+        } catch (e) { toast('Could not remove the IPv4 interface: ' + e.message, 'error'); }
+      }, 'danger', 'Remove this VLAN\u2019s IPv4 interface');
+      const rmRow = el('div', 'snmp-form-actions'); rmRow.style.marginTop = '8px'; rmRow.appendChild(rm);
+      form.appendChild(rmRow);
+    }
+    pane.appendChild(form);
+  }
+
+  // Refresh only the tables the VLAN view needs (the VLAN table, and the
+  // interface table for SVI/membership changes) via a targeted partial walk,
+  // rather than a full panel reload that re-walks everything. Keeps the switch
+  // CPU impact minimal. opts.vlansOnly skips the heavier interface walk for a
+  // rename (which changes nothing in the interface table).
+  function refreshVlanPanels(s, opts) {
+    opts = opts || {};
+    // Always include sviAddrs so the VLAN table's IPv4 column reflects an SVI
+    // that was just added/changed. A rename skips the heavier interface walk; a
+    // Voice VLAN edit only needs the voice tables + scalars.
+    const voice = ['voiceOUI', 'voiceLocalSrc', 'scalars'];
+    const tables = opts.voiceOnly ? voice
+      : opts.vlansOnly ? ['vlans', 'sviAddrs']
+      : ['vlans', 'interfaces', 'sviAddrs'].concat(voice);
+    // Return a promise that resolves once the (delayed) walk completes, so a
+    // button action can spin until the VLAN table actually updates.
+    return new Promise((res) => { setTimeout(() => { refreshTables(s, tables).then(res, res); }, 900); });
+  }
+
+  // Remove an SVI's IPv4 configuration for a given ifIndex: any static address
+  // (rsIpAdEntStatus = invalid(2)) and the DHCP client (rlDhcpClActionStatus =
+  // destroy(6)). Used before deleting a VLAN, and when clearing its IPv4 tab.
+  async function teardownSvi(s, ifIndex) {
+    const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
+    // Remove any address rows that belong to this ifIndex.
+    try {
+      const { body } = await apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.ifIndex, mode: 'getbulk' });
+      for (const r of ((body && body.results) || [])) {
+        if (parseInt(cv(r.value), 10) === parseInt(ifIndex, 10)) {
+          try { await snmpSet(s, { oid: SVI_IP.status + '.' + String(r.index), type: 'Integer', value: 2 }); } catch (e) { /* ignore per-row */ }
+        }
+      }
+    } catch (e) { /* ignore */ }
+    // Disable the DHCP client on this ifIndex, if enabled.
+    try { await snmpSet(s, { oid: DHCP_CL.status + '.' + ifIndex, type: 'Integer', value: 6 }); } catch (e) { /* not enabled */ }
+  }
+
+  // The ifIndex of the SVI carrying our SNMP connection: the address table row
+  // whose IP equals the host we are talking to. Modifying or deleting this SVI
+  // (or its VLAN) would cut the app's own connectivity, so it is protected.
+  // Returns the ifIndex number, or null if not found (then nothing is locked).
+  function managementIfIndex(s) {
+    const host = s && s.target && s.target.host;
+    if (!host) return null;
+    const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
+    for (const a of ((s.health && s.health.sviAddrs) || [])) {
+      if (String(a.index) === String(host)) { const ix = parseInt(cv(a.rsIpAdEntIfIndex), 10); return Number.isFinite(ix) ? ix : null; }
+    }
+    return null;
+  }
+  // True if the given SVI ifIndex is the management interface.
+  function isManagementIf(s, ifIndex) { const m = managementIfIndex(s); return m != null && ifIndex != null && parseInt(ifIndex, 10) === m; }
+
+  // After an SVI/IPv4 change the switch needs a moment to create the L3
+  // interface row (and, for DHCP, to obtain a lease). Refresh the VLAN + SVI
+  // tables twice - soon, and again a few seconds later - so the table reflects
+  // the change without the user having to reload. Light, targeted walks only.
+  function refreshSvi(s) {
+    setTimeout(() => refreshTables(s, ['vlans', 'interfaces', 'sviAddrs']), 1000);
+    setTimeout(() => refreshTables(s, ['vlans', 'interfaces', 'sviAddrs']), 4500);
+  }
+
+  // The "add VLAN" control shown above the VLAN table.
+  // Create-VLAN popout: id + name, then (after creation) the editor opens so the
+  // IPv4/ACL tabs are available.
+  function openVlanCreate(s) {
+    const tabs = [{ label: 'New VLAN', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const sec = formSection('VLAN');
+      const idIn = el('input'); idIn.type = 'number'; idIn.min = '2'; idIn.max = '4094'; idIn.placeholder = '2-4094';
+      sec.body.appendChild(field('VLAN id', idIn));
+      const nameIn = el('input'); nameIn.type = 'text'; nameIn.maxLength = 32; nameIn.placeholder = 'optional';
+      sec.body.appendChild(field('Name', nameIn));
+      sec.body.appendChild(el('div', 'card-sub', 'After the VLAN is created, its editor opens so you can add an IPv4 interface and bind an ACL.'));
+      form.appendChild(sec.sec);
+      const { actions, apply } = applyActions('Create VLAN');
+      const msg = el('div', 'port-detail-msg');
+      withConfirm(apply, (ev) => {
+        const id = parseInt(idIn.value, 10);
+        clear(msg);
+        if (!Number.isFinite(id) || id < 2 || id > 4094) { msg.appendChild(el('div', 'sw-err', 'Enter a VLAN id between 2 and 4094.')); return; }
+        if ((s.health && s.health.vlans || []).some((v) => Number(v.index) === id)) { msg.appendChild(el('div', 'sw-err', 'VLAN ' + id + ' already exists.')); return; }
+        const nm = (nameIn.value || '').trim();
+        runButtonAction(ev.currentTarget, {
+          failLabel: 'Create VLAN', spinLabel: 'Creating\u2026',
+          run: () => createVlan(s, id, nm),
+          ok: (res) => res && res.ok,
+          error: (res) => { msg.appendChild(el('div', 'sw-err', 'Could not create VLAN: ' + ((res && res.error) || 'failed'))); return (res && res.error) || 'failed'; },
+          onApplied: () => {
+            markConfigDirty(s); s._vlanFlash = id;
+            close();
+            setTimeout(() => openVlanEditor(s, { id, name: nm }), 250);
+          },
+          settle: () => new Promise((res) => setTimeout(() => refreshVlanPanels(s).then(res, res), 1200))
+        });
+      });
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+    } }];
+    openTabbedPopout(s, 'New VLAN', tabs, []);
+  }
+
+  // Add a Telephony OUI entry. The prefix (3-byte OUI) is the row index; set the
+  // Description + RowStatus createAndGo in one PDU (a bare RowStatus set is
+  // rejected, the lesson from the DNS tables).
+  function openVoiceOuiForm(s) {
+    const tabs = [{ label: 'Add OUI', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const sec = formSection('Telephony OUI');
+      const ouiIn = el('input'); ouiIn.type = 'text'; ouiIn.placeholder = 'AA-BB-CC (first 3 MAC bytes)';
+      sec.body.appendChild(field('OUI prefix', ouiIn));
+      const descIn = el('input'); descIn.type = 'text'; descIn.maxLength = 32; descIn.placeholder = 'e.g. Acme_phone';
+      sec.body.appendChild(field('Description', descIn));
+      form.appendChild(sec.sec);
+      const { actions, apply } = applyActions('Add OUI');
+      const msg = el('div', 'port-detail-msg');
+      apply.addEventListener('click', (e) => {
+        clear(msg);
+        const idx = ouiToOidIndex(ouiIn.value);
+        if (!idx) { msg.appendChild(el('div', 'sw-err', 'Enter an OUI as 3 hex octets, e.g. 00-11-22.')); return; }
+        const descr = (descIn.value || '').trim();
+        runButtonAction(e.currentTarget, {
+          failLabel: 'Add OUI',
+          run: () => snmpSetResult(s, [
+            { oid: '1.3.6.1.4.1.9.6.1.101.48.54.12.4.1.2.' + idx, type: 'OctetString', value: descr },
+            { oid: '1.3.6.1.4.1.9.6.1.101.48.54.12.4.1.3.' + idx, type: 'Integer', value: 4 }   // createAndGo
+          ]),
+          ok: (res) => res && res.ok && !(res.body && res.body.error),
+          error: (res) => (res && res.body && res.body.error) || 'the switch rejected it',
+          onApplied: () => markConfigDirty(s),
+          settle: () => refreshVlanPanels(s, { voiceOnly: true }).then(() => close())
+        });
+      });
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+    } }];
+    openTabbedPopout(s, 'Add Telephony OUI', tabs, []);
+  }
+
+  // Per-row delete control. VLAN 1 (the default VLAN) cannot be removed.
+  function buildVlanDeleteCell(s, td, info) {
+    if (info.id === 1) { td.appendChild(el('span', 'card-sub', '\u2014')); return; }
+    const paint = () => {
+      clear(td);
+      // Two-tap confirm: first tap arms ("Confirm?"), second deletes. The title
+      // carries the warning about ports losing the VLAN.
+      td.appendChild(actGroup([actBtnConfirm('Delete', () => {
+        clear(td); td.appendChild(el('span', 'card-sub', 'Deleting\u2026'));
+        deleteVlan(s, info.id).then((res) => {
+          // On success the VLAN row disappears on refresh - the change made visible.
+          if (res.ok) { markConfigDirty(s); refreshVlanPanels(s); }
+          else { clear(td); const e = el('div', 'sw-err', res.error); td.appendChild(e); td.appendChild(actGroup([actBtn('Back', paint)])); }
+        });
+      }, 'danger', 'Delete VLAN ' + info.id + (info.name ? ' (' + info.name + ')' : '') + ' — ports using it will lose this VLAN')]));
+    };
+    paint();
+  }
+
+  async function fetchPortCounters(s, ifIndex, wrap) {
+    if (!s.target) { clear(wrap); wrap.appendChild(el('div', 'card-sub', 'Not connected.')); return; }
+    // Build the full OID list (preferred 64-bit plus 32-bit fallback), then
+    // fetch in small batches. A single 22-OID GET can produce a reply the SNMP
+    // library fails to parse, which never resolves — small PDUs avoid that and
+    // also let partial data show if one batch fails.
+    const oids = [];
+    for (const row of PORT_COUNTERS) for (let i = 1; i < row.length; i++) oids.push(row[i] + '.' + ifIndex);
+    const BATCH = 6;
+    const byName = new Map();
+    let anyError = null;
+    for (let i = 0; i < oids.length; i += BATCH) {
+      const slice = oids.slice(i, i + BATCH);
+      try {
+        const { ok, status, body } = await apiPost('/api/snmp/get', { target: s.target, oids: slice });
+        if (!ok || (body && body.error)) { anyError = (body && body.error) || ('HTTP ' + status); continue; }
+        for (const vb of ((body && body.results) || [])) {
+          if (vb.error) continue;
+          const col = vb.column || (vb.name ? String(vb.name).split('.')[0] : '');
+          if (col && !byName.has(col)) byName.set(col, vb);
+        }
+      } catch (e) { anyError = e.message; }
+    }
+    clear(wrap);
+    const dlg = el('dl', 'port-detail-grid');
+    for (const row of PORT_COUNTERS) {
+      let vb = null;
+      for (let i = 1; i < row.length; i++) { vb = byName.get(row[i]); if (vb) break; }
+      if (!vb) continue;
+      const val = vb.display !== undefined && vb.display !== null && vb.display !== String(vb.value)
+        ? vb.display : vb.value;
+      dlg.appendChild(el('dt', '', row[0]));
+      dlg.appendChild(el('dd', '', String(val === undefined || val === null ? '' : val)));
+    }
+    if (dlg.children.length) {
+      wrap.appendChild(dlg);
+      wrap.appendChild(el('div', 'card-sub', 'Read live at ' + new Date().toLocaleTimeString() + '.'));
+    } else {
+      wrap.appendChild(el('div', 'card-sub',
+        anyError ? ('Could not read counters: ' + anyError) : 'No counter values returned.'));
+    }
+  }
+
+  function portActionsCell(s, info) {
+    const td = document.createElement('td');
+    td.className = 'tbl-act';
+
+    const done = (message) => {
+      clear(td);
+      td.appendChild(el('span', 'card-sub', message));
+      setTimeout(paint, 4000);
+    };
+
+    const post = (url, body, describe, btn) => {
+      // Port actions (PoE bounce, admin up/down) bounce the port; suppress the
+      // reactive link-trap refresh while we do our own targeted update.
+      s._ifWriteUntil = Date.now() + 12000;
+      const hasIf = info.ifIndex !== null && info.ifIndex !== undefined;
+      runButtonAction(btn, {
+        failLabel: info.name,
+        run: () => apiPost(url, Object.assign({ target: s.target }, body)),
+        ok: (res) => res && res.ok && !(res.body && res.body.error),
+        error: (res) => (res && res.body && res.body.error) || 'unknown',
+        onApplied: (res) => { appLog('info', 'Port action complete', Object.assign({ host: s.host, port: info.name }, res.body || {})); markConfigDirty(s); },
+        settle: () => hasIf ? refreshOnePort(s, info.ifIndex).then(() => { setTimeout(() => refreshOnePort(s, info.ifIndex), 3000); }) : Promise.resolve(),
+        // When there is no button to flash (shouldn't happen here) or the action
+        // wasn't on the keyed table, fall back to the inline text summary.
+        onDone: (res) => { if (!btn) done(describe(res.body || {})); }
+      }).catch(() => { /* toast already shown by the helper */ });
+    };
+
+    function paint() {
+      clear(td);
+      const group = [];
+      // Bounce PoE and shut/no-shut only make sense for a port that has an L2 or
+      // L3 mode defined. A port whose L2/L3 mode is blank (unconfigured /
+      // non-switching) does not get these controls. If the switch reports no
+      // L2/L3 data at all (hasL2L3Data false), the controls are allowed since we
+      // cannot tell - we only withhold them when we positively know the mode is
+      // absent for that port.
+      const showControls = (info.l2l3 === 'L2' || info.l2l3 === 'L3') ||
+        (info.hasL2L3Data === false);
+      if (info.poePort && showControls) {
+        // Two-tap confirm (like every other action); the uplink warning, when
+        // relevant, rides in the button title.
+        const b = actBtnConfirm('Bounce PoE',
+          (e) => post('/api/port/poe', { port: info.poePort, action: 'bounce' },
+            (out) => (out.enabled ? 'power restored' : 'still off') +
+              (out.configRestored === false ? ' \u00b7 config left unsaved' : ''), e.currentTarget),
+          'danger',
+          'Power-cycle ' + info.name + (info.uplink ? ' \u2014 faces ' + info.uplink : '') + ' to reboot whatever it powers');
+        group.push(b);
+      }
+      if (info.ifIndex && showControls) {
+        const down = info.adminUp;
+        const b = actBtnConfirm(down ? 'Shut' : 'No shut',
+          (e) => post('/api/port/admin', { ifIndex: info.ifIndex, action: down ? 'down' : 'up' },
+            (out) => 'admin ' + (out.admin === 1 ? 'up' : 'down'), e.currentTarget),
+          down ? 'danger' : '',
+          (down ? 'Administratively disable ' : 'Re-enable ') + info.name +
+            (down && info.uplink ? ' \u2014 faces ' + info.uplink + ', shutting it may cut off this switch' : ''));
+        group.push(b);
+      }
+      if (group.length) td.appendChild(actGroup(group));
+      else td.appendChild(el('span', 'card-sub', '\u2014'));
+    }
+
+    paint();
+    return td;
+  }
+
+  /** Collapse a list of numbers into ranges: 1,2,3,7 -> "1-3, 7". */
+  function rangeOf(list) {
+    const nums = list.map(Number).filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
+    if (!nums.length) return '';
+    const out = [];
+    let start = nums[0], prev = nums[0];
+    for (let i = 1; i <= nums.length; i++) {
+      const n = nums[i];
+      if (n === prev + 1) { prev = n; continue; }
+      out.push(start === prev ? String(start) : start + '-' + prev);
+      start = prev = n;
+    }
+    return out.join(', ');
+  }
+
+  // AAA server inventory (RADIUS + TACACS+) for the Authentication panel. Each
+  // server is one summary row with an expander revealing the deep detail:
+  // timeouts/retries/deadtime, shared-key status, and (RADIUS) the full RFC
+  // 4668 statistics. The shared key itself is write-only on the switch, so we
+  // show whether a key is set, not its value.
+  // AAA server inventory (RADIUS + TACACS+) for the Authentication panel,
+  // rendered as standard tables with column headers. Each server row is
+  // clickable to open a detail popout with the deep data (timeouts, deadtime,
+  // shared-key status, and the full RADIUS statistics). The shared key is
+  // write-only on the switch, so only whether one is set is ever shown.
+  // Global 802.1X settings for the Sessions & authentication panel: port-based
+  // auth enable, guest VLAN id/timeout, and the notification (trap) toggles -
+  // all scalar read-write objects. Shown always; editable controls write via
+  // SNMP SET and the switch enforces access.
+  const DOT1X_G = {
+    sysAuth:   { oid: '1.0.8802.1.1.1.1.1.1', kind: 'enable' },        // enabled(1)/disabled(2)
+    guestVid:  { oid: '1.3.6.1.4.1.9.6.1.101.95.4', kind: 'int' },     // 0 = none
+    guestTime: { oid: '1.3.6.1.4.1.9.6.1.101.95.19', kind: 'int' },    // 0..180
+    macSucc:   { oid: '1.3.6.1.4.1.9.6.1.101.95.20', kind: 'truth' },
+    macFail:   { oid: '1.3.6.1.4.1.9.6.1.101.95.21', kind: 'truth' },
+    suppSucc:  { oid: '1.3.6.1.4.1.9.6.1.101.95.29', kind: 'truth' },
+    suppFail:  { oid: '1.3.6.1.4.1.9.6.1.101.95.30', kind: 'truth' },
+    webQuiet:  { oid: '1.3.6.1.4.1.9.6.1.101.95.25', kind: 'truth' }
+  };
+  const D1XG_SCALAR = {
+    sysAuth: 'dot1xPaeSystemAuthControl', guestVid: 'rldot1xGuestVlanVID', guestTime: 'rldot1xGuestVlanTimeInterval',
+    macSucc: 'rldot1xMacAuthSuccessTrapEnabled', macFail: 'rldot1xMacAuthFailureTrapEnabled',
+    suppSucc: 'rldot1xSupplicantSuccessTrapEnabled', suppFail: 'rldot1xSupplicantFailureTrapEnabled',
+    webQuiet: 'rldot1xWebQuietFailureTrapEnabled'
+  };
+
+  function buildDot1xGlobal(s, body, h, section) {
+    const sc = (name) => (h.scalars && h.scalars[name]);
+    const dvS = (name) => { const c = sc(name); return c ? (c.display !== undefined && c.display !== '' ? c.display : c.value) : undefined; };
+    // Only show if the switch reports at least the global control (i.e. it
+    // supports 802.1X).
+    if (dvS('dot1xPaeSystemAuthControl') === undefined && dvS('rldot1xGuestVlanVID') === undefined) return;
+    section('802.1X global settings', '');
+
+    const wrap = el('div', 'd1xg');
+    // TruthValue is true(1)/false(2); enable objects use enabled(1)/disabled(2).
+    // Decide by the leading numeric value (1 = on) when present, else by text -
+    // the old /1/ substring test could misfire on any string containing a 1.
+    const truthy = (v) => {
+      const str = String(v == null ? '' : v).trim();
+      const m = str.match(/\((\d+)\)\s*$/) || str.match(/^(\d+)$/);   // "true (1)" or "1"
+      if (m) return parseInt(m[1], 10) === 1;
+      return /^(true|enabled|on|yes)$/i.test(str);
+    };
+    const isOn = truthy(dvS('dot1xPaeSystemAuthControl'));
+
+    const field = (grid, label, node, narrow) => { const f = el('div', 'd1xg-field' + (narrow ? ' narrow' : '')); f.appendChild(el('label', '', label)); f.appendChild(node); grid.appendChild(f); return node; };
+
+    // Port-based auth enable — on its own line.
+    const authGrid = el('div', 'd1xg-grid');
+    const sysSel = el('select'); for (const o of [['on', 'Enabled'], ['off', 'Disabled']]) { const op = el('option', '', o[1]); op.value = o[0]; sysSel.appendChild(op); }
+    sysSel.value = isOn ? 'on' : 'off';
+    field(authGrid, 'Port-based authentication', sysSel);
+    wrap.appendChild(authGrid);
+
+    // Guest VLAN — its own row group, separated by spacing (no heading, to
+    // avoid doubling with the field label below).
+    const gvGrid = el('div', 'd1xg-grid'); gvGrid.style.marginTop = '12px';
+    const curGuest = dvS('rldot1xGuestVlanVID') != null ? String(dvS('rldot1xGuestVlanVID')) : '0';
+    const voiceVid = String(dvS('vlanVoiceOperVid') || '').replace(/[^\d]/g, '');
+    const gvid = el('select');
+    const noneOpt = el('option', '', 'None'); noneOpt.value = '0'; gvid.appendChild(noneOpt);
+    const vlanList = ((s.health && s.health.vlans) || []).map((v) => Number(v.index)).filter((n) => Number.isFinite(n) && n > 1 && String(n) !== voiceVid).sort((a, b) => a - b);
+    for (const v of vlanList) { const o = el('option', '', 'VLAN ' + v); o.value = String(v); gvid.appendChild(o); }
+    // Keep the current value visible even if it's VLAN 1/voice (so state is honest).
+    if (curGuest !== '0' && !vlanList.some((v) => String(v) === curGuest)) { const o = el('option', '', 'VLAN ' + curGuest + (curGuest === voiceVid ? ' (voice)' : (curGuest === '1' ? ' (default)' : ''))); o.value = curGuest; gvid.appendChild(o); }
+    gvid.value = curGuest;
+    field(gvGrid, 'Guest VLAN', gvid);
+    const gtime = el('input'); gtime.type = 'number'; gtime.min = '0'; gtime.max = '180'; gtime.value = dvS('rldot1xGuestVlanTimeInterval') != null ? String(dvS('rldot1xGuestVlanTimeInterval')) : '';
+    field(gvGrid, 'Guest VLAN timeout (s)', gtime, true);
+    wrap.appendChild(gvGrid);
+
+    // MAB (MAC Authentication Bypass) global settings: the format of the
+    // username the switch builds from a client's MAC when doing MAC auth.
+    wrap.appendChild(el('div', 'aaa-sub', 'MAC authentication (MAB)'));
+    const mabGrid = el('div', 'd1xg-grid');
+    // RADIUS attribute format: EAP (true) vs PAP/Call-Check (false).
+    const eapSel = el('select'); for (const o of [['on', 'EAP'], ['off', 'PAP (Call-Check)']]) { const op = el('option', '', o[1]); op.value = o[0]; eapSel.appendChild(op); }
+    eapSel.value = truthy(dvS('rldot1xMacAuthEapEnabled')) ? 'on' : 'off';
+    field(mabGrid, 'RADIUS format', eapSel);
+    // Username group size (how MAC octets are grouped): 1 / 2 / 4 / 12.
+    const gsCur = String(dvS('rldot1xMacAuthUserGroupsize') || '').replace(/[^\d]/g, '') || '2';
+    const gsSel = el('select'); for (const g of ['1', '2', '4', '12']) { const o = el('option', '', g); o.value = g; gsSel.appendChild(o); }
+    gsSel.value = ['1', '2', '4', '12'].indexOf(gsCur) >= 0 ? gsCur : '2';
+    field(mabGrid, 'Group size', gsSel, true);
+    // Separator: hyphen(1) / colon(2) / dot(3).
+    const sepMap = { '1': 'hyphen', '2': 'colon', '3': 'dot' };
+    const sepCur = String(dvS('rldot1xMacAuthUserSeparator') || '').match(/\((\d)\)/);
+    const sepVal = sepCur ? sepCur[1] : (/hyphen/i.test(String(dvS('rldot1xMacAuthUserSeparator'))) ? '1' : /colon/i.test(String(dvS('rldot1xMacAuthUserSeparator'))) ? '2' : /dot/i.test(String(dvS('rldot1xMacAuthUserSeparator'))) ? '3' : '1');
+    const sepSel = el('select'); for (const [v, label] of [['1', 'hyphen (-)'], ['2', 'colon (:)'], ['3', 'dot (.)']]) { const o = el('option', '', label); o.value = v; sepSel.appendChild(o); }
+    sepSel.value = sepVal;
+    field(mabGrid, 'Separator', sepSel);
+    // Lowercase MAC in username.
+    const lcSel = el('select'); for (const o of [['on', 'Lowercase'], ['off', 'Uppercase']]) { const op = el('option', '', o[1]); op.value = o[0]; lcSel.appendChild(op); }
+    lcSel.value = truthy(dvS('rldot1xMacAuthUserLowercase')) ? 'on' : 'off';
+    field(mabGrid, 'MAC case', lcSel);
+    wrap.appendChild(mabGrid);
+
+    // Trap toggles.
+    wrap.appendChild(el('div', 'aaa-sub', 'Trap settings'));
+    const trapGrid = el('div', 'd1xg-traps');
+    // The success/failure traps are controlled by a PER-METHOD enum (one scalar
+    // for success, one for failure): the value encodes which auth methods send
+    // a trap. Confirmed from the switch/MIB:
+    //   0 none | 1 eapol(802.1x) | 2 mac+eapol | 3 mac | 4 web
+    //   5 web+eapol | 6 web+mac | 7 web+mac+eapol
+    // So the GUI's four 802.1x/MAC success/failure checkboxes are really two
+    // enums. We present 802.1x, MAC and Web checkboxes for each of success and
+    // failure, and encode/decode the enum from them.
+    const ENUM_METHODS = { 0: [], 1: ['eapol'], 2: ['mac', 'eapol'], 3: ['mac'], 4: ['web'], 5: ['web', 'eapol'], 6: ['web', 'mac'], 7: ['web', 'mac', 'eapol'] };
+    const methodsToEnum = (set) => {
+      const has = (m) => set.has(m);
+      for (const v of Object.keys(ENUM_METHODS)) {
+        const ms = ENUM_METHODS[v];
+        if (ms.length === set.size && ms.every((m) => has(m))) return Number(v);
+      }
+      return 0;
+    };
+    const enumOf = (name) => { const raw = dvS(name); const m = String(raw == null ? '' : raw).match(/\((\d+)\)/) || String(raw).match(/^(\d+)$/); return m ? parseInt(m[1], 10) : 0; };
+    const succEnum = enumOf('rldot1xMacWebAuthSuccessTrapEnabled');
+    const failEnum = enumOf('rldot1xMacWebAuthFailureTrapEnabled');
+    const succSet = new Set(ENUM_METHODS[succEnum] || []);
+    const failSet = new Set(ENUM_METHODS[failEnum] || []);
+
+    // A compact matrix: columns are the auth methods (802.1X / MAC / Web),
+    // rows are Success and Failure. Checkboxes line up under their column at any
+    // width, which reads far better than a wrapping row of labels.
+    const methodCbs = { succ: {}, fail: {} };
+    const methods = [['eapol', '802.1X'], ['mac', 'MAC'], ['web', 'Web']];
+    const matrix = el('table', 'd1xg-trap-matrix');
+    const mhead = el('tr');
+    mhead.appendChild(el('th', 'd1xg-trap-rowhead', ''));
+    for (const [, label] of methods) mhead.appendChild(el('th', '', label));
+    matrix.appendChild(mhead);
+    for (const [which, rowLabel, set] of [['succ', 'Success', succSet], ['fail', 'Failure', failSet]]) {
+      const tr = el('tr');
+      tr.appendChild(el('td', 'd1xg-trap-rowhead', rowLabel));
+      for (const [m] of methods) {
+        const cell = el('td', 'd1xg-trap-cell');
+        const cb = el('input'); cb.type = 'checkbox'; cb.checked = set.has(m);
+        methodCbs[which][m] = cb;
+        cell.appendChild(cb);
+        tr.appendChild(cell);
+      }
+      matrix.appendChild(tr);
+    }
+    trapGrid.appendChild(matrix);
+
+    // The remaining genuine TruthValue toggles (supplicant, web quiet) as a
+    // clean checkbox list below the matrix.
+    const trapDefs = [
+      ['suppSucc', 'Supplicant auth success'], ['suppFail', 'Supplicant auth failure'],
+      ['webQuiet', 'Web quiet failure']
+    ];
+    const trapCbs = {};
+    const extraList = el('div', 'd1xg-trap-extra');
+    for (const [key, label] of trapDefs) {
+      const lab = el('label', 'check-label');
+      const cb = el('input'); cb.type = 'checkbox'; cb.checked = truthy(dvS(D1XG_SCALAR[key]));
+      trapCbs[key] = cb;
+      lab.appendChild(cb); lab.appendChild(el('span', '', label));
+      extraList.appendChild(lab);
+    }
+    trapGrid.appendChild(extraList);
+    wrap.appendChild(trapGrid);
+
+    // Apply.
+    const { actions, apply, msg } = applyActions('Apply 802.1X settings');
+    withConfirm(apply, (ev) => {
+      clear(msg);
+      const vbs = [];
+      const curTruth = (key) => truthy(dvS(D1XG_SCALAR[key]));
+      // sysAuth: enabled(1)/disabled(2)
+      // Collect the controls the user actually changed, to highlight on success.
+      const changedCtls = [];
+      const newSys = sysSel.value === 'on' ? 1 : 2;
+      if ((newSys === 1) !== isOn) { vbs.push({ oid: DOT1X_G.sysAuth.oid + '.0', type: 'Integer', value: newSys }); changedCtls.push(sysSel); }
+      // guest vid / timeout
+      // rldot1xGuestVlanVID is a VlanIndex - this firmware wants it as Gauge,
+      // not Integer (Integer gave WrongType), matching the switchport VLAN writes.
+      const nvid = parseInt(gvid.value, 10); if (Number.isFinite(nvid) && String(nvid) !== String(dvS('rldot1xGuestVlanVID'))) { vbs.push({ oid: DOT1X_G.guestVid.oid + '.0', type: 'Gauge', value: nvid }); changedCtls.push(gvid); }
+      const ntime = parseInt(gtime.value, 10); if (Number.isFinite(ntime) && String(ntime) !== String(dvS('rldot1xGuestVlanTimeInterval'))) { vbs.push({ oid: DOT1X_G.guestTime.oid + '.0', type: 'Integer', value: ntime }); changedCtls.push(gtime); }
+      // Success/failure method-trap enums (encode the checked methods).
+      const newSucc = methodsToEnum(new Set(['eapol', 'mac', 'web'].filter((m) => methodCbs.succ[m].checked)));
+      const newFail = methodsToEnum(new Set(['eapol', 'mac', 'web'].filter((m) => methodCbs.fail[m].checked)));
+      if (newSucc !== succEnum) { vbs.push({ oid: '1.3.6.1.4.1.9.6.1.101.95.26.0', type: 'Integer', value: newSucc }); for (const m of ['eapol', 'mac', 'web']) changedCtls.push(methodCbs.succ[m]); }
+      if (newFail !== failEnum) { vbs.push({ oid: '1.3.6.1.4.1.9.6.1.101.95.27.0', type: 'Integer', value: newFail }); for (const m of ['eapol', 'mac', 'web']) changedCtls.push(methodCbs.fail[m]); }
+      // Remaining TruthValue toggles: true(1)/false(2)
+      for (const [key] of trapDefs) {
+        const want = trapCbs[key].checked;
+        if (want !== curTruth(key)) { vbs.push({ oid: DOT1X_G[key].oid + '.0', type: 'Integer', value: want ? 1 : 2 }); changedCtls.push(trapCbs[key]); }
+      }
+      // MAB global settings.
+      const numOf = (name) => { const m = String(dvS(name) || '').match(/\((\d+)\)/) || String(dvS(name)).match(/^(\d+)$/); return m ? parseInt(m[1], 10) : null; };
+      if ((eapSel.value === 'on') !== truthy(dvS('rldot1xMacAuthEapEnabled'))) { vbs.push({ oid: '1.3.6.1.4.1.9.6.1.101.95.35.0', type: 'Integer', value: eapSel.value === 'on' ? 1 : 2 }); changedCtls.push(eapSel); }
+      if (parseInt(gsSel.value, 10) !== numOf('rldot1xMacAuthUserGroupsize')) { vbs.push({ oid: '1.3.6.1.4.1.9.6.1.101.95.36.0', type: 'Integer', value: parseInt(gsSel.value, 10) }); changedCtls.push(gsSel); }
+      if (parseInt(sepSel.value, 10) !== numOf('rldot1xMacAuthUserSeparator')) { vbs.push({ oid: '1.3.6.1.4.1.9.6.1.101.95.37.0', type: 'Integer', value: parseInt(sepSel.value, 10) }); changedCtls.push(sepSel); }
+      if ((lcSel.value === 'on') !== truthy(dvS('rldot1xMacAuthUserLowercase'))) { vbs.push({ oid: '1.3.6.1.4.1.9.6.1.101.95.38.0', type: 'Integer', value: lcSel.value === 'on' ? 1 : 2 }); changedCtls.push(lcSel); }
+      if (!vbs.length) { msg.appendChild(el('div', 'card-sub', 'No changes.')); return; }
+      runButtonAction(ev.currentTarget, {
+        failLabel: 'Apply 802.1X settings',
+        run: () => snmpSetResult(s, vbs),
+        ok: (res) => res && res.ok && !(res.body && res.body.error),
+        error: (res) => { msg.appendChild(el('div', 'sw-err', 'Change failed: ' + ((res && res.body && res.body.error) || 'error'))); return (res && res.body && res.body.error) || 'error'; },
+        onApplied: () => markConfigDirty(s, changedCtls),
+        settle: () => {
+          // These settings ARE scalars, so re-read just the scalar OIDs we wrote
+          // and update h.scalars in place. The auth-panel repaint is scheduled
+          // AFTER runButtonAction's Done flash finishes - repainting during the
+          // flash recreates the panel and destroys the button mid-flash.
+          const changedScalars = {};
+          for (const key of Object.keys(DOT1X_G)) changedScalars[D1XG_SCALAR[key]] = DOT1X_G[key].oid;
+          changedScalars['rldot1xMacWebAuthSuccessTrapEnabled'] = '1.3.6.1.4.1.9.6.1.101.95.26';
+          changedScalars['rldot1xMacWebAuthFailureTrapEnabled'] = '1.3.6.1.4.1.9.6.1.101.95.27';
+          changedScalars['rldot1xMacAuthEapEnabled'] = '1.3.6.1.4.1.9.6.1.101.95.35';
+          changedScalars['rldot1xMacAuthUserGroupsize'] = '1.3.6.1.4.1.9.6.1.101.95.36';
+          changedScalars['rldot1xMacAuthUserSeparator'] = '1.3.6.1.4.1.9.6.1.101.95.37';
+          changedScalars['rldot1xMacAuthUserLowercase'] = '1.3.6.1.4.1.9.6.1.101.95.38';
+          return refreshScalars(s, changedScalars).then(() => { setTimeout(() => repaintPanel(s, 'auth'), 1900); });
+        }
+      });
+    });
+    wrap.appendChild(actions); wrap.appendChild(msg);
+    body.appendChild(wrap);
+  }
+
+  function buildAaaServers(s, body, h, section, p) {
+    const dv2 = (cell) => (cell && (cell.display !== undefined && cell.display !== null && cell.display !== '')
+      ? cell.display : (cell && cell.value !== undefined ? cell.value : ''));
+    const RADIUS_USAGE = { 1: 'login', 2: '802.1X', 3: 'all', 4: 'wireless' };
+
+    // InetAddress columns arrive as raw bytes (hex). Decode to a readable IP.
+    const inetAddr = (cell) => {
+      let raw = (cell && cell.value !== undefined && cell.value !== null && cell.value !== '')
+        ? cell.value : dv2(cell);
+      if (raw === '' || raw === null || raw === undefined) return '';
+      let str = String(raw).replace(/\s*\(hex\)\s*$/i, '');
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(str) || str.indexOf(':') >= 0) return str;
+      const hex = str.replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '');
+      if (hex.length === 8) return [0, 2, 4, 6].map((i) => parseInt(hex.substr(i, 2), 16)).join('.');
+      if (hex.length === 32) return (hex.match(/.{4}/g) || []).join(':').replace(/\b0+(\w)/g, '$1');
+      return str;
+    };
+    const keyStatus = (useGlobalCell, keyCell) => {
+      if (/true|1|yes/i.test(String(dv2(useGlobalCell)))) return 'global default';
+      const k = dv2(keyCell);
+      const hex = String(k).replace(/[^0-9a-fA-F]/g, '');
+      return (k !== '' && k !== null && k !== undefined && !/^0+$/.test(hex)) ? 'set' : 'none';
+    };
+
+    const statsByAddr = new Map();
+    for (const r of (h.radiusStats || [])) {
+      const addr = inetAddr(r.radiusAuthServerAddress);
+      if (addr) statsByAddr.set(String(addr), r);
+    }
+
+    const radius = h.radiusServers || [];
+    const tacacs = h.tacacsServers || [];
+    // Show the section when there are servers, or when the operator can add one.
+    const editableEarly = (s._snmp && s._snmp.editable) || s._aaaEditable;
+    if (!radius.length && !tacacs.length && !editableEarly) return;
+
+    const sc = (k) => (h.scalars && h.scalars[k]);
+    const isOn = (k) => sc(k) && /true|enable|1|yes/i.test(String(sc(k).display || sc(k).value));
+
+    // A detail popout, reusing the generic key/value dialog look.
+    const openDetail = (title, pairs, statsRow) => {
+      const prev = document.querySelector('.port-detail-back');
+      if (prev) prev.remove();
+      const back = el('div', 'port-detail-back');
+      const pop = el('div', 'port-detail');
+      const close = () => back.remove();
+      back.addEventListener('click', (e) => { if (e.target === back) close(); });
+      const head = el('div', 'port-detail-head');
+      head.appendChild(el('h3', '', title));
+      const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
+      x.addEventListener('click', close); head.appendChild(x);
+      pop.appendChild(head);
+      const grid = (ps) => {
+        const dl = el('dl', 'port-detail-grid');
+        for (const [k, v] of ps) {
+          if (v === undefined || v === null || v === '') continue;
+          dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v)));
+        }
+        return dl;
+      };
+      pop.appendChild(grid(pairs));
+      if (statsRow) {
+        pop.appendChild(el('div', 'port-detail-sub', 'RADIUS statistics'));
+        pop.appendChild(grid([
+          ['Round-trip (ms)', dv2(statsRow.radiusAuthClientRoundTripTime)],
+          ['Access-Requests', dv2(statsRow.radiusAuthClientAccessRequests)],
+          ['Accepts', dv2(statsRow.radiusAuthClientAccessAccepts)],
+          ['Rejects', dv2(statsRow.radiusAuthClientAccessRejects)],
+          ['Challenges', dv2(statsRow.radiusAuthClientAccessChallenges)],
+          ['Retransmissions', dv2(statsRow.radiusAuthClientAccessRetransmissions)],
+          ['Timeouts', dv2(statsRow.radiusAuthClientTimeouts)],
+          ['Pending', dv2(statsRow.radiusAuthClientPendingRequests)],
+          ['Bad authenticators', dv2(statsRow.radiusAuthClientBadAuthenticators)],
+          ['Malformed responses', dv2(statsRow.radiusAuthClientMalformedAccessResponses)],
+          ['Unknown types', dv2(statsRow.radiusAuthClientUnknownTypes)],
+          ['Packets dropped', dv2(statsRow.radiusAuthClientPacketsDropped)]
+        ]));
+      }
+      back.appendChild(pop);
+      document.body.appendChild(back);
+    };
+
+    // --- write support: add / edit / delete ---
+    // Write access is "full DefaultSuper" credential. The SNMP config panel
+    // learns this when it loads; if it hasn't, fetch it here (once, cached) and
+    // repaint when it arrives, so the add/edit/delete controls appear without
+    // needing to visit the SNMP panel first.
+    let editable = (s._snmp && s._snmp.editable) || s._aaaEditable;
+    if (editable === undefined && !s._aaaAccessPending) {
+      s._aaaAccessPending = true;
+      snmpCfgPost(s, 'access').then((access) => {
+        s._aaaEditable = !!(access && access.ok && access.level === 'full');
+        s._aaaAccessPending = false;
+        const p = s.panels.find((x) => x.key === 'auth');
+        if (p && p._body) paintPanelBody(s, p);
+      }).catch(() => { s._aaaAccessPending = false; });
+    }
+    editable = editable || false;
+    // Pre-emptive cleartext-key note: is this session SNMPv3 authPriv?
+    const t = s.target || {};
+    const isV3Priv = String(t.version) === '3' && t.v3 && String(t.v3.level) === 'authPriv';
+
+    // A field row helper for the add/edit forms.
+    const inp = (type, val, ph) => { const i = el('input'); i.type = type; if (val != null) i.value = val; if (ph) i.placeholder = ph; return i; };
+
+    // In-app confirm: renders a message with Confirm / Cancel buttons into a
+    // host element and resolves true/false. No browser dialog.
+    const inAppConfirm = (host, message, confirmLabel) => new Promise((resolve) => {
+      for (const old of Array.from(host.querySelectorAll('.inapp-confirm'))) old.remove();
+      const box = el('div', 'inapp-confirm');
+      box.appendChild(el('div', 'sw-warn', message));
+      const row = el('div', 'snmp-form-actions');
+      const yes = el('button', 'btn btn-small btn-danger', confirmLabel || 'Confirm'); yes.type = 'button';
+      const no = el('button', 'btn btn-small', 'Cancel'); no.type = 'button';
+      yes.addEventListener('click', () => { box.remove(); resolve(true); });
+      no.addEventListener('click', () => { box.remove(); resolve(false); });
+      row.appendChild(yes); row.appendChild(no); box.appendChild(row);
+      host.appendChild(box);
+    });
+
+    // Submit an add/edit. If the server replies that the key would be sent in
+    // cleartext (409 + warning), show an in-app confirm rather than a browser
+    // prompt, then resend with confirm=true.
+    const submit = (url, payload, host, onOk) => {
+      const go = (confirmed) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(Object.assign({ target: s.target, confirm: confirmed }, payload)) })
+        .then((r) => r.json().then((b) => ({ status: r.status, b })))
+        .then(({ status, b }) => {
+          if (status === 409 && b.warning && !confirmed) {
+            return inAppConfirm(host, b.warning + ' Send the key anyway?', 'Send anyway')
+              .then((ok) => { if (ok) return go(true); });
+          }
+          if (b && b.ok) { onOk(); markConfigDirty(s); refreshPanel(s, s.panels.find((p) => p.key === 'auth')); }
+          else { clearErr(host); host.appendChild(el('div', 'sw-err', (b && b.error) || 'Failed.')); }
+        })
+        .catch((e) => { clearErr(host); host.appendChild(el('div', 'sw-err', e.message)); });
+      s.writeBusy = true;
+      Promise.resolve(go(false)).finally(() => { s.writeBusy = false; });
+    };
+
+    // Delete with an in-app confirm rendered next to the row's action cell.
+    // The Delete button confirms itself (two-tap), so this deletes directly and
+    // refreshes just the auth panel.
+    const delDirect = (url, payload) => {
+      s.writeBusy = true;
+      fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(Object.assign({ target: s.target }, payload)) })
+        .then((r) => r.json()).then((b) => {
+          s.writeBusy = false;
+          if (b && b.ok) { markConfigDirty(s); refreshPanel(s, s.panels.find((p) => p.key === 'auth')); }
+          else { appLog('error', 'Delete failed', { message: (b && b.error) || 'unknown' }); toast('Delete failed: ' + ((b && b.error) || 'the switch rejected it'), 'error'); }
+        }).catch((e) => { s.writeBusy = false; appLog('error', 'Delete error', { message: e.message }); toast('Delete failed: ' + e.message, 'error'); });
+    };
+
+    // Build an add/edit form for RADIUS or TACACS.
+    const serverForm = (kind, host, existing) => {
+      const wrap = el('div', 'aaa-form');
+      if (!isV3Priv) wrap.appendChild(el('div', 'sw-warn',
+        'This session is not SNMPv3 with privacy — a shared key entered here is sent in cleartext.'));
+      const grid = el('div', 'snmp-form-grid');
+      const addr = inp('text', existing ? existing.address : '', 'e.g. 192.168.1.3');
+      if (existing) addr.disabled = true;   // address is the key; edit keeps it fixed
+      grid.appendChild(field('Server IP', addr));
+      let authPort, acctPort, port, usageSel;
+      if (kind === 'radius') {
+        authPort = inp('number', existing ? existing.authPort : 1812); grid.appendChild(field('Auth port', authPort));
+        acctPort = inp('number', existing ? existing.acctPort : 1813); grid.appendChild(field('Acct port', acctPort));
+        usageSel = el('select'); for (const u of ['all', 'login', '802.1x', 'wireless']) { const o = el('option', '', u); o.value = u; usageSel.appendChild(o); }
+        if (existing && existing.usage) usageSel.value = existing.usage;
+        grid.appendChild(field('Usage', usageSel));
+      } else {
+        port = inp('number', existing ? existing.port : 49); grid.appendChild(field('Port', port));
+      }
+      const prio = inp('number', existing ? existing.priority : 0); grid.appendChild(field('Priority', prio));
+      const timeout = inp('number', existing ? existing.timeout : '', 'optional'); grid.appendChild(field('Timeout (s)', timeout));
+      const globalKey = el('input'); globalKey.type = 'checkbox'; globalKey.checked = existing ? !!existing.useGlobalKey : false;
+      const gkWrap = el('label', 'snmp-field-check'); gkWrap.appendChild(globalKey); gkWrap.appendChild(el('span', '', 'Use global default key'));
+      const key = inp('password', '', existing ? '(unchanged)' : 'shared secret');
+      // Key field with a show/hide toggle so the operator can verify what they
+      // typed without re-entering it.
+      const keyField = el('div', 'snmp-field');
+      keyField.appendChild(el('label', '', 'Shared key'));
+      const keyRow = el('div', 'key-row');
+      const showToggle = el('button', 'btn btn-small key-show', 'Show'); showToggle.type = 'button';
+      showToggle.addEventListener('click', () => {
+        const shown = key.type === 'text';
+        key.type = shown ? 'password' : 'text';
+        showToggle.textContent = shown ? 'Show' : 'Hide';
+      });
+      keyRow.appendChild(key); keyRow.appendChild(showToggle);
+      keyField.appendChild(keyRow);
+      const syncKey = () => { keyField.style.display = globalKey.checked ? 'none' : ''; };
+      globalKey.addEventListener('change', syncKey); syncKey();
+      grid.appendChild(gkWrap);
+      grid.appendChild(keyField);
+      wrap.appendChild(grid);
+
+      const cancel = el('button', 'btn btn-small', 'Cancel'); cancel.type = 'button';
+      cancel.addEventListener('click', () => wrap.remove());
+      const { actions, apply: save } = applyActions(existing ? 'Save' : 'Add', { extra: [cancel] });
+      save.addEventListener('click', () => {
+        const a = (addr.value || '').trim();
+        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(a)) { clearErr(wrap); wrap.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
+        const common = { address: a, edit: !!existing, priority: parseInt(prio.value, 10),
+          timeout: timeout.value === '' ? undefined : parseInt(timeout.value, 10),
+          useGlobalKey: globalKey.checked, key: globalKey.checked ? undefined : (key.value || undefined) };
+        if (kind === 'radius') {
+          submit('/api/aaa/radius', Object.assign(common, {
+            authPort: parseInt(authPort.value, 10) || 1812, acctPort: parseInt(acctPort.value, 10) || 1813,
+            usage: usageSel.value }), wrap, () => wrap.remove());
+        } else {
+          submit('/api/aaa/tacacs', Object.assign(common, { port: parseInt(port.value, 10) || 49 }), wrap, () => wrap.remove());
+        }
+      });
+      wrap.appendChild(actions);
+      host.appendChild(wrap);
+    };
+    const clearErr = (node) => { for (const e of Array.from(node.querySelectorAll('.sw-err'))) e.remove(); };
+
+    // Remove any open inline AAA editor/add-form/confirm anywhere in the panel,
+    // so only one is ever shown.
+    const closeAaaEditors = () => {
+      for (const n of Array.from(body.querySelectorAll('.aaa-inline-row'))) n.remove();
+      for (const n of Array.from(body.querySelectorAll('.aaa-form'))) n.remove();
+      for (const n of Array.from(body.querySelectorAll('.inapp-confirm'))) n.remove();
+      // Mark any in-place editing rows as no longer editing (a repaint, if one
+      // follows, rebuilds them clean).
+      for (const tr of Array.from(body.querySelectorAll('tr.aaa-editing'))) {
+        tr._editing = false; tr.classList.remove('aaa-editing');
+      }
+    };
+    s._aaaCloseEditors = closeAaaEditors;
+
+
+    // Build an edit form into a row-editor host (the proven SNMP-groups pattern:
+    // openRowEditor inserts a <tr> after the row and returns a div to fill).
+    // Edit form rendered into a row-editor host (openRowEditor inserts a <tr>
+    // after the row and returns a div to fill).
+    const editForm = (kind, host, cur, tr, onCancel) => {
+      const form = el('div', 'snmp-form');
+      form.appendChild(el('h5', '', 'Edit ' + (kind === 'radius' ? 'RADIUS' : 'TACACS+') + ' server ' + cur.address));
+      if (!isV3Priv) form.appendChild(el('div', 'sw-warn',
+        'This session is not SNMPv3 with privacy — a shared key entered here is sent in cleartext.'));
+      const grid = el('div', 'snmp-form-grid');
+      // A number input rejects a value it can't parse (e.g. "1,812" or
+      // "1812 (auth)"), silently showing empty - so pull the numeric part out
+      // of whatever the display string is before assigning it.
+      const num = (v) => {
+        const i = el('input'); i.type = 'number';
+        if (v != null && v !== '') {
+          const m = String(v).replace(/,/g, '').match(/-?\d+(\.\d+)?/);
+          if (m) i.value = m[0];
+        }
+        return i;
+      };
+      let authPort, acctPort, port, usageSel;
+      if (kind === 'radius') {
+        authPort = num(cur.authPort); grid.appendChild(field('Auth port', authPort));
+        acctPort = num(cur.acctPort); grid.appendChild(field('Acct port', acctPort));
+        usageSel = el('select'); for (const u of ['all', 'login', '802.1X', 'wireless']) { const o = el('option', '', u); o.value = u; usageSel.appendChild(o); }
+        // Pre-select the current usage, matching case-insensitively so "802.1X"
+        // from the switch lines up with the option regardless of letter case.
+        if (cur.usage) {
+          const want = String(cur.usage).toLowerCase();
+          for (const o of usageSel.options) { if (o.value.toLowerCase() === want) { usageSel.value = o.value; break; } }
+        }
+        grid.appendChild(field('Usage', usageSel));
+      } else {
+        port = num(cur.port); grid.appendChild(field('Port', port));
+      }
+      const prio = num(cur.priority); grid.appendChild(field('Priority', prio));
+      const timeout = num(cur.timeout); grid.appendChild(field('Timeout (s)', timeout));
+      const gk = el('input'); gk.type = 'checkbox'; gk.checked = !!cur.useGlobalKey;
+      const gkWrap = el('label', 'snmp-field-check'); gkWrap.appendChild(gk); gkWrap.appendChild(el('span', '', 'Use global default key'));
+      const key = el('input'); key.type = 'password'; key.placeholder = '(unchanged)';
+      const keyField = el('div', 'snmp-field'); keyField.appendChild(el('label', '', 'Shared key'));
+      const keyRow = el('div', 'key-row');
+      const showBtn = el('button', 'btn btn-small', 'Show'); showBtn.type = 'button';
+      showBtn.addEventListener('click', () => { const sh = key.type === 'text'; key.type = sh ? 'password' : 'text'; showBtn.textContent = sh ? 'Show' : 'Hide'; });
+      keyRow.appendChild(key); keyRow.appendChild(showBtn); keyField.appendChild(keyRow);
+      const syncKey = () => { keyField.style.display = gk.checked ? 'none' : ''; };
+      gk.addEventListener('change', syncKey); syncKey();
+      grid.appendChild(gkWrap); grid.appendChild(keyField);
+      form.appendChild(grid);
+      const cancel = el('button', 'btn btn-small secondary', 'Cancel'); cancel.type = 'button';
+      cancel.addEventListener('click', () => { if (onCancel) onCancel(); else if (tr) closeRowEditors(tr.closest('table')); });
+      const { actions, apply: save } = applyActions('Save', { extra: [cancel] });
+      save.addEventListener('click', () => {
+        const common = { address: cur.address, edit: true, priority: parseInt(prio.value, 10),
+          timeout: timeout.value === '' ? undefined : parseInt(timeout.value, 10),
+          useGlobalKey: gk.checked, key: gk.checked ? undefined : (key.value || undefined) };
+        if (kind === 'radius') submit('/api/aaa/radius', Object.assign(common, {
+          authPort: parseInt(authPort.value, 10) || 1812, acctPort: parseInt(acctPort.value, 10) || 1813, usage: usageSel.value }), host, () => {});
+        else submit('/api/aaa/tacacs', Object.assign(common, { port: parseInt(port.value, 10) || 49 }), host, () => {});
+      });
+      form.appendChild(actions);
+      host.appendChild(form);
+    };
+
+    // Edit/Delete buttons for a row, using the row-editor host (the detail popout
+    // stays available via the clickable address cell).
+    const rowActionsCell = (kind, addr, extra) => {
+      const btns = [];
+      // Editing is via row-click (opens the edit popout); the row action is
+      // delete only, unless a caller explicitly wants the inline Edit too.
+      if (!extra.deleteOnly) btns.push(actBtn('Edit', (e) => { const tr = e.target.closest('tr');
+        editForm(kind, openRowEditor(tr, tr.children.length), Object.assign({ address: addr }, extra.cur), tr); }, '', 'Edit this server'));
+      btns.push(actBtnConfirm('Delete', (e) => { const tr = e.target.closest('tr');
+        delDirect(extra.delUrl, extra.delPayload); }, 'danger', 'Delete this server'));
+      return actGroup(btns);
+    };
+    // Read-only key/value grid for a server popout when the session can't edit.
+    const aaaReadonly = (pairs) => {
+      const dl = el('dl', 'port-detail-grid');
+      for (const [k, v] of pairs) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
+      return dl;
+    };
+    // RADIUS live-stats grid (RFC 4668 counters) for the Counters tab.
+    const radiusStatsGrid = (stats) => {
+      const wrap = el('div');
+      wrap.appendChild(el('div', 'port-detail-sub', 'RADIUS statistics'));
+      const dl = el('dl', 'port-detail-grid');
+      for (const [k, v] of Object.entries(stats || {})) {
+        if (k === 'index') continue;
+        const val = (v && typeof v === 'object') ? (v.display !== undefined ? v.display : v.value) : v;
+        if (val === undefined || val === null || val === '') continue;
+        dl.appendChild(el('dt', '', k.replace(/^radiusAuthClient/, '').replace(/([A-Z])/g, ' $1').trim())); dl.appendChild(el('dd', '', String(val)));
+      }
+      wrap.appendChild(dl);
+      return wrap;
+    };
+
+    if (radius.length || editable) {
+      section('RADIUS servers', radius.length + (isOn('rlAAARadiusEnabled') ? ' \u00b7 enabled' : ' \u00b7 disabled'));
+      if (radius.length) mountInto(body, s, p, 'radius',
+        ['Address', 'Auth port', 'Acct port', 'Priority', 'Usage', 'Timeout', 'Retries', 'Key'].concat(editable ? [''] : []),
+        radius.map((r) => {
+          const addr = inetAddr(r.rlRadiusServerInetAddress);
+          const authPort = dv2(r.rlRadiusServerInetAuthPortNumber);
+          const acctPort = dv2(r.rlRadiusServerInetAcctPortNumber);
+          const usage = RADIUS_USAGE[Number(dv2(r.rlRadiusServerInetUsage))] || dv2(r.rlRadiusServerInetUsage);
+          const key = keyStatus(r.rlRadiusServerInetUseGlobalDefaultKey, r.rlRadiusServerInetKey);
+          const stats = statsByAddr.get(String(addr));
+          const cur = { address: addr, authPort, acctPort, priority: dv2(r.rlRadiusServerInetPriority), usage,
+            timeout: dv2(r.rlRadiusServerInetTimeout),
+            useGlobalKey: /true|1|yes/i.test(String(dv2(r.rlRadiusServerInetUseGlobalDefaultKey))) };
+          // Row-click opens the standard edit popout: Config tab = the edit form
+          // (when editable, else a read-only view), Counters tab = RADIUS stats.
+          const openIt = () => openEditPopout(s, 'RADIUS \u00b7 ' + addr,
+            (pane, close) => { if (editable) editForm('radius', pane, cur, null, close); else pane.appendChild(aaaReadonly([
+              ['Address', addr], ['Auth port', authPort], ['Acct port', acctPort],
+              ['Priority', dv2(r.rlRadiusServerInetPriority)], ['Usage', usage],
+              ['Timeout (s)', dv2(r.rlRadiusServerInetTimeout)], ['Retries', dv2(r.rlRadiusServerInetRetries)],
+              ['Deadtime (min)', dv2(r.rlRadiusServerInetDeadtime)], ['Source', dv2(r.rlRadiusServerInetSource)],
+              ['Shared key', key]])); },
+            stats ? (pane) => pane.appendChild(radiusStatsGrid(stats)) : null);
+          const row = [
+            { click: { open: openIt }, v: addr },
+            { v: authPort }, { v: acctPort }, { v: dv2(r.rlRadiusServerInetPriority) }, { v: usage },
+            { v: dv2(r.rlRadiusServerInetTimeout) }, { v: dv2(r.rlRadiusServerInetRetries) }, { v: key }
+          ];
+          if (editable) row.push({ cellNode: rowActionsCell('radius', addr, { cur, deleteOnly: true,
+            delUrl: '/api/aaa/radius/delete', delPayload: { address: addr, authPort, acctPort } }), sig: 'ra' });
+          return { key: 'radius:' + addr, cells: row };
+        }));
+      if (editable) {
+        body.appendChild(addControl('Add RADIUS server', (host) => {
+          const open = host.querySelector('.aaa-form'); if (s._aaaCloseEditors) s._aaaCloseEditors();
+          if (!open) serverForm('radius', host, null); else host.querySelector('.aaa-form').remove();
+        }));
+      }
+    }
+
+    if (tacacs.length || editable) {
+      section('TACACS+ servers', tacacs.length + (isOn('rlAAATacacsEnabled') ? ' \u00b7 enabled' : ' \u00b7 disabled'));
+      if (tacacs.length) mountInto(body, s, p, 'tacacs',
+        ['Address', 'Port', 'State', 'Priority', 'Timeout', 'Key'].concat(editable ? [''] : []),
+        tacacs.map((r) => {
+          const addr = inetAddr(r.rlTacacsServerInetAddress);
+          const port = dv2(r.rlTacacsServerInetPortNumber);
+          const statusRaw = String(dv2(r.rlTacacsServerInetConnectionStatus));
+          const connected = /connected\(0\)|^0$|^connected$/i.test(statusRaw) && !/not/i.test(statusRaw);
+          const key = keyStatus(r.rlTacacsServerInetUseGlobalDefaultKey, r.rlTacacsServerInetKey);
+          const cur = { address: addr, port, priority: dv2(r.rlTacacsServerInetPriority), timeout: dv2(r.rlTacacsServerInetTimeout),
+            useGlobalKey: /true|1|yes/i.test(String(dv2(r.rlTacacsServerInetUseGlobalDefaultKey))) };
+          const openIt = () => openEditPopout(s, 'TACACS+ \u00b7 ' + addr,
+            (pane, close) => { if (editable) editForm('tacacs', pane, cur, null, close); else pane.appendChild(aaaReadonly([
+              ['Address', addr], ['Port', port], ['Connection', dv2(r.rlTacacsServerInetConnectionStatus)],
+              ['Type', dv2(r.rlTacacsServerInetConnectionType)], ['Priority', dv2(r.rlTacacsServerInetPriority)],
+              ['Timeout (s)', dv2(r.rlTacacsServerInetTimeout)], ['Shared key', key]])); },
+            null);
+          const row = [
+            { click: { open: openIt }, v: addr },
+            { v: port }, { pill: true, v: connected ? 'connected' : 'not connected' },
+            { v: dv2(r.rlTacacsServerInetPriority) }, { v: dv2(r.rlTacacsServerInetTimeout) }, { v: key }
+          ];
+          if (editable) row.push({ cellNode: rowActionsCell('tacacs', addr, { cur, deleteOnly: true,
+            delUrl: '/api/aaa/tacacs/delete', delPayload: { address: addr } }), sig: 'ta' });
+          return { key: 'tacacs:' + addr, cells: row };
+        }));
+      if (editable) {
+        body.appendChild(addControl('Add TACACS+ server', (host) => {
+          const open = host.querySelector('.aaa-form'); if (s._aaaCloseEditors) s._aaaCloseEditors();
+          if (!open) serverForm('tacacs', host, null); else host.querySelector('.aaa-form').remove();
+        }));
+      }
+    }
+
+  }
+
+  // Is a given port's bit set in a PortList hex bitmap? (octet 0 = ports 1-8,
+  // MSB = lowest port.)
+  function portBitSet(hex, portNum) {
+    if (!hex || !Number.isFinite(portNum) || portNum < 1) return false;
+    const bit = portNum - 1;
+    const byteIdx = Math.floor(bit / 8);
+    if (byteIdx * 2 + 2 > hex.length) return false;
+    const byte = parseInt(hex.substr(byteIdx * 2, 2), 16);
+    return !!((byte >> (7 - (bit % 8))) & 1);
+  }
+  // Return a new PortList hex bitmap with one port's bit set or cleared,
+  // preserving all other bits. Grows the bitmap if needed to reach the port.
+  function setPortBit(hex, portNum, on) {
+    const bit = portNum - 1;
+    const needBytes = Math.floor(bit / 8) + 1;
+    const bytes = [];
+    for (let i = 0; i < Math.max(needBytes, hex.length / 2); i++) {
+      bytes.push(i * 2 + 2 <= hex.length ? parseInt(hex.substr(i * 2, 2), 16) : 0);
+    }
+    const mask = 0x80 >> (bit % 8);
+    if (on) bytes[Math.floor(bit / 8)] |= mask; else bytes[Math.floor(bit / 8)] &= ~mask;
+    return bytes.map((b) => (b & 0xff).toString(16).padStart(2, '0')).join('');
+  }
+
+  // Decode a PortList bitmap (hex string or bytes) into the list of member port
+  // numbers. Octet 0 covers ports 1-8, MSB = the lowest port (same scheme as
+  // buildPortListBit / the VLAN bitmaps).
+  function decodePortList(raw) {
+    if (raw == null) return [];
+    let hex = String(raw).replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '');
+    if (hex.length % 2) hex = '0' + hex;
+    const ports = [];
+    for (let i = 0; i < hex.length; i += 2) {
+      const byte = parseInt(hex.substr(i, 2), 16);
+      const base = (i / 2) * 8;
+      for (let bit = 0; bit < 8; bit++) {
+        if ((byte >> (7 - bit)) & 1) ports.push(base + bit + 1);
+      }
+    }
+    return ports;
+  }
+
+  // Port channels (LAGs) section for the Interfaces panel: lists every
+  // aggregator the switch supports, its mode (static/LACP), members, key and
+  // aggregating state - and lets a channel be created/edited (mode + members)
+  // or cleared. Members join by setting their port's actor admin key to the
+  // aggregator's key; a static trunk / LACP is set on the creation table.
+  // Build an interface-detail object for a port channel so it can open the same
+  // tabbed popout a physical port uses. The channel's ifIndex is its aggregator
+  // index; switchport mode/VLAN come from the per-port mode and configured-VLAN
+  // tables (same source the port table uses), so the Switchport tab is prefilled.
+  function buildChannelDetail(s, h, chIfx, chName, extra) {
+    const cvn = (c) => { const v = c && (c.value !== undefined ? c.value : c.display); const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
+    const key = String(chIfx);
+    const ifRow = (h.interfaces || []).find((r) => String(r.index) === key) || null;
+    const dvc = (c) => (c && (c.display !== undefined && c.display !== null ? c.display : c.value)) || '';
+    // Switchport mode (11=access, 12=trunk) and configured VLAN.
+    let modeStr = '';
+    const mRow = (h.portModes || []).find((r) => String(r.index) === key);
+    const mCode = mRow ? cvn(mRow.vlanPortModeState) : null;
+    if (mCode === 11) modeStr = 'access'; else if (mCode === 12) modeStr = 'trunk';
+    const accRow = (h.portAccessVlan || []).find((r) => String(r.index) === key);
+    const natRow = (h.portNativeVlan || []).find((r) => String(r.index) === key);
+    const accV = accRow ? cvn(accRow.vlanAccessPortModeVlanId) : null;
+    const natV = natRow ? cvn(natRow.vlanTrunkPortModeNativeVlanId) : null;
+    const allVlans = (h.vlans || []).map((v) => Number(v.index)).filter(Boolean).sort((a, b) => a - b);
+    const sw = {
+      mode: modeStr,
+      l2l3: '',
+      untagged: modeStr === 'access' && accV ? [String(accV)] : (modeStr === 'trunk' && natV ? [String(natV)] : []),
+      tagged: [],
+      allVlans,
+      uplink: null
+    };
+    const fields = {};
+    if (ifRow) {
+      fields['Admin status'] = dvc(ifRow.rlifPresentAdminStatus);
+      fields['Oper status'] = dvc(ifRow.rlifPresentOperStatus);
+      if (extra && extra.mode) fields['LAG mode'] = extra.mode;
+      if (extra && extra.memNames) fields['Members'] = extra.memNames;
+    }
+    return { name: chName, ifIndex: chIfx, fields, sw, dot1x: null };
+  }
+
+  function buildPortChannels(s, body, h, section, p) {
+    const dv2 = (c) => (c && (c.display !== undefined && c.display !== null && c.display !== '') ? c.display : (c && c.value !== undefined ? c.value : ''));
+    const dv = dv2;   // local alias (the interfaces-case dv is out of scope here)
+    const truthy = (c) => /true|1|yes|enabled/i.test(String(dv2(c)));
+
+    // Enumerate EVERY port-channel slot, configured or not, by unioning all
+    // sources: the interface table (configured channels appear as present
+    // interfaces named Po#/ch#/LAG# etc.), the creation table, and the standard
+    // dot3ad aggregator table - then synthesising any remaining slots up to the
+    // switch's supported count so empty channels still show.
+    const CH_NAME = /^(po|ch|port-?channel|lag|trunk)\s*\d+/i;
+    const creationByIdx = new Map(); for (const r of (h.lagCreation || [])) creationByIdx.set(String(r.index), r);
+    const nameOfIf = new Map();
+    for (const r of (h.interfaces || [])) nameOfIf.set(String(r.index), dv(r.rlifPresentName) || '');
+
+    // Collect candidate aggregator ifIndexes from every source.
+    const slotIdx = new Map();   // ifIndex -> display name
+    for (const r of (h.interfaces || [])) {
+      const nm = String(dv(r.rlifPresentName) || '');
+      if (CH_NAME.test(nm)) slotIdx.set(String(r.index), nm);
+    }
+    for (const r of (h.lagCreation || [])) if (!slotIdx.has(String(r.index))) slotIdx.set(String(r.index), nameOfIf.get(String(r.index)) || null);
+    for (const r of (h.lagAgg || [])) if (!slotIdx.has(String(r.index))) slotIdx.set(String(r.index), nameOfIf.get(String(r.index)) || null);
+
+    // Synthesise the full slot set. The aggregator ifIndexes form a contiguous
+    // block; derive its base/stride from the known slots and extend to the
+    // supported count so empty channels appear too.
+    const scN = (h.scalars && h.scalars.rlDot3adAggNumOfTrunks);
+    const supported = scN ? parseInt(dv2(scN), 10) : 0;
+    const known = Array.from(slotIdx.keys()).map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+    if (supported > 0 && known.length) {
+      // Stride between consecutive aggregator ifIndexes (usually 1); extend from
+      // the lowest known slot up to the supported count so empty slots appear.
+      const stride = known.length >= 2 ? Math.max(1, known[1] - known[0]) : 1;
+      for (let i = 0; i < supported; i++) {
+        const idx = String(known[0] + i * stride);
+        if (!slotIdx.has(idx)) slotIdx.set(idx, null);
+      }
+    }
+    // The aggregator ifIndexes form a contiguous block. Derive the base (the
+    // lowest slot = channel 1) so an unnamed/synthesised slot can be labelled
+    // "Po<N>" by its position, rather than "Po/<ifIndex>".
+    const aggBase = known.length ? known[0] : null;
+    const chLabel = (idx) => {
+      const nm = slotIdx.get(String(idx)) || nameOfIf.get(String(idx));
+      if (nm) return nm;                                   // the switch's own name
+      if (aggBase != null) return 'Po' + (Number(idx) - aggBase + 1);   // derived number
+      return 'Po/' + idx;
+    };
+    // The set of real LAG aggregator ifIndexes (for the "already a member"
+    // check): only these count as "another channel".
+    const lagSlots = new Set(Array.from(slotIdx.keys()).map(String));
+
+    // Build the channel list, ordered by ifIndex, merging the creation row.
+    let lagCreate = Array.from(slotIdx.keys()).map(Number).filter(Number.isFinite).sort((a, b) => a - b)
+      .map((idx) => Object.assign(
+        { index: idx, _name: chLabel(idx) },
+        creationByIdx.get(String(idx)) || {}));
+    if (!lagCreate.length) return;   // nothing to show at all
+
+    // Index the supporting tables by aggregator ifIndex.
+    const aggByIdx = new Map(); for (const r of (h.lagAgg || [])) aggByIdx.set(String(r.index), r);
+    const memByIdx = new Map(); for (const r of (h.lagMembers || [])) memByIdx.set(String(r.index), r);
+    // Map agg key -> agg ifIndex, and gather each port's actor key.
+    const portKey = new Map();   // portIfIndex -> actor admin key
+    const portAttached = new Map(); // portIfIndex -> attached agg id
+    const portState = new Map();  // portIfIndex -> actor admin state (hex; a2=LACP, empty=static)
+    for (const r of (h.lagPortKey || [])) {
+      portKey.set(String(r.index), dv2(r.dot3adAggPortActorAdminKey));
+      portAttached.set(String(r.index), dv2(r.dot3adAggPortAttachedAggID));
+      portState.set(String(r.index), String(dv2(r.dot3adAggPortActorAdminState) || '').trim());
+    }
+    // Interface names by ifIndex, for showing member/port names.
+    const nameByIdx = new Map();
+    for (const r of (h.interfaces || [])) nameByIdx.set(String(r.index), dv(r.rlifPresentName) || String(r.index));
+
+    const sc = (k) => (h.scalars && h.scalars[k]);
+    const maxTrunks = sc('rlDot3adAggNumOfTrunks') ? dv2(sc('rlDot3adAggNumOfTrunks')) : lagCreate.length;
+    const maxPorts = sc('rlDot3adAggMaxPortsInTrunks') ? dv2(sc('rlDot3adAggMaxPortsInTrunks')) : '';
+
+    section('Port channels', lagCreate.length + ' available' + (maxPorts ? ' \u00b7 up to ' + maxPorts + ' ports each' : ''));
+
+    const editable = (s._snmp && s._snmp.editable) || s._aaaEditable || true;   // writes allowed; switch enforces access
+    const OIDS = {
+      createTrunk: '1.3.6.1.4.1.9.6.1.101.65.6.1.1',
+      createLacp: '1.3.6.1.4.1.9.6.1.101.65.6.1.2',
+      aggAdminKey: '1.2.840.10006.300.43.1.1.1.1.6',
+      portActorKey: '1.2.840.10006.300.43.1.2.1.1.4',
+      portActorState: '1.2.840.10006.300.43.1.2.1.1.20',
+      balanceLayer: '1.3.6.1.4.1.9.6.1.101.65.2.1.2'
+    };
+
+    const setVb = (varbinds) => snmpSetResult(s, varbinds).then((res) => ({ ok: res.ok, b: res.body }));
+
+    // Build the channel table rows.
+    const cols = ['Channel', 'Mode', 'Members', 'Key', 'Aggregating', 'Status'].concat(editable ? [''] : []);
+    const rows = lagCreate.map((c) => {
+      const aggIdx = String(c.index);
+      const agg = aggByIdx.get(aggIdx);
+      const mem = memByIdx.get(aggIdx);
+      // A port is a CONFIGURED member when its actor admin key equals this
+      // aggregator's key (= the aggregator ifIndex). The bitmap
+      // (dot3adAggPortListPorts) only lists ACTIVELY aggregated ports, so a
+      // configured-but-down member would be missed. Prefer the key match, and
+      // fall back to the bitmap if no key matches.
+      const keyMembers = [];
+      const normKey = (v) => String(v == null ? '' : v).replace(/[,\s]/g, '');
+      for (const [pIdx, k] of portKey) { if (normKey(k) === aggIdx && pIdx !== aggIdx) keyMembers.push(Number(pIdx)); }
+      const bitMembers = mem ? decodePortList(mem.dot3adAggPortListPorts && (mem.dot3adAggPortListPorts.value !== undefined ? mem.dot3adAggPortListPorts.value : mem.dot3adAggPortListPorts.display)) : [];
+      const members = keyMembers.length ? keyMembers.sort((a, b) => a - b) : bitMembers;
+      // Mode from the members' actual actor state (the creation-table flags are
+      // not writable/reliable): a member running LACP has a non-empty state
+      // (e.g. "a2"); a static member's state is empty/zero.
+      const memStates = members.map((p) => String(portState.get(String(p)) || '').replace(/0x|\s|\(hex\)|"/gi, ''));
+      const anyLacp = memStates.some((st) => st && !/^0*$/.test(st));
+      const mode = !members.length ? '\u2014' : (anyLacp ? 'LACP' : 'static');
+      const isTrunk = members.length > 0;
+      const isLacp = anyLacp;
+      const memNames = members.map((p) => nameByIdx.get(String(p)) || ('if' + p)).join(', ') || '\u2014';
+      const key = agg ? dv2(agg.dot3adAggActorOperKey) || dv2(agg.dot3adAggActorAdminKey) : '';
+      const aggregating = agg ? dv2(agg.dot3adAggAggregateOrIndividual) : '';
+      const chName = c._name || nameByIdx.get(aggIdx) || ('Po/' + aggIdx);
+      const memberKeyInfo = members.map((p) => (nameByIdx.get(String(p)) || ('if' + p)) + ' key=' + (portKey.get(String(p)) || '?')).join(', ') || '\u2014';
+      const detail = () => openDetailDialog(s, 'Port channel ' + chName, [
+        ['Channel', chName], ['Aggregator ifIndex', aggIdx], ['Mode', mode],
+        ['Members', memNames], ['Member keys', memberKeyInfo],
+        ['Actor key (admin)', agg ? dv2(agg.dot3adAggActorAdminKey) : ''],
+        ['Actor key (oper)', agg ? dv2(agg.dot3adAggActorOperKey) : ''],
+        ['Aggregating', aggregating], ['System ID', agg ? dv2(agg.dot3adAggActorSystemID) : '']
+      ]);
+      // Row-click opens the full interface detail (a port channel IS an
+      // interface - its aggregator ifIndex), with the same tabs a physical port
+      // has (Port settings, Switchport, 802.1X, ACL, Counters) PLUS a leading
+      // Membership tab (the channel's mode + member ports). Read-only detail is
+      // shown when not editable.
+      const chIfxNum = parseInt(aggIdx, 10);
+      const openIt = () => {
+        if (!editable) { detail(); return; }
+        if (!Number.isFinite(chIfxNum)) { openEditPopout(s, 'Port channel ' + chName, (pane, close) => editChannel(c, agg, members, pane, close)); return; }
+        const chDetail = buildChannelDetail(s, h, chIfxNum, chName, { mode, memNames, memberKeyInfo });
+        const membershipTab = { label: 'Membership', fill: (pane, close) => { editChannel(c, agg, members, pane, close); } };
+        openPortDetail(s, chDetail, { title: 'Port channel ' + chName, leadingTabs: [membershipTab] });
+      };
+      const row = [
+        { click: { open: openIt }, v: chName },
+        { v: mode }, { v: memNames }, { v: key }, { v: aggregating },
+        { pill: true, v: (isTrunk || isLacp) ? 'configured' : 'empty' }
+      ];
+      if (editable) {
+        const acts = [];
+        // Shut / No-shut: a port channel is an interface (its aggregator
+        // ifIndex), so ifAdminStatus applies exactly as it does to a physical
+        // port. Read the channel's current admin state to label the action.
+        const chIfx = parseInt(aggIdx, 10);
+        if (Number.isFinite(chIfx)) {
+          const chRow = (s.health && s.health.interfaces || []).find((x) => String(x.index) === String(chIfx));
+          const adminUp = chRow ? !/down|disabled/i.test(String(dv(chRow.rlifPresentAdminStatus) || '')) : true;
+          acts.push(actBtnConfirm(adminUp ? 'Shut' : 'No shut', (e) => {
+            runButtonAction(e.currentTarget, {
+              failLabel: adminUp ? 'Shut' : 'No shut',
+              run: () => apiPost('/api/port/admin', { target: s.target, ifIndex: chIfx, action: adminUp ? 'down' : 'up' }),
+              onApplied: () => markConfigDirty(s),
+              settle: () => refreshTables(s, ['interfaces', 'lagAgg', 'lagMembers', 'lagCreation', 'lagPortKey'])
+            });
+          }, adminUp ? 'danger' : '', (adminUp ? 'Administratively disable ' : 'Re-enable ') + chName));
+        }
+        acts.push(actBtnConfirm('Clear', (e) => clearChannel(c, members), 'danger', 'Remove all members and unconfigure'));
+        // sig captures what the action buttons depend on: the channel's admin
+        // state (Shut/No-shut label) and whether it has members (Clear present).
+        const chRow2 = (s.health && s.health.interfaces || []).find((x) => String(x.index) === aggIdx);
+        const admUp = chRow2 ? !/down|disabled/i.test(String(dv(chRow2.rlifPresentAdminStatus) || '')) : true;
+        row.push({ cellNode: actGroup(acts), sig: (admUp ? 'up' : 'down') + '|' + members.length });
+      }
+      row._key = 'ch:' + aggIdx;
+      return row;
+    });
+    mountInto(body, s, p, 'channels', cols,
+      rows.map((cells) => ({ key: cells._key, cells: cells })));
+    // Editors render into this host, placed immediately below the channel table.
+    // On reconcile the host already exists; reuse it rather than appending a
+    // second one (which would strand an open editor).
+    let chEditHost = s._ktReconcile ? body.querySelector('.ch-edit-host') : null;
+    if (!chEditHost) { chEditHost = el('div', 'ch-edit-host'); if (!s._ktReconcile) body.appendChild(chEditHost); }
+
+    // --- editors ---
+    function closeChEditors() { clear(chEditHost); }
+
+    function editChannel(c, agg, currentMembers, pane, popClose) {
+      const aggIdx = String(c.index);
+      const aggKey = agg ? parseInt(dv2(agg.dot3adAggActorAdminKey), 10) : NaN;
+      // Render into the popout pane when given one; else the old inline host.
+      const inPopout = !!pane;
+      if (!inPopout) closeChEditors();
+      const host = pane || el('div', 'ch-editor aaa-form');
+      if (!inPopout) host.appendChild(el('h5', '', 'Edit port channel ' + (nameByIdx.get(aggIdx) || aggIdx)));
+      const grid = el('div', 'snmp-form-grid');
+      // Mode: off / static / LACP.
+      const modeSel = el('select');
+      for (const m of [['off', 'off'], ['static', 'static'], ['lacp', 'LACP']]) { const o = el('option', '', m[1]); o.value = m[0]; modeSel.appendChild(o); }
+      // Current mode from members' actor state (not the unreliable creation flags).
+      const curStates = currentMembers.map((p) => String(portState.get(String(p)) || '').replace(/0x|\s|\(hex\)|"/gi, ''));
+      modeSel.value = !currentMembers.length ? 'off' : (curStates.some((st) => st && !/^0*$/.test(st)) ? 'lacp' : 'static');
+      { const f = el('div', 'snmp-field'); f.appendChild(el('label', '', 'Mode')); f.appendChild(modeSel); grid.appendChild(f); }
+      host.appendChild(grid);
+
+      // Members: a checkbox list of physical ports (those not already in a
+      // different channel). Current members pre-checked.
+      host.appendChild(el('div', 'aaa-sub', 'Member ports'));
+      const memWrap = el('div', 'ch-members');
+      const cur = new Set(currentMembers.map(String));
+      const physPorts = (h.interfaces || []).filter((r) => {
+        const nm = String(dv(r.rlifPresentName) || '');
+        return /^(gi|te|fa|fo|tw|fi|hu)/i.test(nm) || /ethernet/i.test(nm);   // physical ports only
+      });
+      const checks = [];
+      for (const r of physPorts) {
+        const pIdx = String(r.index);
+        const lab = el('label', 'ch-member');
+        const cb = el('input'); cb.type = 'checkbox'; cb.checked = cur.has(pIdx); cb.dataset.port = pIdx;
+        // A port is only unavailable if it is a member of a DIFFERENT real LAG
+        // slot. The standard dot3adAggPortAttachedAggID returns a port's own
+        // individual aggregator (its own ifIndex) when it is standalone - that
+        // is NOT another channel, so only disable when the attached id is one of
+        // our LAG aggregator slots and isn't this one.
+        const att = String(portAttached.get(pIdx) || '');
+        const inOtherLag = att && att !== '0' && att !== aggIdx && lagSlots.has(att);
+        if (inOtherLag && !cur.has(pIdx)) { cb.disabled = true; lab.title = 'In another channel'; }
+        lab.appendChild(cb); lab.appendChild(el('span', '', dv(r.rlifPresentName) || pIdx));
+        memWrap.appendChild(lab); checks.push(cb);
+      }
+      host.appendChild(memWrap);
+
+      const cancel = el('button', 'btn btn-small', 'Cancel'); cancel.type = 'button';
+      cancel.addEventListener('click', () => { if (inPopout && popClose) popClose(); else closeChEditors(); });
+      const { actions, apply: save, msg } = applyActions('Save', { extra: [cancel] });
+      withConfirm(save, (ev) => {
+        clear(msg);
+        const mode = modeSel.value;
+        // The creation-table flags (rlDot3adAggCreationTrunk/Lacp) are NotWritable
+        // on this firmware - they describe capability, not config. Channel
+        // membership is driven entirely by the port's actor admin KEY: setting a
+        // port's key to the aggregator's key (= its ifIndex here, e.g. 1000 for
+        // Po1) joins it; setting the key back to the port's own ifIndex (its
+        // individual aggregator) removes it. Static vs LACP is the LACP_Activity
+        // bit of the actor admin STATE (bit 0): LACP = active, static = cleared.
+        const want = new Set(checks.filter((cb) => cb.checked).map((cb) => cb.dataset.port));
+        // CONFIRMED from CLI-configured members in BOTH modes (LAG debug):
+        //   - key is always the aggregator ifIndex (1000 for Po1), in both modes.
+        //   - LACP ("mode auto"): ActorAdminState = 0xa2 (LACP_Activity +
+        //     Aggregation + Defaulted).
+        //   - static ("mode on"): ActorAdminState = empty / all-zero (LACP off).
+        // So the ONLY mode difference is the state octet; the key is identical.
+        const keyVal = parseInt(aggIdx, 10);
+        const stateHex = (mode === 'lacp') ? 'a2' : '00';   // confirmed: LACP=a2, static=0
+        // The switch will NOT change a member's mode in place (WrongValue). So
+        // the mode is changed by BREAKING the port out of the LAG (key->0) and
+        // RE-ADDING it with the new state. We therefore split the writes into
+        // two sequential phases: remove first, then add. A member whose mode is
+        // unchanged is left alone.
+        const curMode = (pIdx) => {
+          const st = String(portState.get(String(pIdx)) || '').replace(/0x|\s|\(hex\)|"/gi, '');
+          return (st && !/^0*$/.test(st)) ? 'lacp' : 'static';
+        };
+        const removeSteps = [];   // phase 1: key -> 0
+        const addSteps = [];      // phase 2: state + key
+        const rollbackSteps = [];  // restore phase-1 ports if phase 2 fails
+        // The original state hex of a currently-LACP member is 0xa2; a static
+        // member's is empty/00. Used to restore a mode-changed member on rollback.
+        const origStateHex = (pIdx) => (curMode(pIdx) === 'lacp' ? 'a2' : '00');
+        for (const cb of checks) {
+          const pIdx = cb.dataset.port;
+          const was = cur.has(pIdx);
+          const now = want.has(pIdx);
+          const modeChanged = was && now && (curMode(pIdx) !== mode);
+          if (now && !was) {
+            // New member: add with the chosen mode.
+            addSteps.push({ oid: OIDS.portActorState + '.' + pIdx, type: 'OctetString', valueHex: stateHex });
+            addSteps.push({ oid: OIDS.portActorKey + '.' + pIdx, type: 'Integer', value: keyVal });
+          } else if (!now && was) {
+            // Removed member: break out (intended removal - not rolled back).
+            removeSteps.push({ oid: OIDS.portActorKey + '.' + pIdx, type: 'Integer', value: 0 });
+          } else if (modeChanged) {
+            // Staying, but mode changed: break out (phase 1) then re-add (phase 2).
+            // Capture how to restore it if the re-add fails.
+            removeSteps.push({ oid: OIDS.portActorKey + '.' + pIdx, type: 'Integer', value: 0 });
+            removeSteps.push({ oid: OIDS.portActorState + '.' + pIdx, type: 'OctetString', valueHex: '00' });
+            addSteps.push({ oid: OIDS.portActorState + '.' + pIdx, type: 'OctetString', valueHex: stateHex });
+            addSteps.push({ oid: OIDS.portActorKey + '.' + pIdx, type: 'Integer', value: keyVal });
+            rollbackSteps.push({ oid: OIDS.portActorState + '.' + pIdx, type: 'OctetString', valueHex: origStateHex(pIdx) });
+            rollbackSteps.push({ oid: OIDS.portActorKey + '.' + pIdx, type: 'Integer', value: keyVal });
+          }
+        }
+        if (!removeSteps.length && !addSteps.length) { msg.appendChild(el('div', 'card-sub', 'No changes.')); return; }
+        runButtonAction(ev.currentTarget, {
+          failLabel: 'Save channel', spinLabel: 'Saving\u2026',
+          run: async () => {
+            try {
+              let failed = null;
+              let phase1Done = false;
+              if (removeSteps.length) { const r = await setVb(removeSteps); if (!r.ok || r.b.error) failed = r.b.error || 'remove failed'; else phase1Done = true; }
+              if (!failed && addSteps.length) {
+                await new Promise((res) => setTimeout(res, 400));
+                const r2 = await setVb(addSteps); if (!r2.ok || r2.b.error) failed = r2.b.error || 'add failed';
+              }
+              if (failed && phase1Done && rollbackSteps.length) {
+                try {
+                  await new Promise((res) => setTimeout(res, 300));
+                  const rb = await setVb(rollbackSteps);
+                  if (!rb.ok || rb.b.error) toast('Mode change failed AND rollback failed \u2014 check the channel members manually: ' + (rb.b.error || failed), 'error');
+                  else toast('Mode change failed; the channel members were restored.', 'error');
+                } catch (e) { toast('Mode change failed AND rollback errored \u2014 verify the channel: ' + e.message, 'error'); }
+              }
+              return failed ? { ok: false, error: failed } : { ok: true };
+            } catch (e) { return { ok: false, error: e.message }; }
+          },
+          ok: (r) => r && r.ok,
+          error: (r) => { msg.appendChild(el('div', 'sw-err', 'Change failed: ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+          onApplied: () => { markConfigDirty(s, modeSel); },
+          settle: () => {
+            const expect = want.size;
+            const check = (attempt) => refreshLagTables(s).then((memCount) => {
+              if (memCount < expect && attempt < 2) setTimeout(() => check(attempt + 1), 5000);
+            });
+            setTimeout(() => check(1), 4000);
+            return Promise.resolve();
+          }
+        });
+      });
+      host.appendChild(actions); host.appendChild(msg);
+      if (!inPopout) { chEditHost.appendChild(host); chEditHost.scrollIntoView({ block: 'nearest' }); }
+    }
+
+    function clearChannel(c, members) {
+      closeChEditors();
+      const aggIdx = String(c.index);
+      const host = el('div', 'ch-editor aaa-form');
+      host.appendChild(el('div', 'sw-warn', 'Remove all members and unconfigure port channel ' + (nameByIdx.get(aggIdx) || aggIdx) + '?'));
+      const row = el('div', 'snmp-form-actions');
+      const yes = actBtn('Clear', async () => {
+        // Remove each member by resetting its actor key to its own ifIndex (its
+        // individual aggregator = standalone). The creation-table flags are
+        // NotWritable, so membership is managed purely through the port keys.
+        const steps = [];
+        for (const p of members) steps.push({ oid: OIDS.portActorKey + '.' + p, type: 'Integer', value: 0 });
+        if (steps.length) {
+          const r = await setVb(steps);
+          if (!r.ok || r.b.error) { toast('Could not clear the channel: ' + (r.b.error || 'the switch rejected it'), 'error'); return; }
+          markConfigDirty(s);   // members removed -> running differs from startup
+        }
+        closeChEditors();
+        setTimeout(() => refreshLagTables(s), 2000);   // clearing is immediate; one light read
+      }, 'danger');
+      const no = actBtn('Cancel', closeChEditors);
+      row.appendChild(yes); row.appendChild(no); host.appendChild(row);
+      chEditHost.appendChild(host); chEditHost.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function paintPanelBody(s, p) {
+    if (p.collapsed) return;
+    const body = p._body;
+    if (!body) return;
+    clear(body);
+    if (p.kind === 'oid') { paintOidPanel(s, p, body); return; }
+    try {
+      paintBuiltin(s, p.key, body, p);
+    } catch (e) {
+      body.appendChild(el('div', 'panel-err', 'Could not render this panel: ' + e.message));
+      appLog('error', 'Panel render failed', { panel: p.title, message: e.message });
+    }
+  }
+
+  // ---------- built-in panel bodies ----------
+  /** Panels can be fed by SNMP or a capture; say which, every time. */
+  function sourceNote(src, detail) {
+    const d = el('div', 'panel-note');
+    d.appendChild(el('span', 'src-tag ' + src, src));
+    d.appendChild(document.createTextNode(' ' + detail));
+    return d;
+  }
+
+  function paintBuiltin(s, key, body, p) {
+    // SNMP configuration does not depend on a health collection, so it is
+    // handled before the "no data yet" gate the health panels sit behind.
+    if (key === 'snmpcfg') { paintSnmpPanel(s, body); return; }
+    if (key === 'acl') { paintAclPanel(s, body); return; }
+    if (key === 'routing') { paintRoutingPanel(s, body, p); return; }
+    if (key === 'vlans') { paintVlanPanel(s, body, p); return; }
+    if (key === 'capture') { paintCapturePanel(s, body); return; }
+    if (key === 'flash') { paintFlashPanel(s, body); return; }
+    const h = s.health;
+    if (!h) { body.appendChild(el('div', 'card-sub', 'No SNMP data yet.')); return; }
+    const sc = (k) => (h.scalars[k] ? h.scalars[k].display : null);
+    const scv = (k) => (h.scalars[k] ? h.scalars[k].value : null);
+
+    // A forwarding database can be thousands of rows, and putting all of
+    // them in the DOM on every refresh costs more than it informs. Render a
+    // first slice and let the user ask for the rest; rows go in through a
+    // fragment so the browser lays out once instead of per row.
+    const ROW_CAP = 250;
+    // `display` is omitted by the server when it would just repeat the
+    // value, so every read of a cell has to fall back.
+    const dv = (c, fallback) => {
+      if (c === null || c === undefined) return fallback === undefined ? '' : fallback;
+      if (typeof c !== 'object') return c;
+      return c.display !== undefined ? c.display : c.value;
+    };
+    // `index` is a plain string on the row, not a {value,display} cell.
+    // Treating it like one yielded undefined, and the table then rendered
+    // the wrapper object itself -- the "[object Object]" in every index
+    // column.
+    const cellText = (raw) => {
+      if (raw === null || raw === undefined) return '';
+      if (typeof raw === 'object') return raw.display !== undefined ? raw.display : raw.value;
+      return raw;
+    };
+    const cellsOf = (rows, cols) => rows.map((r) => cols.map((c) => {
+      const v = cellText(c.key === 'index' ? r.index : r[c.key]);
+      return c.state ? { pill: true, v } : { v };
+    }));
+
+    switch (key) {
+      case 'summary': {
+        const sev = overallSeverity(s);
+        const hero = el('div', 'hero sev-' + (sev === 'info' ? 'ok' : sev));
+        hero.style.margin = '0';
+        const main = el('div', 'hero-main');
+        const nameRow = el('div', 'hero-name-row');
+        nameRow.appendChild(el('div', 'hero-name', sc('sysName') || s.host));
+        if (s.target) {
+          const pen = el('button', 'hero-edit-btn', '\u270E');
+          pen.title = 'Edit name, location and contact';
+          pen.type = 'button';
+          pen.addEventListener('click', (e) => { e.stopPropagation(); editSysIdentity(s, pen); });
+          nameRow.appendChild(pen);
+        }
+        main.appendChild(nameRow);
+        const bits = [];
+        if (sc('sysDescr')) bits.push(sc('sysDescr'));
+        const ident = [];
+        if (h.summary.model) ident.push(h.summary.model);
+        const chassis = h.inventory.find((r) => /chassis/i.test((r.entPhysicalClass && r.entPhysicalClass.display) || ''));
+        if (chassis) {
+          const cell = (c) => (c ? (c.display !== undefined ? c.display : c.value) : null);
+          const sn = cell(chassis.entPhysicalSerialNum);
+          const sw = cell(chassis.entPhysicalSoftwareRev);
+          if (sn) ident.push('S/N ' + sn);
+          if (sw) ident.push('Firmware ' + sw);
+        }
+        if (ident.length) bits.push(ident.join('  \u00b7  '));
+        if (sc('sysUpTime')) bits.push('Uptime: ' + sc('sysUpTime'));
+        const place = [sc('sysLocation'), sc('sysContact')].filter((x) => x && x !== '(empty)');
+        if (place.length) bits.push(place.join('  \u00b7  '));
+        main.appendChild(el('div', 'hero-sub', bits.join('\n')));
+        hero.appendChild(main);
+        hero.appendChild(el('div', 'hero-badge sev-' + (sev === 'info' ? 'info' : sev),
+          sev === 'ok' ? 'Healthy' : (sev === 'critical' ? 'Critical' : (sev === 'warning' ? 'Attention' : 'Info'))));
+        body.appendChild(hero);
+
+        // Findings belong with the verdict they produced, not in a panel
+        // of their own: the badge above says how the switch is, and these
+        // say why.
+        // Use the shared live-alert set so the findings shown here are exactly
+        // what the Attention badge counts (see liveAlerts).
+        const list = liveAlerts(s);
+        const real = list.filter((x) => x.severity !== 'ok');
+        const shown = real.length ? real : list;
+        if (shown.length) {
+          const wrap = el('div', 'hero-findings');
+          for (const f of shown.sort((a, x) => (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[x.severity] ?? 9))) {
+            const row = el('div', 'alert-row sev-' + f.severity);
+            row.appendChild(el('div', 'alert-area', f.area));
+            row.appendChild(el('div', 'alert-msg', f.message));
+            wrap.appendChild(row);
+          }
+          body.appendChild(wrap);
+        }
+
+        // --- quick actions ---
+        // The things you come to a switch to *do*, next to the summary of
+        // what it is. Each opens its result rather than a settings page.
+        const qa = el('div', 'quick-actions');
+        const act = (label, cls, fn, busy, title) => {
+          const b = el('button', 'btn ' + (cls || ''), busy || label);
+          b.type = 'button';
+          if (title) b.title = title;
+          if (busy) b.disabled = true; else b.addEventListener('click', fn);
+          qa.appendChild(b);
+          return b;
+        };
+        act(s.tech ? 'Recollect tech-support' : 'Collect tech-support', 'btn-amber',
+          () => startTechCollect(s), s.techBusy, 'Runs show tech-support over SSH');
+        if (s.tech) {
+          act('View tech-support', '', () => openOverlay(s, 'techOverlay'));
+        }
+        // When the two configurations are identical there is only one
+        // thing to back up, and offering a choice between two copies of
+        // the same file is a decision with no consequence.
+        const savedCell = h.scalars && h.scalars['rlRunningCDBequalToStartupCDB'];
+        const identical = !!savedCell && (
+          (savedCell.value !== undefined && savedCell.value !== null)
+            ? (Number(savedCell.value) === 1 || /true|yes|equal/i.test(String(savedCell.value)))
+            : /true|yes|equal/i.test(String(savedCell.display)));
+        if (identical) {
+          act('Download config', 'btn-blue', () => backupConfig(s, 'running'), s.cfgBusy,
+            'Running and startup are identical; fetches it over TFTP and saves it');
+        } else {
+          act('Download running-config', 'btn-blue', () => backupConfig(s, 'running'),
+            s.cfgBusy, 'Fetches it over TFTP and saves it');
+          act('Download startup-config', 'btn-blue', () => backupConfig(s, 'startup'), s.cfgBusy);
+        }
+        // CLI access moved to its own tab in the task bar (between Overview and
+        // Settings), so it is not a Quick Action anymore.
+        body.appendChild(qa);
+        return;
+      }
+
+      case 'metrics': {
+        const grid = el('div', 'card-grid');
+        grid.style.margin = '0';
+        const card = (label, value, cls, sub, pct, pcls, trend) => {
+          if (value === null || value === undefined || value === '') return;
+          const c = el('div', 'card');
+          c.appendChild(el('div', 'card-label', label));
+          c.appendChild(el('div', 'card-value' + (cls ? ' ' + cls : ''), value));
+          if (sub) c.appendChild(el('div', 'card-sub', sub));
+          if (trend) {
+            const spark = sparkline(
+              (s.history || []).map((x) => ({ t: x.t, v: x[trend.key] })),
+              { cls: pcls || cls, unit: trend.unit });
+            if (spark) c.appendChild(spark);
+            // The card is the summary; the graph behind it is the record.
+            c.classList.add('clickable');
+            c.title = 'Open the full history of ' + label.toLowerCase();
+            c.addEventListener('click', () => openGraph(s, trend.key));
+          }
+          if (pct != null) {
+            const m = el('div', 'meter'); const i = el('i', pcls || '');
+            i.style.width = Math.max(0, Math.min(100, pct)) + '%';
+            m.appendChild(i); c.appendChild(m);
+          }
+          grid.appendChild(c);
+          return c;
+        };
+
+        const led = sc('rlEnvSystemLed');
+        if (led) card('Status LED', led, /green/i.test(led) ? 'good' : (/amber/i.test(led) ? 'crit' : ''));
+
+        // Same reasoning as the input rate: the probe keeps reading these
+        // between collections, so the newest sample is the honest value.
+        const cpuLatest = latestOf(s.history, 'cpu');
+        const cpu5 = cpuLatest === null ? Number(scv('rlCpuUtilDuringLast5Minutes')) : cpuLatest;
+        if (Number.isFinite(cpu5)) {
+          card('CPU (5 min)', cpu5 + '%', cpu5 >= 80 ? 'crit' : (cpu5 >= 60 ? 'warn' : 'good'),
+            '1s ' + (scv('rlCpuUtilDuringLastSecond') ?? '?') + '%  \u00b7  1m ' + (scv('rlCpuUtilDuringLastMinute') ?? '?') + '%',
+            cpu5, cpu5 >= 80 ? 'crit' : (cpu5 >= 60 ? 'warn' : ''),
+            { key: 'cpu', unit: '%' });
+        }
+        // Packets per second punted to the CPU, beside utilisation: the two
+        // answer different questions.
+        if (h.summary.cpuInputPps != null) {
+          // The rate now, with the peaks underneath. Bursts are what hurt a
+          // control plane and the instant you happen to look is rarely one
+          // of them, so the peaks earn their place -- but the current value
+          // is what the card is *for*, so it stays the headline, and it
+          // comes from the newest reading rather than the last collection.
+          const latest = latestOf(s.history, 'cpuPps');
+          const now = latest === null ? Number(h.summary.cpuInputPps) : latest;
+          const hi5 = peakOf(s.history, 'cpuPps', 5 * 60 * 1000);
+          const hi60 = peakOf(s.history, 'cpuPps', 60 * 60 * 1000);
+          // Each figure carries its unit: "5 min peak 9" reads as two
+          // numbers with no way to tell which is which.
+          const peaks = [];
+          if (hi5) peaks.push('peak ' + groupNum(hi5.peak) + ' pps over 5 min');
+          if (hi60 && (!hi5 || hi60.peak !== hi5.peak)) {
+            peaks.push(groupNum(hi60.peak) + ' pps over an hour');
+          }
+          const level = now >= 20000 ? 'crit' : (now >= 5000 ? 'warn' : 'good');
+          card('CPU input rate', groupNum(now) + ' pps', level,
+            h.summary.cpuInputEnabled === false
+              ? 'SCT rate counting is disabled \u2014 value not measured'
+              : (peaks.length ? peaks.join('  \u00b7  ')
+                : 'packets per second handled by the CPU'),
+            null, level, { key: 'cpuPps', unit: 'pps' });
+        }
+        if (h.summary.flashFreePct != null) {
+          const ff = h.summary.flashFreePct;
+          card('Flash free', ff + '%', ff < 10 ? 'crit' : (ff < 25 ? 'warn' : 'good'),
+            scv('rlFileTotalSizeOfFlash') ? fmtBytes(scv('rlFileFreeSizeOfFlash')) + ' of ' + fmtBytes(scv('rlFileTotalSizeOfFlash')) : '',
+            ff, ff < 10 ? 'crit' : (ff < 25 ? 'warn' : ''));
+        }
+        if (h.summary.maxTempC != null) {
+          const x = h.summary.maxTempC;
+          card('Max temp', x + '\u00b0C', x >= 80 ? 'crit' : (x >= 65 ? 'warn' : 'good'), h.sensors.length + ' sensor(s)');
+        }
+        if (h.summary.poeBudgetW) {
+          const poeLatest = latestOf(s.history, 'poeW');
+          const poeW = poeLatest === null ? h.summary.poeUsedW : poeLatest;
+          const pct = (poeW / h.summary.poeBudgetW) * 100;
+          const ds = h.summary.datasheetPoeW;
+          card('PoE load', poeW + ' W', pct >= 90 ? 'crit' : (pct >= 75 ? 'warn' : 'good'),
+            'of ' + h.summary.poeBudgetW + ' W budget (' + pct.toFixed(0) + '%)' +
+            (ds && ds !== h.summary.poeBudgetW ? '  \u00b7  ' + h.summary.model + ' rated ' + ds + ' W' : ''),
+            pct, pct >= 90 ? 'crit' : (pct >= 75 ? 'warn' : ''),
+            { key: 'poeW', unit: 'W' });
+        }
+        if (h.summary.interfacesTotal) {
+          card('Interfaces up', h.summary.interfacesUp + ' / ' + h.summary.interfacesTotal, 'good',
+            h.summary.interfacesAdminDown + ' admin down');
+        }
+        const cfgCell = h.scalars && h.scalars['rlRunningCDBequalToStartupCDB'];
+        if (cfgCell) {
+          // The scalar is a TruthValue: true(1) = running equals startup (saved).
+          // Read the raw value when present (robust to any display format like
+          // "1", "true", or "true(1)"), else fall back to the display text.
+          const rawVal = cfgCell.value;
+          const isSaved = (rawVal !== undefined && rawVal !== null)
+            ? (Number(rawVal) === 1 || /true|yes|equal/i.test(String(rawVal)))
+            : /true|yes|equal/i.test(String(cfgCell.display));
+          const c = card('Config saved', isSaved ? 'Yes' : 'No',
+            isSaved ? 'good' : 'warn', 'running vs startup');
+          // Actionable only when it is not saved: comparing two identical
+          // files, or offering to save what is already saved, is busywork.
+          if (c && !isSaved) {
+            c.classList.add('clickable');
+            c.title = 'Show what differs, and save the running configuration';
+            c.appendChild(el('div', 'card-action', 'Compare and save \u2192'));
+            c.addEventListener('click', () => openConfigDiff(s));
+          }
+        }
+        // VLAN, neighbour and MAC counts are inventory, not health: they
+        // are the size of a table, and each has a panel that shows the
+        // table itself. A number with no threshold is not a key metric.
+        body.appendChild(grid);
+        return;
+      }
+
+      // One panel for the physical box: supplies, fans, sensors, the stack
+      // and the identifiable hardware. They are all answers to "what is in
+      // this switch and is it healthy", and as five panels they were five
+      // mostly-empty boxes.
+      case 'hardware': {
+        const section = (title, note) => {
+          if (s._ktReconcile) return;
+          const st = el('div', 'section-title', title);
+          if (note) st.appendChild(el('span', 'st-note', note));
+          body.appendChild(st);
+        };
+
+        // Inventory leads: what the box *is* comes before how it is
+        // doing. Only hardware with an identity worth recording -- ports,
+        // fans, supplies and sensors are covered by the sections below,
+        // and a row with no model, serial or revision identifies
+        // nothing.
+        const rows = h.inventory.filter((r) => {
+          const cls = String((r.entPhysicalClass && r.entPhysicalClass.display) || '');
+          if (/port|fan|powerSupply|sensor|container|slot|backplane/i.test(cls)) return false;
+          if (!/chassis|module|stack/i.test(cls)) return false;
+          const has = (k) => {
+            const c = r[k];
+            const v = c ? (c.display !== undefined ? c.display : c.value) : '';
+            return v !== undefined && v !== null && String(v).trim() !== '' && String(v) !== '(empty)';
+          };
+          return has('entPhysicalModelName') || has('entPhysicalSerialNum') ||
+            has('entPhysicalHardwareRev') || has('entPhysicalSoftwareRev');
+        });
+        if (rows.length) {
+          // entPhysicalName is often just an index ("1" for the chassis),
+          // in which case the description is the thing worth showing.
+          const label = (r) => {
+            const name = dv(r.entPhysicalName);
+            const descr = dv(r.entPhysicalDescr);
+            if (!name || /^\d+$/.test(String(name).trim())) return descr || name;
+            return name;
+          };
+          section('Inventory');
+          mountInto(body, s, p, 'inventory', ['Name', 'Class', 'Model', 'Serial', 'HW', 'SW'],
+            keyedRowsFrom(rows.map((r) => [
+              { v: label(r) }, { v: dv(r.entPhysicalClass) }, { v: dv(r.entPhysicalModelName) },
+              { v: dv(r.entPhysicalSerialNum) }, { v: dv(r.entPhysicalHardwareRev) },
+              { v: dv(r.entPhysicalSoftwareRev) }]), rows, (r) => r.index));
+        }
+
+        if (h.psus.length) {
+          section('Power supplies');
+          mountInto(body, s, p, 'psus', ['Supply', 'State', 'Source'],
+            keyedRowsFrom(cellsOf(h.psus, [
+              { key: 'rlEnvMonSupplyStatusDescr' }, { key: 'rlEnvMonSupplyState', state: true },
+              { key: 'rlEnvMonSupplySource' }]), h.psus, (r) => r.index));
+        }
+        if (h.fans.length) {
+          section('Fans');
+          mountInto(body, s, p, 'fans', ['Fan', 'State'],
+            keyedRowsFrom(cellsOf(h.fans, [
+              { key: 'rlEnvMonFanStatusDescr' }, { key: 'rlEnvMonFanState', state: true }]), h.fans, (r) => r.index));
+        }
+        if (h.sensors.length) {
+          section('Sensors');
+          mountInto(body, s, p, 'sensors', ['Sensor', 'Type', 'Reading', 'Status'],
+            keyedRowsFrom(cellsOf(h.sensors, [
+              { key: 'index' }, { key: 'entPhySensorType' }, { key: 'entPhySensorValue' },
+              { key: 'entPhySensorOperStatus', state: true }]), h.sensors, (r) => r.index));
+        }
+        // A single unit is not a stack, and saying so tells nobody
+        // anything they cannot see from the model number.
+        if (h.stack.length > 1) {
+          section('Stack units', h.stack.length + ' units');
+          mountInto(body, s, p, 'stack', ['Unit', 'Model', 'Software', 'MAC'],
+            keyedRowsFrom(cellsOf(h.stack, [
+              { key: 'index' }, { key: 'rlPhdStackProductID' },
+              { key: 'rlPhdStackSofrwareVer' }, { key: 'rlPhdStackMacAddr' }]), h.stack, (r) => r.index));
+        }
+
+        if (!s._ktReconcile && !body.children.length) {
+          body.appendChild(el('div', 'empty-state', 'The switch reported no hardware detail.'));
+        }
+        return;
+      }
+
+      // Interfaces and PoE describe the same physical ports, so they are
+      // one table: what the port is doing, and what it is powering. The
+      // PoE columns only appear on a switch that has PoE at all.
+      case 'interfaces': {
+        // In reconcile mode the body is not cleared, so the fixed scaffolding
+        // (notes, the PoE budget header, section titles) is already present and
+        // must not be re-appended; only the keyed tables reconcile. Each
+        // appendChild of fixed chrome is therefore guarded with !s._ktReconcile.
+        if (h.interfacesNotPresent && !s._ktReconcile) {
+          body.appendChild(el('div', 'panel-note',
+            h.interfacesNotPresent + ' interface(s) reporting notPresent(6) are not shown.'));
+        }
+
+        // Power budget first: it applies to the whole table below it.
+        if (h.poe.length && !s._ktReconcile) {
+          // A measured 0 W is valid; only treat a genuinely absent reading as
+          // unknown. Never print "null W".
+          const used = Number.isFinite(h.summary.poeUsedW) ? h.summary.poeUsedW : 0;
+          const budget = Number.isFinite(h.summary.poeBudgetW) ? h.summary.poeBudgetW : 0;
+          const pct = budget ? (used / budget) * 100 : 0;
+          const head = el('div', 'poe-head');
+          const big = el('div', 'poe-figure');
+          big.appendChild(el('span', 'poe-used' + (pct >= 90 ? ' crit' : (pct >= 75 ? ' warn' : '')),
+            used + ' W'));
+          big.appendChild(el('span', 'poe-of', ' drawn of ' + budget + ' W PoE budget'));
+          head.appendChild(big);
+          const meter = el('div', 'meter');
+          const bar = el('i', pct >= 90 ? 'crit' : (pct >= 75 ? 'warn' : ''));
+          bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+          meter.appendChild(bar);
+          head.appendChild(meter);
+          const on = h.poePorts.filter((r) => /deliveringPower/i.test(
+            (r.pethPsePortDetectionStatus && r.pethPsePortDetectionStatus.display) || '')).length;
+          head.appendChild(el('div', 'card-sub',
+            [pct.toFixed(0) + '% used', (budget - used) + ' W free', on + ' port(s) delivering']
+              .join('  \u00b7  ')));
+          body.appendChild(head);
+          if (h.poeIgnored && h.poeIgnored.length) {
+            const note = el('div', 'panel-note', h.poeIgnored.length + ' phantom PSE row(s) ignored');
+            note.title = h.poeIgnored.map((x) => 'PSE ' + x.index +
+              (x.budget != null ? ' (' + x.budget + 'W)' : '')).join(', ');
+            body.appendChild(note);
+          }
+        }
+
+        // Join on the port name: PoE rows carry the same identity the
+        // interface list does.
+        const poeByPort = new Map();
+        for (const r of h.poePorts) {
+          const name = dv(r.port);
+          if (name) poeByPort.set(String(name), r);
+        }
+        const hasPoe = h.poePorts.length > 0;
+
+        /**
+         * VLAN membership, turned round. The switch reports it per VLAN as
+         * a bitmap of ports; what you want when looking at a port is the
+         * other direction -- which VLAN it is in, and what it trunks. So
+         * the bitmaps are inverted into a per-port index once, here.
+         */
+        const portVlans = new Map();
+        const addVlan = (raw, vlan, kind) => {
+          for (const n of String(raw || '').split(',')) {
+            const port = n.trim();
+            if (!port) continue;
+            if (!portVlans.has(port)) portVlans.set(port, { untagged: [], tagged: [] });
+            portVlans.get(port)[kind].push(vlan);
+          }
+        };
+        for (const v of h.vlans) {
+          const id = String(v.index);
+          addVlan(v.untagged && v.untagged.value, id, 'untagged');
+          addVlan(v.tagged && v.tagged.value, id, 'tagged');
+        }
+        const hasVlans = h.vlans.length > 0;
+
+        /**
+         * The switch lists its VLAN interfaces in the same table as its
+         * ports, named after the VLAN id -- so a VLAN appears twice on
+         * screen, once as a "port" called 10 and once as VLAN 10. They are
+         * the same thing seen twice, so the interface is folded into the
+         * VLAN row it belongs to and dropped from the port list.
+         */
+        const vlanIds = new Set(h.vlans.map((v) => String(v.index)));
+        const sviByVlan = new Map();
+        // Port channels are shown in their own section below, not in the ports
+        // list - keep them out here to avoid duplicating them.
+        const IS_CHANNEL = /^(po|ch|port-?channel|lag|trunk)\s*\d+/i;
+        const ports = [];
+        for (const r of h.interfaces) {
+          const name = String(dv(r.rlifPresentName) || '').trim();
+          if (/^\d+$/.test(name) && vlanIds.has(name)) sviByVlan.set(name, r);
+          else if (IS_CHANNEL.test(name)) continue;   // shown in Port channels section
+          else ports.push(r);
+        }
+
+        /**
+         * Which ports look like uplinks. Shutting one of these is how you
+         * lose contact with the switch you are administering, so they are
+         * called out in the confirmation rather than treated like any
+         * other port: a neighbour that announced itself over CDP or LLDP,
+         * or the port the spanning tree is using to reach the root.
+         */
+        const uplinks = new Map();
+        for (const r of h.cdp) {
+          const n = dv(r.localPort, r.index);
+          if (n) uplinks.set(String(n), dv(r.cdpCacheDeviceId) || 'a CDP neighbour');
+        }
+        for (const r of h.lldp) {
+          const n = dv(r.localPort, r.index);
+          if (n && !uplinks.has(String(n))) {
+            uplinks.set(String(n), dv(r.lldpRemSysName) || 'an LLDP neighbour');
+          }
+        }
+        const rootPort = h.scalars.dot1dStpRootPort && h.scalars.dot1dStpRootPort.display;
+        if (rootPort && !/none/i.test(String(rootPort))) {
+          // Both reasons matter, and a port can have both: knowing it
+          // faces core-sw *and* carries the path to the root is more
+          // useful than either alone.
+          const had = uplinks.get(String(rootPort));
+          uplinks.set(String(rootPort),
+            had ? had + ', and carries the spanning-tree path to the root'
+              : 'the spanning-tree root port');
+        }
+
+        // Switchport mode per port, from vlanPortModeState (indexed by ifIndex).
+        // Confirmed against this switch's CLI: 11 = access, 12 = trunk. Only
+        // those two are labelled; any other code is shown raw ("mode N") rather
+        // than guessed, so the column never asserts a mode it can't verify.
+        const PORT_MODE = { 11: 'access', 12: 'trunk' };
+        const modeByIf = new Map();
+        for (const r of (h.portModes || [])) {
+          const code = r.vlanPortModeState && (r.vlanPortModeState.value !== undefined
+            ? r.vlanPortModeState.value : r.vlanPortModeState.display);
+          const n = parseInt(code, 10);
+          if (!Number.isNaN(n)) modeByIf.set(String(r.index), PORT_MODE[n] || ('mode ' + n));
+        }
+        const hasModes = modeByIf.size > 0;
+
+        // Per-port CONFIGURED access VLAN and trunk native VLAN. These reflect
+        // the switchport's configured membership even when the port is down,
+        // unlike the static egress-port table (which only shows applied
+        // membership once the port comes up) - so a VLAN set on a down port is
+        // read correctly from here.
+        const accessVlanByIf = new Map();
+        for (const r of (h.portAccessVlan || [])) {
+          const n = parseInt(r.vlanAccessPortModeVlanId && (r.vlanAccessPortModeVlanId.value !== undefined ? r.vlanAccessPortModeVlanId.value : r.vlanAccessPortModeVlanId.display), 10);
+          if (Number.isFinite(n) && n > 0) accessVlanByIf.set(String(r.index), n);
+        }
+        const nativeVlanByIf = new Map();
+        for (const r of (h.portNativeVlan || [])) {
+          const n = parseInt(r.vlanTrunkPortModeNativeVlanId && (r.vlanTrunkPortModeNativeVlanId.value !== undefined ? r.vlanTrunkPortModeNativeVlanId.value : r.vlanTrunkPortModeNativeVlanId.display), 10);
+          if (Number.isFinite(n) && n > 0) nativeVlanByIf.set(String(r.index), n);
+        }
+
+        // L2 vs L3 per port, from vlanSwitchPortModeCategory (1 = l2 switchport,
+        // 2 = l3 routed). Shown as a compact L2/L3 label; unknown codes raw.
+        const L2L3 = { 1: 'L2', 2: 'L3' };
+        const l2l3ByIf = new Map();
+        for (const r of (h.portL2L3 || [])) {
+          const code = r.vlanSwitchPortModeCategory && (r.vlanSwitchPortModeCategory.value !== undefined
+            ? r.vlanSwitchPortModeCategory.value : r.vlanSwitchPortModeCategory.display);
+          const n = parseInt(code, 10);
+          if (!Number.isNaN(n)) l2l3ByIf.set(String(r.index), L2L3[n] || ('cat ' + n));
+        }
+        const hasL2L3 = l2l3ByIf.size > 0;
+
+        // 802.1X per-port config: port-control (force-unauth/auto/force-auth),
+        // authorized status, and host-mode (single/multiple/multiple-auth).
+        const dvv = (cell) => cell && (cell.value !== undefined ? cell.value : cell.display);
+        const PORT_CONTROL = { 1: 'force-unauth', 2: 'auto', 3: 'force-auth' };
+        const PORT_STATUS = { 1: 'authorized', 2: 'unauthorized' };
+        const HOST_MODE = { 1: 'single', 2: 'multiple', 3: 'multiple-auth' };
+        const dot1xByIf = new Map();
+        for (const r of (h.dot1xPortCfg || [])) {
+          const ctl = parseInt(dvv(r.dot1xAuthAuthControlledPortControl), 10);
+          const st = parseInt(dvv(r.dot1xAuthAuthControlledPortStatus), 10);
+          dot1xByIf.set(String(r.index), {
+            control: PORT_CONTROL[ctl] || (Number.isFinite(ctl) ? 'ctl ' + ctl : ''),
+            controlCode: Number.isFinite(ctl) ? ctl : null,
+            status: PORT_STATUS[st] || ''
+          });
+        }
+        const hostModeByIf = new Map();
+        for (const r of (h.dot1xHostMode || [])) {
+          const hm = parseInt(dvv(r.swIfHostMode), 10);
+          if (Number.isFinite(hm)) hostModeByIf.set(String(r.index), { mode: HOST_MODE[hm] || ('mode ' + hm), modeCode: hm });
+        }
+        // Per-port authentication method (for MAB): the enum encodes which
+        // methods are enabled on the port (802.1X / MAC / Web combinations).
+        const methodByIf = new Map();
+        for (const r of (h.dot1xPortMethod || [])) {
+          const m = parseInt(dvv(r.rldot1xAuthenticationPortMethod), 10);
+          if (Number.isFinite(m)) methodByIf.set(String(r.index), m);
+        }
+        const hasDot1x = dot1xByIf.size > 0 || hostModeByIf.size > 0;
+
+        // Counters (errors, discards, packet breakdowns, octets) no longer live
+        // in the main table — they are fetched on demand into a per-port popout
+        // when a row is clicked. The table keeps only identity and state.
+        const headers = ['Port', 'Admin', 'Oper', 'Speed']
+          .concat(hasL2L3 ? ['L2/L3'] : [])
+          .concat(hasModes ? ['Mode'] : [])
+          .concat(hasDot1x ? ['802.1X'] : [])
+          .concat(hasPoe ? ['PoE'] : [])
+          .concat(hasVlans ? ['Untagged', 'Tagged'] : [])
+          .concat(['']);
+
+        // The set of VLANs that exist on the switch is the same for every port,
+        // so compute it once rather than re-map/filter/sort it per row.
+        const allVlans = (h.vlans || []).map((v) => Number(v.index))
+          .filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
+
+        // A PoE-capable switch can have ports the interface table does not
+        // list; they still belong in the table rather than nowhere.
+        const rows = ports.map((r) => {
+          const name = dv(r.rlifPresentName);
+          const poe = poeByPort.get(String(name));
+          if (poe) poeByPort.delete(String(name));
+          // detail carries everything the popout shows that we already have from
+          // the walk, plus the ifIndex it needs to fetch live counters on click.
+          const vlNow = portVlans.get(String(r.index)) || { untagged: [], tagged: [] };
+          // 802.1X per-port state (used by both the detail object and the cell).
+          const d1x = dot1xByIf.get(String(r.index));
+          const hm = hostModeByIf.get(String(r.index));
+          const detail = {
+            name: String(name || r.index), ifIndex: r.index,
+            fields: {
+              Description: dv(r.rlifPresentDescr), Alias: dv(r.rlifPresentAlias),
+              'MAC address': dv(r.rlifPresentPhysAddress), MTU: dv(r.rlifPresentMtu),
+              Speed: dv(r.rlifPresentHighSpeed), Type: dv(r.rlifPresentType),
+              'Last change': dv(r.rlifPresentLastChange)
+            },
+            poe: poe ? {
+              Status: dv(poe.pethPsePortDetectionStatus),
+              Class: dv(poe.pethPsePortPowerClassifications),
+              'Denied count': dv(poe.pethPsePortPowerDeniedCounter)
+            } : null,
+            // 802.1X per-port config, for display and the editor. control/host
+            // carry the current enum codes; present indicates the switch reports
+            // dot1x for this port (so the editor only shows for real dot1x ports).
+            dot1x: (d1x || hm) ? {
+              control: d1x ? d1x.control : '', controlCode: d1x ? d1x.controlCode : null,
+              status: d1x ? d1x.status : '',
+              hostMode: hm ? hm.mode : '', hostModeCode: hm ? hm.modeCode : null,
+              methodCode: methodByIf.has(String(r.index)) ? methodByIf.get(String(r.index)) : null,
+              present: !!d1x
+            } : null,
+            // Physical interface settings (speed/duplex/auto-neg/flow/MDIX) and
+            // the port alias are fetched live when the popout opens (not polled
+            // in bulk), so only a marker is carried here.
+            settings: 'ondemand',
+            // Current switchport state and the data the editor needs. mode is
+            // 'access'/'trunk' (or '' if the switch didn't report it); l2l3 flags
+            // routed ports, which can't take a switchport mode. allVlans is the
+            // set of VLANs that exist on the switch (the only ones offered).
+            sw: (() => {
+              const mode = modeByIf.get(String(r.index)) || '';
+              // Prefer the per-port configured VLAN (correct even when the port
+              // is down); fall back to the static egress membership.
+              let untagged = vlNow.untagged.slice(), tagged = vlNow.tagged.slice();
+              const accCfg = accessVlanByIf.get(String(r.index));
+              const natCfg = nativeVlanByIf.get(String(r.index));
+              if (mode === 'access' && accCfg != null) { untagged = [String(accCfg)]; tagged = []; }
+              else if (mode === 'trunk' && natCfg != null) {
+                untagged = [String(natCfg)];
+                if (tagged.indexOf(String(natCfg)) === -1) tagged = [String(natCfg)].concat(tagged);
+              }
+              return {
+              mode,
+              l2l3: l2l3ByIf.get(String(r.index)) || '',
+              untagged, tagged,
+              allVlans,
+              // Spanning-tree uplink / root-path flag, used to warn before a
+              // change that could cut the path the app reaches the switch by.
+              uplink: uplinks.get(String(name)) || uplinks.get(String(r.index)) || null
+            };
+            })()
+          };
+          const base = [
+            { click: detail, v: dv(r.rlifPresentName) },
+            { pill: true, v: dv(r.rlifPresentAdminStatus) },
+            { pill: true, v: dv(r.rlifPresentOperStatus) },
+            { v: dv(r.rlifPresentHighSpeed) }
+          ];
+          const withL2 = hasL2L3 ? base.concat([{ v: l2l3ByIf.get(String(r.index)) || '' }]) : base;
+          const withMode = hasModes ? withL2.concat([{ v: modeByIf.get(String(r.index)) || '' }]) : withL2;
+          // 802.1X cell: "control · status", e.g. "auto · authorized".
+          let d1xText = '';
+          if (d1x || hm) {
+            const parts = [];
+            if (d1x && d1x.control) parts.push(d1x.control);
+            if (d1x && d1x.status) parts.push(d1x.status);
+            d1xText = parts.join(' \u00b7 ') || (hm ? hm.mode : '');
+          }
+          const withDot1x = hasDot1x ? withMode.concat([{ v: d1xText }]) : withMode;
+          const withPoe = hasPoe ? withDot1x.concat([
+            { pill: true, v: poe ? dv(poe.pethPsePortDetectionStatus) : '' }
+          ]) : withDot1x;
+          const vl = portVlans.get(String(r.index)) || { untagged: [], tagged: [] };
+          const withVlans = hasVlans ? withPoe.concat([
+            { v: vl.untagged.join(', ') },
+            { v: rangeOf(vl.tagged) }
+          ]) : withPoe;
+          const adminUp = !/down|disabled/i.test(String(dv(r.rlifPresentAdminStatus) || ''));
+          const poePort = poe ? dv(poe.portIndex, poe.index) : null;
+          const uplink = uplinks.get(String(name)) || uplinks.get(String(r.index)) || null;
+          const cells = withVlans.concat([{ actions: {
+            name: String(name || r.index),
+            ifIndex: r.index,
+            poePort: poePort,
+            adminUp: adminUp,
+            uplink: uplink,
+            l2l3: l2l3ByIf.get(String(r.index)) || '', hasL2L3Data: hasL2L3
+          // The action buttons depend on admin state (Shut/No-shut label), PoE
+          // capability and uplink flag; sig changes exactly when they do.
+          }, sig: [adminUp ? 'up' : 'down', poePort == null ? '' : poePort, uplink ? 'u' : ''].join('|') }]);
+          cells._key = 'if:' + r.index;
+          return cells;
+        });
+        for (const poe of poeByPort.values()) {
+          const detail = {
+            name: String(dv(poe.port)), ifIndex: null, fields: {},
+            poe: {
+              Status: dv(poe.pethPsePortDetectionStatus),
+              Class: dv(poe.pethPsePortPowerClassifications),
+              'Denied count': dv(poe.pethPsePortPowerDeniedCounter)
+            }
+          };
+          const row = [{ click: detail, v: dv(poe.port) }, { v: '' }, { v: '' }, { v: '' }]
+            .concat(hasL2L3 ? [{ v: '' }] : [])
+            .concat(hasModes ? [{ v: '' }] : [])
+            .concat(hasPoe ? [{ pill: true, v: dv(poe.pethPsePortDetectionStatus) }] : []);
+          const peCells = (hasVlans ? row.concat([{ v: '' }, { v: '' }]) : row).concat([{ actions: {
+            name: String(dv(poe.port)), ifIndex: null,
+            poePort: dv(poe.portIndex, poe.index), adminUp: true, uplink: null,
+            l2l3: '', hasL2L3Data: hasL2L3
+          }, sig: 'poe:' + dv(poe.portIndex, poe.index) }]);
+          peCells._key = 'poe:' + String(dv(poe.port));
+          rows.push(peCells);
+        }
+
+        // Keyed table: reconciles in place on refresh so a single row's change
+        // (e.g. a port channel shut) patches only that cell - no teardown, no
+        // reflow, no scroll jump.
+        mountInto(body, s, p, 'ports', headers,
+          rows.map((cells) => ({ key: cells._key || ('row:' + rows.indexOf(cells)), cells: cells })));
+
+        // Port channels (LAGs): all available aggregators, their members and
+        // mode, with create/edit/clear.
+        buildPortChannels(s, body, h, (title, note) => {
+          if (s._ktReconcile) return;   // titles already present on reconcile
+          const stt = el('div', 'section-title', title);
+          if (note) stt.appendChild(el('span', 'st-note', note));
+          body.appendChild(stt);
+        }, p);
+
+        return;
+      }
+
+      /**
+       * Who is on the switch, and who has been let onto the network
+       * through it. Three sources answer that: the sessions this app is
+       * holding, the switch's own view of its management sessions, and
+       * 802.1x.
+       */
+      case 'auth': {
+        const section = (title, note) => {
+          if (s._ktReconcile) return;
+          const st = el('div', 'section-title', title);
+          if (note) st.appendChild(el('span', 'st-note', note));
+          body.appendChild(st);
+        };
+
+        // --- ours ---
+        const mine = (s.appSessions || []).filter((x) =>
+          x.target === s.host || String(x.target).indexOf(s.host) >= 0 ||
+          (s.consoleTarget && String(x.target).indexOf(s.consoleTarget.path) >= 0));
+        if (mine.length) {
+          section('This app', mine.length + ' open');
+          mountInto(body, s, p, 'appSessions', ['Kind', 'Target', 'Open for', 'State'],
+            keyedRowsFrom(mine.map((x) => [
+              { pill: true, v: x.kind === 'console' ? 'console' : 'ssh' },
+              { v: x.target },
+              { v: secs(x.seconds) },
+              { v: x.capturing ? 'collecting tech-support' : 'idle' }]), mine, (x, i) => (x.id || x.target || '') + ':' + i));
+        }
+
+        // --- the switch's own ---
+        if (h.mgmtSessions.length) {
+          section('Logged in to the switch', h.mgmtSessions.length + ' session(s)');
+          mountInto(body, s, p, 'mgmtSessions', ['Session', 'User', 'Level', 'Channel'],
+            keyedRowsFrom(cellsOf(h.mgmtSessions, [
+              { key: 'index' }, { key: 'rlSecSdMngSessionUserName' },
+              { key: 'rlSecSdMngSessionUserLevel' }, { key: 'rlSecSdMngSessionChannel' }]), h.mgmtSessions, (r) => r.index));
+        }
+        if (h.sshSessions.length) {
+          section('SSH');
+          mountInto(body, s, p, 'sshSessions', ['User', 'From', 'Port', 'Cipher', 'Version'],
+            keyedRowsFrom(cellsOf(h.sshSessions, [
+              { key: 'rlSshServerSessionInetUsername' }, { key: 'rlSshServerSessionInetPeerAddress' },
+              { key: 'rlSshServerSessionInetPeerPort' }, { key: 'rlSshServerSessionInetCipher' },
+              { key: 'rlSshServerSessionInetPeerVersion' }]), h.sshSessions, (r) => r.index));
+        }
+        if (h.telnetSessions.length) {
+          section('Telnet', 'unencrypted');
+          mountInto(body, s, p, 'telnetSessions', ['Session', 'From', 'Logged in', 'Status'],
+            keyedRowsFrom(cellsOf(h.telnetSessions, [
+              { key: 'index' }, { key: 'rlTelnetSessionClientAddress' },
+              { key: 'rlTelnetSessionLoginTime' }, { key: 'rlTelnetSessionStatus', state: true }]), h.telnetSessions, (r) => r.index));
+        }
+
+        // --- 802.1x ---
+        const hosts = h.dot1xHosts.filter((r) => dv(r.rldot1xAuthMultiSessionUserName) ||
+          dv(r.rldot1xAuthMultiSessionId));
+        if (hosts.length) {
+          // Index the per-host counter tables by the row's own index (port+MAC)
+          // so a host row can show its EAPOL/auth/session counters on click.
+          const byIdx = (arr) => { const m = new Map(); for (const r of (arr || [])) m.set(String(r.index), r); return m; };
+          const stats = byIdx(h.dot1xHostStats), diag = byIdx(h.dot1xHostDiag), sess = byIdx(h.dot1xHostSession);
+          const dc = (cell) => (cell && (cell.display !== undefined && cell.display !== null && cell.display !== '') ? cell.display : (cell && cell.value !== undefined ? cell.value : ''));
+          const hostDetail = (r) => {
+            const idx = String(r.index);
+            const st = stats.get(idx) || {}, dg = diag.get(idx) || {}, ss = sess.get(idx) || {};
+            openDetailDialog(s, '802.1X host \u00b7 ' + (dv(r.rldot1xAuthMultiSessionUserName) || dv(r.mac) || dv(r.port)), [
+              ['Port', dv(r.port)], ['MAC', dv(r.mac)], ['User', dv(r.rldot1xAuthMultiSessionUserName)],
+              ['Method', dv(r.rlDot1xAuthMultiSessionMethodType)], ['Session time', dv(r.rldot1xAuthMultiSessionTime)]
+            ], {
+              'Session': [
+                ['Session ID', dv(ss.rldot1xAuthMultiSessionId)],
+                ['Accounting session ID', dv(ss.rldot1xAuthMultiSessionAcctSessionId)],
+                ['Source IP', dv(ss.rldot1xAuthMultiSessionSourceIpAddress)],
+                ['Assigned VLAN', dv(r.rldot1xAuthMultiSessionRadiusAttrVlan) || dv(ss.rldot1xAuthMultiSessionRadiusAttrVlan)],
+                ['Filter ID', dv(ss.rldot1xAuthMultiSessionRadiusAttrFilterId)],
+                ['Reauth in', dv(ss.rldot1xAuthMultiSessionReauthTimeRemain)]
+              ],
+              'EAPOL frames': [
+                ['Rx', dc(st.rldot1xAuthMultiEapolFramesRx)], ['Tx', dc(st.rldot1xAuthMultiEapolFramesTx)],
+                ['Start Rx', dc(st.rldot1xAuthMultiEapolStartFramesRx)], ['Logoff Rx', dc(st.rldot1xAuthMultiEapolLogoffFramesRx)],
+                ['Invalid Rx', dc(st.rldot1xAuthMultiInvalidEapolFramesRx)]
+              ],
+              'Authentication': [
+                ['Auth successes', dc(dg.rldot1xAuthMultiAuthSuccessWhileAuthenticating)],
+                ['Auth failures', dc(dg.rldot1xAuthMultiAuthFailWhileAuthenticating)],
+                ['Backend successes', dc(dg.rldot1xAuthMultiBackendAuthSuccesses)],
+                ['Backend challenges', dc(dg.rldot1xAuthMultiBackendAccessChallenges)]
+              ],
+              'Session traffic': [
+                ['Octets Rx', dc(ss.rldot1xAuthMultiSessionOctetsRx)], ['Octets Tx', dc(ss.rldot1xAuthMultiSessionOctetsTx)],
+                ['Frames Rx', dc(ss.rldot1xAuthMultiSessionFramesRx)], ['Frames Tx', dc(ss.rldot1xAuthMultiSessionFramesTx)]
+              ]
+            });
+          };
+          section('802.1x authenticated hosts', hosts.length + ' host(s)');
+          // Map a host's port NAME to its ifIndex so re-auth can target the
+          // right port. Re-auth is per-port on this firmware
+          // (dot1xPaePortReauthenticate, a write-true trigger), so the button
+          // reauthenticates the supplicant(s) on that host's port.
+          const ifxByName = new Map();
+          for (const ir of (h.interfaces || [])) ifxByName.set(String(dv(ir.rlifPresentName)), ir.index);
+          const reauthHost = (r) => {
+            const portName = String(dv(r.port));
+            const ifx = ifxByName.get(portName);
+            if (ifx === undefined || ifx === null) { appLog('warn', 'Re-auth: no ifIndex for port', { port: portName }); return; }
+            return snmpSetResult(s, { oid: '1.0.8802.1.1.1.1.1.2.1.5.' + ifx, type: 'Integer', value: 1 })
+              .then((res) => ({ ok: res.ok, b: res.body }));
+          };
+          mountInto(body, s, p, 'dot1xHosts', ['Port', 'User', 'MAC', 'Method', 'VLAN', 'Session', ''],
+            keyedRowsFrom(hosts.map((r) => {
+              const reBtn = actBtn('Re-auth', (e) => {
+                const pr = reauthHost(r);
+                if (!pr) return;
+                runButtonAction(e.currentTarget, {
+                  failLabel: 'Re-auth',
+                  run: () => pr.then(({ ok, b }) => ({ ok: ok, body: b })),   // normalise to {ok, body}
+                  error: (res) => (res && res.body && res.body.error) || 'error'
+                  // No table to settle - re-auth has no visible row change; the
+                  // Done confirmation on the button is the feedback.
+                });
+              }, '', 'Reauthenticate the supplicant(s) on this port');
+              return [
+                { click: { open: () => hostDetail(r) }, v: dv(r.port) },
+                { v: dv(r.rldot1xAuthMultiSessionUserName) },
+                { v: dv(r.mac) },
+                { v: dv(r.rlDot1xAuthMultiSessionMethodType) },
+                { v: dv(r.rldot1xAuthMultiSessionRadiusAttrVlan) },
+                { v: dv(r.rldot1xAuthMultiSessionTime) },
+                { cellNode: actGroup([reBtn]), sig: 'reauth' }
+              ];
+            }), hosts, (r) => String(dv(r.port)) + '|' + String(dv(r.mac))));
+        }
+        if (h.dot1xLocked.length) {
+          section('Locked out', h.dot1xLocked.length);
+          mountInto(body, s, p, 'dot1xLocked', ['Port', 'MAC'],
+            keyedRowsFrom(h.dot1xLocked.map((r) => [
+              { v: dv(r.port) }, { v: dv(r.mac) }]), h.dot1xLocked, (r) => String(dv(r.port)) + '|' + String(dv(r.mac))));
+        }
+
+        // --- AAA servers (RADIUS + TACACS+) --- not yet keyed; skipped on
+        // reconcile (a full repaint still renders them, and a change to their
+        // tables forces a full repaint via PANEL_FULL_REPAINT_TABLES).
+        if (!s._ktReconcile) {
+          buildDot1xGlobal(s, body, h, section);
+          buildAaaServers(s, body, h, section, p);
+        }
+
+        if (!s._ktReconcile && !body.children.length) {
+          body.appendChild(el('div', 'empty-state',
+            'No sessions open, and the switch reported no 802.1x activity.'));
+        }
+        return;
+      }
+
+      /**
+       * Everything reachable through a port, in one place: who announced
+       * themselves (CDP and LLDP), and what has simply been seen (the
+       * forwarding database).
+       *
+       * CDP and LLDP are two protocols describing the same neighbours, so
+       * they are one table with a column saying which spoke. A device
+       * running both would otherwise appear twice, in two panels, and
+       * leave you to work out it was one device.
+       */
+      case 'connected': {
+        // The MAC forwarding table is large and only shown here, so it is not
+        // in the regular poll. Fetch it on demand - but at most once every 30s,
+        // and never twice concurrently. Without the time guard, a switch that
+        // returns an empty (or merely small) MAC result would leave
+        // s.health.macTable falsy and the panel would re-fetch on every repaint,
+        // thrashing the switch. The timestamp makes this fire once per visit.
+        if (!s._macFetching && (Date.now() - (s._macFetchedAt || 0) > 30000)) {
+          s._macFetching = true;
+          fetch('/api/health', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target: s.target, only: ['macTable'] }) })
+            .then((r) => r.json()).then((body) => {
+              s._macFetching = false; s._macFetchedAt = Date.now();
+              if (body && !body.error) {
+                for (const k of body.keys || []) s.health[k] = body[k];
+                // Repaint with the loaded rows, then reflow so the panel grows
+                // to fit the now-populated table (the MAC data arrives after the
+                // first paint, so without this the panel keeps its empty height
+                // and the table scrolls until the module is reopened).
+                const cp = s.panels && s.panels.find((x) => x.kind === 'builtin' && x.key === 'connected');
+                if (!cp || !reconcilePanelInPlace(s, cp)) repaintPanel(s, 'connected');
+                reflowTallPanels(s);
+              }
+            }).catch(() => { s._macFetching = false; s._macFetchedAt = Date.now(); });
+        }
+        const neighbours = new Map();
+        const keyFor = (port, id) => String(port) + '\u0000' + String(id || '').toLowerCase();
+
+        const addNeighbour = (port, id, via, extra) => {
+          // Same port and same identity is the same neighbour. Identities
+          // differ between the protocols (CDP gives a device-id, LLDP a
+          // system name), so a port with one of each and no contradiction
+          // is treated as one device rather than two.
+          let hit = null;
+          for (const [k, n] of neighbours) {
+            if (n.port !== port) continue;
+            const a = String(n.id || '').toLowerCase();
+            const bb = String(id || '').toLowerCase();
+            if (!a || !bb || a === bb || a.indexOf(bb) >= 0 || bb.indexOf(a) >= 0) { hit = n; break; }
+            if (k) { /* different device on the same port: keep both */ }
+          }
+          if (!hit) {
+            hit = { port, id, via: [], remotePort: '', descr: '', address: '' };
+            neighbours.set(keyFor(port, id) + ':' + neighbours.size, hit);
+          }
+          if (!hit.id) hit.id = id;
+          if (hit.via.indexOf(via) < 0) hit.via.push(via);
+          for (const k of ['remotePort', 'descr', 'address']) {
+            if (!hit[k] && extra[k]) hit[k] = extra[k];
+          }
+        };
+
+        for (const r of h.cdp) {
+          addNeighbour(dv(r.localPort, r.index), dv(r.cdpCacheDeviceId), 'CDP', {
+            remotePort: dv(r.cdpCacheDevicePort),
+            descr: dv(r.cdpCachePlatform),
+            address: dv(r.cdpCacheAddress)
+          });
+        }
+        for (const r of h.lldp) {
+          addNeighbour(dv(r.localPort, r.index), dv(r.lldpRemSysName) || dv(r.lldpRemChassisId), 'LLDP', {
+            remotePort: dv(r.lldpRemPortId),
+            descr: dv(r.lldpRemPortDesc),
+            address: dv(r.lldpRemChassisId)
+          });
+        }
+
+        if (neighbours.size) {
+          if (!s._ktReconcile) {
+            const st = el('div', 'section-title', 'Neighbours');
+            st.appendChild(el('span', 'st-note', neighbours.size + ' device(s)'));
+            body.appendChild(st);
+          }
+          const nbr = Array.from(neighbours.values());
+          mountInto(body, s, p, 'neighbours', ['Local port', 'Device', 'Via', 'Remote port', 'Details'],
+            nbr.map((n, i) => ({ key: 'nbr:' + (n.port || '') + '|' + (n.id || '') + '|' + i, cells: [
+              { v: n.port }, { v: n.id }, { v: n.via.join(' + ') }, { v: n.remotePort }, { v: n.descr || n.address }] })));
+        }
+
+        if (h.macTable.length || s.target) {
+          if (!s._ktReconcile) {
+            const st = el('div', 'section-title', 'MAC address table');
+            // Count + note are stable containers refreshed on every pass (incl.
+            // the reconcile after the on-demand fetch finishes), so a "loading"
+            // hint can turn into the real count/empty-state without a rebuild.
+            p._macCount = el('span', 'st-note', '');
+            st.appendChild(p._macCount);
+            body.appendChild(st);
+            if (s.target) {
+              const macCtlRow = el('div', 'tbl-add');
+              const addBtn = el('button', 'tbl-add-btn', '+ Add static MAC'); addBtn.type = 'button';
+              addBtn.addEventListener('click', () => openStaticMacForm(s, h));
+              macCtlRow.appendChild(addBtn);
+              body.appendChild(macCtlRow);
+            }
+            p._macNote = el('div', 'card-sub', '');
+            body.appendChild(p._macNote);
+          }
+          // The table is on-demand (fetched on first open), so an empty table is
+          // ambiguous: still loading, or genuinely empty? Say which, so the user
+          // doesn't read "loading" as "no devices".
+          if (p._macCount) {
+            p._macCount.textContent = (s._macFetching && !h.macTable.length)
+              ? 'loading…' : h.macTable.length.toLocaleString() + ' entries';
+          }
+          if (p._macNote) {
+            p._macNote.textContent = h.macTable.length ? ''
+              : (s._macFetching ? 'Loading MAC address table…' : 'No MAC entries learned yet.');
+          }
+          if (h.macTable.length) {
+            const cols = ['VLAN', 'MAC', 'Port', 'Status'].concat(s.target ? [''] : []);
+            const krows = h.macTable.map((r) => {
+              const statusNum = parseInt((r.dot1qTpFdbStatus && (r.dot1qTpFdbStatus.value !== undefined ? r.dot1qTpFdbStatus.value : r.dot1qTpFdbStatus.display)), 10);
+              const isStatic = statusNum === 1 || statusNum === 5;
+              const macStr = String(dv(r.mac) || '');
+              const vlanStr = String(dv(r.vlan) || '');
+              const base = [{ v: dv(r.vlan) }, { v: dv(r.mac) }, { v: dv(r.port) }, { v: dv(r.dot1qTpFdbStatus) }];
+              let cells = base;
+              if (s.target) {
+                const bpNum = parseInt((r.dot1qTpFdbPort && (r.dot1qTpFdbPort.value !== undefined ? r.dot1qTpFdbPort.value : r.dot1qTpFdbPort.display)), 10) || 0;
+                const delCell = isStatic
+                  ? { cellNode: actGroup([actBtnConfirm('Delete', (e) => {
+                      runButtonAction(e.currentTarget, {
+                        failLabel: 'Delete MAC',
+                        run: () => deleteStaticMac(s, vlanStr, macStr, bpNum).then(() => ({ ok: true, body: {} })),
+                        onApplied: () => { markConfigDirty(s); s._macFetchedAt = 0; },
+                        settle: () => refreshTables(s, ['macTable'])
+                      });
+                    }, 'danger', 'Delete this static MAC entry')]), sig: 'del' }
+                  : { v: '' };
+                cells = base.concat([delCell]);
+              }
+              return { key: 'mac:' + vlanStr + '|' + macStr, cells: cells };
+            });
+            // The FDB can be thousands of entries - paginate at 50 via the engine.
+            mountInto(body, s, p, 'macTable', cols, krows, { pageSize: 50 });
+          }
+          // (empty / loading text handled by p._macNote above)
+        }
+
+        // Don't claim "nothing here" while the MAC table is still being fetched.
+        if (!s._ktReconcile && !neighbours.size && !h.macTable.length && !s._macFetching) {
+          body.appendChild(el('div', 'empty-state', 'No neighbours or learned addresses.'));
+        }
+        return;
+      }
+
+      // A complete view of spanning tree: which mode is running, who the
+      // root is, how stable the topology is, and what every port is doing
+      // -- plus the per-instance or per-VLAN detail for MSTP and PVST.
+      // Laid out the way `show spanning-tree` reads, because that is the
+      // shape the information actually has. Under PVST or MSTP the real
+      // state is per VLAN or per instance -- the common dot1dStpPortTable
+      // reports every port disabled and is worse than useless on its own.
+      // Syslog and traps are the same question -- what has this switch
+      // been telling me -- asked over two transports, so they are one
+      // list, merged by time and labelled by where each line came from.
+      case 'events': paintEventsPanel(s, body); return;
+
+      case 'stp': {
+        const mode = h.summary.stpMode || 'unknown';
+        const MODE_LABEL = {
+          stp: 'STP (802.1D)', rstp: 'RSTP (802.1w)', mstp: 'MSTP (802.1s)',
+          pvst: 'Rapid-PVST / PVST', unknown: 'not reported'
+        };
+        const perInstance = mode === 'pvst' || mode === 'mstp';
+        const isDisabled = (v) => !v || /^(dsbl|disabled|unknown|broken)/i.test(String(v));
+
+        // --- what mode, and the global picture ---
+        const headline = el('div', 'stp-head');
+        const facts = el('div', 'stp-facts');
+        const fact = (k, v) => {
+          if (v === undefined || v === null || v === '') return;
+          const row = el('div', 'kv-row');
+          row.appendChild(el('div', 'k', k));
+          row.appendChild(el('div', 'v', v));
+          facts.appendChild(row);
+        };
+        const detect = h.stpDetect || {};
+        fact('Mode', (MODE_LABEL[mode] || mode) +
+          (detect.disagrees && detect.reportedVersion
+            ? '  \u00b7  the switch reports "' + detect.reportedVersion + '"' : ''));
+        fact('This bridge', (sc('dot1dStpPriority') ? sc('dot1dStpPriority') + '  ' : '') +
+          (sc('dot1dBaseBridgeAddress') || ''));
+        if (mode === 'mstp') {
+          fact('MST region', sc('rldot1sMstpConfigurationName'));
+          fact('Region digest', sc('rldot1sMstpConfigurationDigest'));
+          fact('Max hops', sc('rldot1sMstpDesignatedMaxHopes'));
+        }
+        if (!perInstance) {
+          fact('Root bridge', sc('dot1dStpDesignatedRoot'));
+          fact('Root port', sc('dot1dStpRootPort'));
+          fact('Cost to root', sc('dot1dStpRootCost'));
+          fact('Topology changes', sc('dot1dStpTopChanges'));
+          fact('Last change', sc('dot1dStpTimeSinceTopologyChange'));
+          fact('Timers in force', [sc('dot1dStpHelloTime') && 'hello ' + sc('dot1dStpHelloTime'),
+            sc('dot1dStpMaxAge') && 'max age ' + sc('dot1dStpMaxAge'),
+            sc('dot1dStpForwardDelay') && 'forward delay ' + sc('dot1dStpForwardDelay')]
+            .filter(Boolean).join('  \u00b7  '));
+        }
+        const instances = mode === 'pvst' ? h.pvstVlans : (mode === 'mstp' ? h.mstpInstances : []);
+        if (detect.disagrees) {
+          // Worth stating plainly: the mode shown was worked out from the
+          // tables the switch populates, not from what it says it runs.
+          fact('Detected from', (detect.pvstVlanRows ? detect.pvstVlanRows + ' per-VLAN row(s)' : '') +
+            (detect.mstpInstanceRows ? (detect.pvstVlanRows ? ', ' : '') +
+              detect.mstpInstanceRows + ' MST instance row(s)' : '') +
+            ' returned by the switch');
+        }
+        if (perInstance) {
+          const rooted = instances.filter((r) => String(dv(r.isRoot)) === 'yes').length;
+          fact('Instances', instances.length + (mode === 'pvst' ? ' VLAN(s)' : ' MST instance(s)') +
+            (rooted ? '  \u00b7  root for ' + rooted : ''));
+        }
+        if (!perInstance) {
+          headline.appendChild(el('div', 'hero-badge sev-' + (h.summary.stpIsRoot ? 'info' : 'ok'),
+            h.summary.stpIsRoot ? 'This switch is root' : 'Non-root bridge'));
+        }
+        headline.appendChild(facts);
+        body.appendChild(headline);
+
+        // --- per VLAN / per instance, the way the CLI prints it ---
+        if (perInstance && instances.length) {
+          const portsByKey = new Map();
+          const source = mode === 'pvst' ? h.pvstPorts : h.mstpPorts;
+          const keyOf = (r) => String(dv(mode === 'pvst' ? r.vlan : r.instance));
+          for (const r of source) {
+            const k = keyOf(r);
+            if (!portsByKey.has(k)) portsByKey.set(k, []);
+            portsByKey.get(k).push(r);
+          }
+
+          const roleOf = (r) => dv(mode === 'pvst' ? r.rlBrgPvstOperPortRole : r.rldot1sMStpInstancePortRole);
+          const stateOf = (r) => dv(mode === 'pvst' ? r.rlBrgPvstOperPortState : r.rldot1sMstpInstancePortState);
+          const costOf = (r) => dv(mode === 'pvst' ? r.rlBrgPvstOperPortPathCost : r.rldot1sMstpInstancePortPathCost);
+
+          for (const inst of instances) {
+            const id = String(dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanId : inst.rldot1sMstpInstanceId, inst.index));
+            const wrap = el('div', 'stp-instance');
+            const head = el('div', 'stp-instance-head');
+            head.appendChild(el('span', 'stp-instance-name', (mode === 'pvst' ? 'VLAN ' : 'Instance ') + id));
+            const amRoot = String(dv(inst.isRoot)) === 'yes';
+            head.appendChild(el('span', 'stp-instance-badge' + (amRoot ? ' root' : ''),
+              amRoot ? 'this switch is the root' : 'root elsewhere'));
+            wrap.appendChild(head);
+
+            const kv = el('div', 'stp-instance-facts');
+            const f2 = (k, v) => {
+              if (v === undefined || v === null || v === '') return;
+              const row = el('div', 'kv-row');
+              row.appendChild(el('div', 'k', k));
+              row.appendChild(el('div', 'v', v));
+              kv.appendChild(row);
+            };
+            f2('Root ID', dv(mode === 'pvst'
+              ? inst.rlBrgPvstOperVlanDesignatedRoot : inst.rldot1sMstpInstanceDesignatedRoot));
+            if (!amRoot) {
+              f2('Root port', dv(inst.rootPort));
+              f2('Path cost', dv(mode === 'pvst'
+                ? inst.rlBrgPvstOperVlanRootCost : inst.rldot1sMstpInstanceRootCost));
+            }
+            f2('Bridge priority', dv(mode === 'pvst'
+              ? inst.rlBrgPvstOperVlanPriority : inst.rldot1sMstpInstancePriority));
+            f2('Timers', [
+              dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanHelloTime : inst.rldot1sMstpInstanceHelloTime) &&
+                'hello ' + dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanHelloTime : inst.rldot1sMstpInstanceHelloTime),
+              dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanMaxAge : inst.rldot1sMstpInstanceMaxAge) &&
+                'max age ' + dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanMaxAge : inst.rldot1sMstpInstanceMaxAge),
+              dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanForwardDelay : inst.rldot1sMstpInstanceForwardDelay) &&
+                'forward delay ' + dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanForwardDelay : inst.rldot1sMstpInstanceForwardDelay)
+            ].filter(Boolean).join('  \u00b7  '));
+            const tc = dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanTopChanges : inst.rldot1sMstpInstanceTopChanges);
+            const ts = dv(mode === 'pvst'
+              ? inst.rlBrgPvstOperVlanTimeSinceTopologyChange : inst.rldot1sMstpInstanceTimeSinceTopologyChange);
+            f2('Topology changes', tc !== '' && tc !== undefined
+              ? tc + (ts ? '  \u00b7  last ' + ts : '') : undefined);
+            wrap.appendChild(kv);
+
+            // Only ports doing something. A 24-port switch times five VLANs
+            // is 120 rows of "Dsbl" that say nothing.
+            // Ports that did not resolve to a real interface are slots in
+            // the switch's ifIndex space, not ports; they never belong in
+            // a per-VLAN table.
+            const everything = portsByKey.get(id) || [];
+            const all = everything.filter((r) => r.realPort !== false);
+            const phantom = everything.length - all.length;
+            // A port is participating only if its *state* says so. Role
+            // alone is not enough: switches report "designated" against
+            // ports that are disabled, and even against slots that do not
+            // exist, which is contradictory -- a disabled port has no
+            // role. The CLI agrees: it shows an idle port as "Dsbl Dsbl",
+            // and lists a port as active only on the Sts column.
+            const active = all.filter((r) => !isDisabled(stateOf(r)));
+            if (active.length) {
+              const t = el('table', 'data-table');
+              const hr = document.createElement('tr');
+              for (const x of ['Port', 'Role', 'State', 'Cost', 'Priority', 'Edge', 'BPDUs in', 'BPDUs out']) {
+                hr.appendChild(el('th', '', x));
+              }
+              t.appendChild(hr);
+              for (const r of active) {
+                const tr = document.createElement('tr');
+                tr.appendChild(el('td', 'col-value', dv(r.port)));
+                const rt = document.createElement('td');
+                rt.appendChild(el('span', 'pill ' + stateClass(String(roleOf(r))), roleOf(r)));
+                tr.appendChild(rt);
+                const stt = document.createElement('td');
+                stt.appendChild(el('span', 'pill ' + stateClass(String(stateOf(r))), stateOf(r)));
+                tr.appendChild(stt);
+                tr.appendChild(el('td', 'col-value', costOf(r)));
+                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst'
+                  ? r.rlBrgPvstOperPortPriority : r.rldot1sMstpInstancePortPriority)));
+                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst' ? r.rlBrgPvstOperPortEdgePort : '')));
+                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst'
+                  ? r.rlBrgPvstOperPortBpduReceived : r.rldot1sMStpInstancePortBpduReceived)));
+                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst'
+                  ? r.rlBrgPvstOperPortBpduSent : r.rldot1sMStpInstancePortBpduSent)));
+                t.appendChild(tr);
+              }
+              wrap.appendChild(t);
+              if (all.length > active.length || phantom) {
+                wrap.appendChild(el('div', 'panel-note',
+                  (all.length - active.length) + ' disabled port(s) not shown' +
+                  (phantom ? ', and ' + phantom + ' entr(y/ies) for interfaces this switch does not have' : '') +
+                  '.'));
+              }
+            } else {
+              wrap.appendChild(el('div', 'panel-note',
+                'No ports are participating in this instance' +
+                (all.length ? ' (' + all.length + ' disabled' +
+                  (phantom ? ', ' + phantom + ' non-existent' : '') + ').' : '.')));
+            }
+            body.appendChild(wrap);
+          }
+        }
+
+        if (perInstance && !instances.length) {
+          body.appendChild(el('div', 'panel-note',
+            'No per-VLAN or per-instance spanning-tree rows were returned, so only the common ' +
+            'instance is shown below.'));
+        }
+        if (!perInstance) {
+          const probed = [];
+          if (detect.pvstVlanRows !== undefined) probed.push('rlBrgPvstOperVlanTable: ' + detect.pvstVlanRows + ' rows');
+          if (detect.mstpInstanceRows !== undefined) probed.push('rldot1sMstpInstanceTable: ' + detect.mstpInstanceRows + ' rows');
+          if (probed.length) {
+            body.appendChild(el('div', 'panel-note',
+              'No per-VLAN or per-instance tables are populated on this switch (' +
+              probed.join(', ') + '), so the common instance below is the whole picture.'));
+          }
+        }
+
+        // --- inconsistencies always matter ---
+        if (h.pvstInconsistencies.length) {
+          if (!s._ktReconcile) {
+            const st = el('div', 'section-title', 'Spanning-tree inconsistencies');
+            st.appendChild(el('span', 'st-note', 'ports blocked by a protection feature'));
+            body.appendChild(st);
+          }
+          mountInto(body, s, p, 'pvstInconsistencies', ['Port', 'VLAN', 'State'],
+            h.pvstInconsistencies.map((r, i) => ({ key: 'pvst:' + (dv(r.port) || '') + '|' + (dv(r.vlan) || '') + '|' + i, cells: [
+              { v: dv(r.port) }, { v: dv(r.vlan) }, { pill: true, v: dv(r.state) }] })));
+        }
+
+        // --- the common instance ---
+        // Only shown when it is the answer. Under PVST or MSTP the real
+        // state is per VLAN or per instance and this table reports every
+        // port disabled, so it is left out entirely rather than displayed
+        // with a caveat -- a table of misleading values plus an
+        // explanation is still a table of misleading values.
+        const showCommon = !(perInstance && instances.length);
+        if (showCommon && h.stpPorts.length) {
+          const active = h.stpPorts.filter((r) => !isDisabled(dv(r.dot1dStpPortState)));
+          if (!s._ktReconcile) {
+            const st = el('div', 'section-title', 'Ports');
+            st.appendChild(el('span', 'st-note', active.length
+              ? active.length + ' active of ' + h.stpPorts.length
+              : 'all ' + h.stpPorts.length + ' ports report disabled'));
+            body.appendChild(st);
+          }
+          const krowFor = (r) => ({ key: 'stp:' + (dv(r.port) || r.index), cells: [
+            { v: dv(r.port) },
+            { pill: true, v: dv(r.dot1dStpPortState) },
+            { v: dv(r.dot1dStpPortEnable) },
+            { v: dv(r.dot1dStpPortPathCost) },
+            { v: dv(r.dot1dStpPortPriority) },
+            { v: dv(r.edge) },
+            { v: dv(r.p2p) },
+            { v: dv(r.dot1dStpPortDesignatedBridge) },
+            { v: dv(r.dot1dStpPortForwardTransitions) }] });
+          const headers = ['Port', 'State', 'Enabled', 'Cost', 'Priority', 'Edge', 'P2P',
+            'Designated bridge', 'Transitions'];
+          // Active ports shown; the disabled ones (if any) reveal via the
+          // engine's own "Show all" by including them past the cap... but here
+          // the hidden set is a filter, not a cap, so a toggle flips the source.
+          const showList = s._stpShowDisabled ? h.stpPorts : (active.length ? active : []);
+          mountInto(body, s, p, 'stpPorts', headers, showList.map(krowFor));
+          if (!s._ktReconcile && h.stpPorts.length > active.length && !s._stpShowDisabled) {
+            const note = el('div', 'panel-note',
+              (h.stpPorts.length - active.length) + ' disabled port(s) hidden.  ');
+            const show = el('button', 'raw-toggle', 'Show disabled ports');
+            show.type = 'button';
+            show.addEventListener('click', () => { s._stpShowDisabled = true; repaintPanel(s, 'stp'); });
+            note.appendChild(show);
+            body.appendChild(note);
+          }
+        } else if (showCommon && !s._ktReconcile) {
+          body.appendChild(el('div', 'panel-note',
+            'The switch did not return a spanning-tree port table. Either spanning tree is ' +
+            'disabled, or this model does not implement dot1dStpPortTable.'));
+        }
+
+        const omitted = showCommon ? (h.stpPortsOmitted || 0) : 0;
+        if (omitted) {
+          body.appendChild(el('div', 'panel-note',
+            omitted.toLocaleString() + ' row(s) hidden: the switch answers for every slot in its ' +
+            'ifIndex space, including stack members that are not fitted and port-channels that do ' +
+            'not exist. Only interfaces present in rlifPresentTable are shown.'));
+        }
+        return;
+      }
+
+      default:
+        body.appendChild(el('div', 'card-sub', 'Unknown panel: ' + key));
+    }
+  }
+
+  // ---------- syslog panel ----------
+  // Two things at once: what has arrived from this switch, and whether the
+  // switch is actually configured to send it. A log view that is silently
+  // empty because nobody pointed the switch at it is worse than useless,
+  // so the state of the plumbing is shown alongside the messages.
+  const SEV_CLASS = {
+    Emergency: 'crit', Alert: 'crit', Critical: 'crit', Error: 'crit',
+    Warning: 'warn', Notice: 'good', Info: 'good', Debug: 'idle', Unknown: 'idle'
+  };
+
+  /**
+   * Live tail. Server-sent events rather than polling: messages arrive as
+   * the switch emits them, and the browser reconnects on its own if the
+   * link drops. New rows are inserted into the existing table rather than
+   * repainting the panel, so a busy switch does not make the page flicker
+   * or fight whatever the user is reading.
+   */
+  function startSyslogStream(s) {
+    if (!s.host || s.syslogStream) return;
+    try {
+      const es = new EventSource('/api/syslog/stream?host=' + encodeURIComponent(s.host));
+      s.syslogStream = es;
+      es.onopen = () => { s.syslogLive = true; paintSyslogLiveState(s); };
+      es.onerror = () => { s.syslogLive = false; paintSyslogLiveState(s); };
+      es.onmessage = (ev) => {
+        let payload;
+        try { payload = JSON.parse(ev.data); } catch (e) { return; }
+        onSyslogMessage(s, payload);
+      };
+      appLog('info', 'Syslog live stream opened', { host: s.host });
+    } catch (e) {
+      appLog('warn', 'Could not open the syslog stream', { message: e.message });
+    }
+  }
+
+  function stopSyslogStream(s) {
+    if (!s.syslogStream) return;
+    try { s.syslogStream.close(); } catch (e) {}
+    s.syslogStream = null;
+    s.syslogLive = false;
+  }
+
+  /** Does an incoming message survive the filters currently on screen? */
+  function syslogMatches(s, m) {
+    if (s.syslogSeverity !== undefined && s.syslogSeverity !== null && s.syslogSeverity !== '') {
+      if (m.severity !== null && m.severity > Number(s.syslogSeverity)) return false;
+    }
+    if (s.syslogSearch) {
+      if (String(m.raw || '').toLowerCase().indexOf(String(s.syslogSearch).toLowerCase()) < 0) return false;
+    }
+    return true;
+  }
+
+  function onSyslogMessage(s, payload) {
+    const m = payload.message;
+    if (!s.syslog) s.syslog = { messages: [], total: 0, held: 0, matched: 0 };
+    s.syslog.total = payload.total !== undefined ? payload.total : (s.syslog.total + 1);
+    s.syslog.lastAt = m.at;
+
+    if (!syslogMatches(s, m)) { paintSyslogLiveState(s); return; }
+
+    s.syslog.messages.unshift(m);
+    s.syslog.matched = (s.syslog.matched || 0) + 1;
+    if (s.syslog.messages.length > 300) s.syslog.messages.pop();
+
+    // Insert into the live table when one is on screen; otherwise the next
+    // paint will pick it up from s.syslog.
+    const tbody = s.syslogTable;
+    if (tbody && tbody.isConnected) {
+      const row = syslogRow(m);
+      row.classList.add('syslog-new');
+      const first = tbody.querySelector('tr:not(:first-child)');
+      if (first) tbody.insertBefore(row, first);
+      else tbody.appendChild(row);
+      while (tbody.querySelectorAll('tr').length > 301) tbody.removeChild(tbody.lastChild);
+      setTimeout(() => row.classList.remove('syslog-new'), 1500);
+    } else {
+      repaintSyslog(s);
+    }
+    paintSyslogLiveState(s);
+  }
+
+  function syslogRow(m) {
+    const tr = document.createElement('tr');
+    tr.appendChild(el('td', 'col-value', new Date(m.at).toLocaleTimeString()));
+    const sc = document.createElement('td');
+    sc.appendChild(el('span', 'pill ' + (SEV_CLASS[m.severityName] || 'idle'), m.severityName));
+    tr.appendChild(sc);
+    tr.appendChild(el('td', 'col-name', m.mnemonic || m.tag || m.facilityName || ''));
+    tr.appendChild(el('td', 'col-value', m.message));
+    return tr;
+  }
+
+  /** Update just the counter and the live badge, without a repaint. */
+  function paintSyslogLiveState(s) {
+    if (s.syslogCountEl && s.syslogCountEl.isConnected && s.syslog) {
+      s.syslogCountEl.textContent = (s.syslog.total || 0).toLocaleString() +
+        ' message(s) from ' + s.host +
+        (s.syslog.lastAt ? '  \u00b7  last ' + new Date(s.syslog.lastAt).toLocaleTimeString() : '');
+    }
+
+  }
+
+  /** Just the fetch, so the merged panel can await it without repainting. */
+  function fetchSyslog(s) {
+    const body = { host: s.host, limit: 300, maxSeverity: s.syslogSeverity, search: s.syslogSearch };
+    return Promise.all([
+      fetch('/api/syslog/messages', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }).then((r) => r.json()),
+      s.target
+        ? fetch('/api/syslog/collectors', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target: s.target })
+          }).then((r) => r.json()).catch((e) => ({ error: e.message }))
+        : Promise.resolve(null)
+    ]).then(([messages, collectors]) => {
+      s.syslog = messages;
+      if (collectors) s.syslogCollectors = collectors;
+    }).catch((e) => { s.syslogError = e.message; });
+  }
+
+  function loadSyslog(s, panel) {
+    s.syslogBusy = true;
+    repaintSyslog(s);
+    const body = { host: s.host, limit: 300, maxSeverity: s.syslogSeverity, search: s.syslogSearch };
+    Promise.all([
+      fetch('/api/syslog/messages', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }).then((r) => r.json()),
+      s.target
+        ? fetch('/api/syslog/collectors', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target: s.target })
+          }).then((r) => r.json()).catch((e) => ({ error: e.message }))
+        : Promise.resolve(null)
+    ]).then(([messages, collectors]) => {
+      s.syslogBusy = false;
+      s.syslog = messages;
+      if (collectors) s.syslogCollectors = collectors;
+      repaintSyslog(s);
+    }).catch((e) => {
+      s.syslogBusy = false;
+      s.syslogError = e.message;
+      repaintSyslog(s);
+    });
+  }
+
+  function repaintSyslog(s) {
+    const panel = s.panels.find((p) => p.kind === 'builtin' && p.key === 'events');
+    if (panel && panel._body) {
+      const keep = panel._body.scrollTop;
+      paintPanelBody(s, panel);
+      panel._body.scrollTop = keep;
+    }
+  }
+
+  /**
+   * Events: syslog and traps in one list.
+   *
+   * They answer the same question over two transports -- one is what the
+   * switch wrote down, the other what it interrupted us about -- and
+   * keeping them apart meant reading two panels to reconstruct one
+   * sequence. Merged by time, with a column saying which arrived how.
+   */
+  function loadEvents(s, p) {
+    // Both sources, then paint once they are both in: two half-populated
+    // repaints in quick succession is worse than one complete one.
+    Promise.all([
+      fetchSyslog(s),
+      fetch('/api/traps/messages', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: s.host, limit: 300 })
+      }).then((r) => r.json()).catch(() => null)
+    ]).then(([, trapData]) => {
+      s.traps = trapData;
+      if (p._body) paintPanelBody(s, p);
+    });
+  }
+
+  /** One row shape for both, so the list reads as a single sequence. */
+  function eventRows(s) {
+    // Which sources to show. Default: syslog only — traps are off until the
+    // user ticks them. Initialised once so the choice persists across repaints.
+    if (!s.eventSources) s.eventSources = { syslog: true, trap: false };
+    const rows = [];
+    if (s.eventSources.syslog) {
+      const sys = (s.syslog && s.syslog.messages) || [];
+      for (const m of sys) {
+        rows.push({
+          at: m.at, kind: 'syslog', severity: m.severityName || 'info',
+          what: m.mnemonic || m.severityName || 'message',
+          detail: m.message
+        });
+      }
+    }
+    if (s.eventSources.trap) {
+      const traps = (s.traps && s.traps.messages) || [];
+      for (const m of traps) {
+        rows.push({
+          at: m.at, kind: 'trap', severity: m.severity,
+          what: m.name,
+          detail: m.varbinds.map((v) => v.name.replace(/\.\d+$/, '') + ' ' + v.value).join('  \u00b7  ')
+        });
+      }
+    }
+    rows.sort((a, b) => new Date(b.at) - new Date(a.at));
+    return rows;
+  }
+
+  function paintEventsPanel(s, body) {
+    startSyslogStream(s);
+    startTrapStream(s);
+
+    // Painting is not fetching. Expanding the panel calls straight in
+    // here, so without this it draws an empty list from data nobody asked
+    // for -- and then looks broken until the next refresh.
+    // Either source missing is enough: a trap that arrived while this
+    // panel was folded clears the held copy precisely so the next paint
+    // goes and gets it.
+    if ((!s.syslog || !s.traps) && !s.eventsLoading) {
+      s.eventsLoading = true;
+      const panel = s.panels.find((x) => x.key === 'events');
+      if (panel) {
+        loadEvents(s, panel);
+        body.appendChild(el('div', 'empty-state', 'Reading events\u2026'));
+        return;
+      }
+    }
+    s.eventsLoading = false;
+
+    const rows = eventRows(s);
+    const receiver = (s.syslog && s.syslog.receiver) || null;
+
+    const bar = el('div', 'syslog-bar');
+    const counts = [];
+    if (s.syslog && s.syslog.total) counts.push(s.syslog.total.toLocaleString() + ' syslog');
+    if (s.traps && s.traps.total) counts.push(s.traps.total.toLocaleString() + ' trap(s)');
+    bar.appendChild(el('span', 'card-sub', counts.length
+      ? counts.join('  \u00b7  ') + '  from ' + s.host : ''));
+    body.appendChild(bar);
+
+    // The offer to point the switch at us belongs here, since this is
+    // where its messages would appear.
+    const cfg = s.syslogCollectors;
+    if (cfg && !cfg.error && !cfg.configured && !(cfg.heard && cfg.heard.total)) {
+      body.appendChild(buildSyslogOffer(s, cfg));
+    }
+
+    const tools = el('div', 'event-tools');
+
+    // Source selector: syslog on by default, traps opt-in.
+    if (!s.eventSources) s.eventSources = { syslog: true, trap: false };
+    const srcWrap = el('span', 'event-sources');
+    const srcBox = (key, labelText) => {
+      const lab = el('label', 'check-label');
+      const cb = el('input'); cb.type = 'checkbox'; cb.checked = !!s.eventSources[key];
+      cb.addEventListener('change', () => {
+        s.eventSources[key] = cb.checked;
+        const p = s.panels.find((x) => x.key === 'events');
+        if (p) paintPanelBody(s, p);   // re-render with the new source set
+      });
+      lab.appendChild(cb); lab.appendChild(el('span', '', labelText));
+      return lab;
+    };
+    srcWrap.appendChild(srcBox('syslog', 'Syslog'));
+    srcWrap.appendChild(srcBox('trap', 'Traps'));
+    tools.appendChild(srcWrap);
+
+    const sev = document.createElement('select');
+    for (const [value, label] of [['', 'All severities'], ['3', 'Error and worse'],
+      ['4', 'Warning and worse'], ['5', 'Notice and worse'], ['6', 'Info and worse']]) {
+      const o = document.createElement('option');
+      o.value = value; o.textContent = label;
+      sev.appendChild(o);
+    }
+    sev.value = s.syslogSeverity || '';
+    sev.addEventListener('change', () => {
+      s.syslogSeverity = sev.value;
+      const p = s.panels.find((x) => x.key === 'events');
+      if (p) loadEvents(s, p);
+    });
+    tools.appendChild(sev);
+
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.className = 'search-input';
+    search.placeholder = 'Search events\u2026';
+    search.value = s.syslogSearch || '';
+    search.addEventListener('input', () => {
+      s.syslogSearch = search.value;
+      clearTimeout(s.eventSearchTimer);
+      s.eventSearchTimer = setTimeout(() => {
+        const p = s.panels.find((x) => x.key === 'events');
+        if (p) loadEvents(s, p);
+      }, 250);
+    });
+    tools.appendChild(search);
+    body.appendChild(tools);
+
+    if (!rows.length) {
+      body.appendChild(el('div', 'empty-state', receiver && receiver.listening
+        ? 'Nothing from ' + s.host + ' yet \u2014 syslog and traps appear here as they arrive.'
+        : 'Neither receiver is running, so nothing can arrive.'));
+      return;
+    }
+
+    const table = document.createElement('table');
+    table.className = 'data-table';
+    const thead = document.createElement('thead');
+    const hr = document.createElement('tr');
+    for (const h of ['Time', 'Via', 'What', 'Detail']) {
+      const th = document.createElement('th'); th.textContent = h; hr.appendChild(th);
+    }
+    thead.appendChild(hr); table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    for (const r of rows) tbody.appendChild(eventRow(r));
+    table.appendChild(tbody);
+    const scroll = el('div', 'table-scroll');
+    scroll.appendChild(table);
+    body.appendChild(scroll);
+    s.eventTable = tbody;
+  }
+
+  function eventRow(r) {
+    const tr = document.createElement('tr');
+    const time = document.createElement('td');
+    time.className = 'col-value';
+    time.textContent = new Date(r.at).toLocaleTimeString();
+    tr.appendChild(time);
+
+    const via = document.createElement('td');
+    via.appendChild(el('span', 'pill ' + (r.kind === 'trap' ? 'info' : 'idle'), r.kind));
+    tr.appendChild(via);
+
+    const what = document.createElement('td');
+    what.appendChild(el('span', 'pill ' + severityClass(r.severity), r.what));
+    tr.appendChild(what);
+
+    const detail = document.createElement('td');
+    detail.className = 'col-value';
+    detail.textContent = r.detail;
+    tr.appendChild(detail);
+    return tr;
+  }
+
+  function severityClass(sev) {
+    if (/emerg|alert|crit/i.test(sev)) return 'crit';
+    if (/err|warn/i.test(sev)) return 'warn';
+    return 'ok';
+  }
+
+  function paintSyslogPanel(s, body) {
+    startSyslogStream(s);
+    const data = s.syslog;
+    const cfg = s.syslogCollectors;
+
+    // --- receiver state ---
+    // Only the count. Whether the receiver is bound and whether the
+    // stream is connected are the app's problems, not the operator's --
+    // and they are already visible in the messages arriving or not.
+    const bar = el('div', 'syslog-bar');
+    const receiver = (data && data.receiver) || (cfg && cfg.receiver);
+    const count = el('span', 'card-sub', data && data.total !== undefined
+      ? data.total.toLocaleString() + ' message(s) from ' + s.host +
+        (data.lastAt ? '  \u00b7  last ' + new Date(data.lastAt).toLocaleTimeString() : '')
+      : '');
+    bar.appendChild(count);
+    s.syslogCountEl = count;
+    s.syslogLiveEl = null;
+    body.appendChild(bar);
+
+    if (receiver && !receiver.listening) {
+      body.appendChild(el('div', 'panel-err',
+        'The syslog receiver could not start: ' + (receiver.error || 'unknown reason') +
+        ' Nothing can be collected until it is listening.'));
+    }
+
+    // --- is the switch pointed at us? ---
+    // Only two states are worth saying anything about: it is not
+    // configured (so offer to fix it), or it is configured but cannot
+    // work. A switch that is set up correctly needs no commentary.
+    if (cfg && !cfg.error) {
+      const heard = cfg.heard && cfg.heard.total;
+      if (!cfg.configured && !heard) {
+        body.appendChild(buildSyslogOffer(s, cfg));
+      } else if (cfg.configured) {
+        const m = cfg.matching || {};
+        const listenPort = receiver && receiver.port;
+        if (listenPort && m.udpPort && Number(m.udpPort) !== Number(listenPort)) {
+          body.appendChild(el('div', 'panel-err',
+            'The switch is sending to port ' + m.udpPort + ', but this receiver is listening on ' +
+            listenPort + ', so nothing will arrive.'));
+        }
+        if (cfg.globalEnabled === false) {
+          body.appendChild(el('div', 'panel-err',
+            'Logging is globally disabled on this switch, so the collector will receive nothing.'));
+        }
+      }
+    } else if (cfg && cfg.error) {
+      body.appendChild(el('div', 'panel-note',
+        'Could not read the switch\u2019s syslog configuration: ' + cfg.error));
+    }
+
+    if (s.syslogError) {
+      const err = el('div', 'panel-err', s.syslogError);
+      err.style.whiteSpace = 'pre-wrap';   // the failure lists each table it tried
+      body.appendChild(err);
+    }
+    if (s.syslogBusy && !data) { body.appendChild(el('div', 'card-sub', 'Loading\u2026')); return; }
+    if (!data) {
+      body.appendChild(el('div', 'card-sub', 'Press Reload to read collected messages.'));
+      return;
+    }
+
+    // --- filters ---
+    const filters = el('div', 'syslog-bar');
+    const sev = document.createElement('select');
+    sev.className = 'interval-input';
+    sev.style.width = 'auto';
+    for (const [value, label] of [['', 'All severities'], ['3', 'Error and worse'],
+      ['4', 'Warning and worse'], ['5', 'Notice and worse'], ['6', 'Info and worse']]) {
+      const o = document.createElement('option');
+      o.value = value; o.textContent = label;
+      sev.appendChild(o);
+    }
+    sev.value = s.syslogSeverity || '';
+    sev.addEventListener('change', () => { s.syslogSeverity = sev.value; loadSyslog(s); });
+    filters.appendChild(sev);
+
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.className = 'search-input';
+    search.placeholder = 'Search messages\u2026';
+    search.value = s.syslogSearch || '';
+    let deb = null;
+    search.addEventListener('input', () => {
+      clearTimeout(deb);
+      deb = setTimeout(() => { s.syslogSearch = search.value; loadSyslog(s); }, 300);
+    });
+    filters.appendChild(search);
+    filters.appendChild(el('span', 'card-sub',
+      data.matched !== undefined
+        ? data.matched.toLocaleString() + ' matching, showing ' + data.messages.length
+        : ''));
+    body.appendChild(filters);
+
+    if (!data.messages.length) {
+      body.appendChild(el('div', 'empty-state', data.total
+        ? 'No messages match the current filter.'
+        : 'Waiting for messages from ' + s.host + ' \u2014 they appear here as they arrive.'));
+      s.syslogTable = null;
+      return;
+    }
+
+    const wrap = el('div', 'table-scroll');
+    const t = el('table', 'data-table');
+    const hr = document.createElement('tr');
+    for (const h of ['Received', 'Severity', 'Facility', 'Message']) hr.appendChild(el('th', '', h));
+    t.appendChild(hr);
+    for (const m of data.messages) t.appendChild(syslogRow(m));
+    wrap.appendChild(t);
+    body.appendChild(wrap);
+    // Held so arriving messages can be inserted without a repaint.
+    s.syslogTable = t;
+  }
+
+  /** The offer to point the switch at us. Writes to the device, so it asks. */
+  function buildSyslogOffer(s, cfg) {
+    const box = el('div', 'cfg-sync');
+    box.appendChild(el('div', 'card-sub',
+      'This switch is not sending syslog here. ' + cfg.ourAddress +
+      ' is not listed among its collectors' +
+      (cfg.collectors && cfg.collectors.length
+        ? ' (it has ' + cfg.collectors.length + ' other collector(s) configured).'
+        : ' (it has none configured).')));
+
+    const row = el('div', 'cfg-confirm');
+    row.style.display = 'flex';
+    const sev = document.createElement('select');
+    sev.className = 'interval-input';
+    sev.style.width = 'auto';
+    for (const [value, label] of [['3', 'Error and worse'], ['4', 'Warning and worse'],
+      ['5', 'Notice and worse'], ['6', 'Info and worse'], ['7', 'Everything, including debug']]) {
+      const o = document.createElement('option');
+      o.value = value; o.textContent = label;
+      sev.appendChild(o);
+    }
+    sev.value = '6';
+    row.appendChild(el('span', 'card-sub', 'Send'));
+    row.appendChild(sev);
+
+    const go = el('button', 'btn btn-amber', 'Configure this switch');
+    go.type = 'button'; go.style.width = 'auto';
+    const confirm = el('div', 'cfg-confirm');
+    confirm.style.display = 'none';
+
+    go.addEventListener('click', () => {
+      clear(confirm);
+      confirm.appendChild(el('span', 'card-sub',
+        'Add ' + cfg.ourAddress + ':' + ((cfg.receiver && cfg.receiver.port) || 514) +
+        ' to the syslog collectors on ' + s.host + '? This writes to the switch.'));
+      const yes = el('button', 'btn btn-danger', 'Yes, configure it');
+      yes.type = 'button'; yes.style.width = 'auto';
+      const no = el('button', 'btn', 'Cancel');
+      no.type = 'button'; no.style.width = 'auto';
+      no.addEventListener('click', () => { confirm.style.display = 'none'; go.style.display = ''; });
+      yes.addEventListener('click', () => configureSyslog(s, sev.value));
+      confirm.appendChild(yes); confirm.appendChild(no);
+      confirm.style.display = 'flex';
+      go.style.display = 'none';
+    });
+    row.appendChild(go);
+    box.appendChild(row);
+    box.appendChild(confirm);
+    return box;
+  }
+
+  function configureSyslog(s, severity) {
+    s.syslogBusy = true; s.syslogError = null;
+    repaintSyslog(s);
+    appLog('info', 'Configuring switch to send syslog here', { host: s.host, severity });
+    fetch('/api/syslog/configure', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: s.target, severity: Number(severity) })
+    })
+      .then((r) => r.json().then((b) => ({ ok: r.ok, body: b })))
+      .then(({ ok, body }) => {
+        s.syslogBusy = false;
+        if (!ok || body.error) {
+          s.syslogError = body.error || 'Could not configure the switch.';
+          appLog('error', 'Syslog configuration failed', { host: s.host, message: s.syslogError });
+          repaintSyslog(s);
+          return;
+        }
+        appLog('info', 'Switch configured to send syslog here', {
+          host: s.host, address: body.address, port: body.port, severity: body.severityName
+        });
+        // Re-read so the panel proves the change rather than asserting it.
+        loadSyslog(s);
+      })
+      .catch((e) => { s.syslogBusy = false; s.syslogError = e.message; repaintSyslog(s); });
+  }
+
+  // ---------- configuration panel ----------
+  // One place to pull every file off the switch: running-config,
+  // startup-config and show tech-support. Whatever has been fetched stays
+  // held and selectable, so comparing does not throw away the document you
+  // were reading, and switching back costs nothing.
+  // Configurations only. show tech-support is collected and read on its
+  // own page: it comes over SSH rather than SNMP, it is two orders of
+  // magnitude larger, and it has a section browser these do not need.
+  const CFG_DOCS = [
+    { key: 'running', label: 'Running', how: 'snmp' },
+    { key: 'startup', label: 'Startup', how: 'snmp' }
+  ];
+
+  function paintConfigPanel(s, body) {
+    s.docs = s.docs || {};
+    if (!s.target) {
+      body.appendChild(el('div', 'empty-state',
+        'Set a switch target on the Health tab first \u2014 pulling files reuses it.'));
+      return;
+    }
+
+    // --- actions ---
+    const bar = el('div', 'cfg-bar');
+    const mk = (label, cls, fn, disabled, title) => {
+      const b = el('button', 'btn ' + (cls || ''), label);
+      b.type = 'button'; b.style.width = 'auto';
+      if (title) b.title = title;
+      if (disabled) b.disabled = true; else b.addEventListener('click', fn);
+      bar.appendChild(b);
+      return b;
+    };
+    const held = (k) => s.docs[k] && s.docs[k].text;
+
+    // One action: pull both and diff them. Fetching one without the other
+    // was never the interesting case -- what you want to know is what the
+    // switch is running and whether it will survive a reload.
+    const have = held('running') && held('startup');
+    mk(have ? 'Refetch both' : 'Fetch configurations', '',
+      () => fetchConfigs(s), s.cfgBusy,
+      'Pulls running-config and startup-config, then compares them');
+    body.appendChild(bar);
+
+    // --- what is held, and which is on screen ---
+    const chips = el('div', 'cfg-chips');
+    const view = (key) => { s.cfgView = key; repaintConfig(s); };
+    let any = false;
+    for (const d of CFG_DOCS) {
+      const doc = s.docs[d.key];
+      if (!doc || !doc.text) continue;
+      any = true;
+      const chip = el('button', 'cfg-chip' + (s.cfgView === d.key ? ' active' : ''), d.label);
+      chip.type = 'button';
+      chip.title = doc.lines.toLocaleString() + ' lines \u00b7 fetched ' + doc.at.toLocaleTimeString();
+      chip.appendChild(el('span', 'chip-meta', doc.lines.toLocaleString() + ' lines'));
+      chip.addEventListener('click', () => view(d.key));
+      chips.appendChild(chip);
+    }
+    if (s.cfgDiff) {
+      any = true;
+      const chip = el('button', 'cfg-chip' + (s.cfgView === 'diff' ? ' active' : ''), 'Differences');
+      chip.type = 'button';
+      chip.appendChild(el('span', 'chip-meta', s.cfgDiff.filter((d) => d.t !== ' ').length + ' lines'));
+      chip.addEventListener('click', () => view('diff'));
+      chips.appendChild(chip);
+    }
+    if (any) {
+      body.appendChild(chips);
+    }
+
+    // --- content ---
+    const out = el('div', 'cfg-out');
+    body.appendChild(out);
+
+    if (s.cfgBusy) { out.appendChild(el('div', 'card-sub', s.cfgBusy)); return; }
+    if (s.cfgError) {
+      const err = el('div', 'panel-err', s.cfgError);
+      err.style.whiteSpace = 'pre-wrap';   // the failure lists what was tried
+      out.appendChild(err);
+    }
+    // The config changed on the switch since this diff was fetched. Rather than
+    // auto-pull both configs over TFTP (a heavy switch copy op) on every change,
+    // show a gentle prompt and let the user refresh on demand.
+    if (s.cfgStale && s.docs && (s.docs.running || s.docs.startup)) {
+      const banner = el('div', 'cfg-stale');
+      banner.appendChild(el('span', '', 'The configuration changed since this was fetched.'));
+      const rb = el('button', 'btn btn-small', 'Refresh comparison'); rb.type = 'button';
+      rb.addEventListener('click', () => { s.cfgStale = false; fetchConfigs(s, true).then(() => { s.cfgView = 'diff'; repaintConfig(s); }); });
+      banner.appendChild(rb);
+      out.appendChild(banner);
+    }
+
+    if (s.cfgView === 'diff' && s.cfgDiff) { renderDiff(out, s.cfgDiff, s); return; }
+
+    const doc = s.docs[s.cfgView];
+    if (doc && doc.text) {
+      const meta = el('div', 'card-sub',
+        doc.label + ' \u00b7 ' + doc.lines.toLocaleString() + ' lines \u00b7 ' +
+        doc.bytes.toLocaleString() + ' bytes \u00b7 ' + doc.via + ' at ' + doc.at.toLocaleTimeString());
+      out.appendChild(meta);
+      const pre = document.createElement('pre');
+      pre.textContent = doc.text;
+      out.appendChild(pre);
+      return;
+    }
+
+    if (!s.cfgError) {
+      out.appendChild(el('div', 'card-sub',
+        'Fetch the configurations to see the running config, the startup config and the ' +
+        'differences between them. The switch uploads each over TFTP to the receiver built ' +
+        'into this app, which needs SNMP write access and reachability on UDP 69. ' +
+        'What you fetch stays here until you refetch. ' +
+        'show tech-support is collected on its own page.'));
+    }
+  }
+
+  function storeDoc(s, key, text, via) {
+    s.docs = s.docs || {};
+    const label = (CFG_DOCS.find((d) => d.key === key) || {}).label || key;
+    s.docs[key] = {
+      key, label, text, via,
+      bytes: text.length,
+      lines: text.split('\n').length,
+      at: new Date()
+    };
+    s.cfgView = key;
+  }
+
+  /**
+   * Pull both configurations and diff them in one action. They are fetched
+   * one after the other rather than together: each is a separate TFTP
+   * transfer triggered by a row in rlCopyTable, and switches do not
+   * reliably handle two in flight at once.
+   */
+  async function fetchConfigs(s, skipHealthReload) {
+    if (!s.target) return;
+    // Pause background polling while fetching configs over TFTP (the config
+    // check). If syncConfigs already set the flag, leave it for that caller
+    // to clear; only this call owns it when it set it itself.
+    const ownsBusy = !s.writeBusy;
+    if (ownsBusy) s.writeBusy = true;
+    s.cfgError = null;
+    try {
+      for (const kind of ['running', 'startup']) {
+        s.cfgBusy = 'Fetching ' + kind + '-config over TFTP\u2026';
+        repaintConfig(s);
+        const r = await fetch('/api/config/fetch', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target: s.target, kind })
+        });
+        const body = await r.json();
+        if (!r.ok || body.error) throw new Error(body.error || 'fetch failed');
+        storeDoc(s, kind, body.text, 'received over TFTP');
+      }
+      s.cfgBusy = null;
+      /**
+       * Startup first, running second, so the marks read the way the
+       * question is asked. The saved configuration is the baseline and
+       * the running one is what the switch is doing now, which makes "+"
+       * a line that is running but unsaved -- what a reload would lose --
+       * and "-" a line that is saved but no longer in effect. The other
+       * way round the signs are technically true and consistently read
+       * backwards.
+       */
+      s.cfgStale = false;   // fresh pull - the diff is current again
+      s.cfgDiff = diffLines(s.docs.startup.text, s.docs.running.text);
+      const changed = s.cfgDiff.filter((d) => d.t !== ' ').length;
+      // Open on the comparison when there are differences, and also when
+      // the switch says it has unsaved changes but the two files match --
+      // that combination needs explaining, and the explanation lives on
+      // the comparison view.
+      s.cfgView = (changed || switchSaysUnsaved(s)) ? 'diff' : 'running';
+      appLog('info', 'Configurations fetched and compared', { host: s.host, changed });
+    } catch (e) {
+      s.cfgBusy = null; s.cfgError = e.message;
+      appLog('error', 'Configuration fetch failed', { host: s.host, message: e.message });
+    }
+    // Fetching configs does not change any switch state (interfaces, VLANs,
+    // etc.) - it just pulls the running/startup files - so there is no reason to
+    // re-walk all 44 health tables here. Refresh only the cheap saved-state
+    // scalar so the "config saved" badge is current. (The auto-diff path passes
+    // skipHealthReload and does its own badge refresh, so it skips even this.)
+    if (ownsBusy) {
+      s.writeBusy = false;
+      if (!skipHealthReload) {
+        refreshScalars(s, { rlRunningCDBequalToStartupCDB: '1.3.6.1.4.1.9.6.1.101.1.13' })
+          .then(() => { repaintConfigBadge(s); repaintConfig(s); })   // overlay banner reflects the fresh flag too
+          .catch(() => {});
+      }
+    }
+    repaintConfig(s);
+    repaintConfigBadge(s);
+  }
+
+  /**
+   * Save the running configuration over startup, then re-read both so the
+   * page proves the result rather than asserting it: after a successful
+   * sync the diff should be empty, and if it is not the user needs to see
+   * that immediately.
+   */
+  async function syncConfigs(s) {
+    if (!s.target) return;
+    // Suspend background polling for the whole save: a config copy is heavy on
+    // the switch and must not share the agent with health walks or probes.
+    s.writeBusy = true;
+    // Held for the whole write, including the re-read that proves it: the
+    // window stays put until there is an answer to show.
+    s.cfgSaving = true;
+    s.cfgBusy = 'Saving the running configuration to startup\u2026';
+    s.cfgError = null;
+    repaintConfig(s);
+    appLog('info', 'Saving running-config to startup', { host: s.host });
+    // Optimistic badge: the user asked to save, so show "saved" at once rather
+    // than waiting the ~3-4s the switch takes to write flash. If the save fails
+    // the catch below reverts it. This makes the dashboard feel instant.
+    const prevSavedScalar = s.health && s.health.scalars ? s.health.scalars.rlRunningCDBequalToStartupCDB : undefined;
+    if (s.health && s.health.scalars) {
+      s.health.scalars.rlRunningCDBequalToStartupCDB = { value: 1, display: 'true', oid: '1.3.6.1.4.1.9.6.1.101.1.13.0' };
+      repaintConfigBadge(s);
+    }
+    // Close the config overlay NOW so the user actually SEES the badge flip -
+    // it sits on the dashboard behind the overlay, so keeping the overlay open
+    // during the ~3-4s flash write hid the update. The save proceeds in the
+    // background; a failure re-opens with the error (handled in catch).
+    s.cfgSaving = false; s.cfgBusy = null;
+    closeOverlays(s);
+    try {
+      const r = await fetch('/api/config/sync', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: s.target, from: 'running', to: 'startup' })
+      });
+      const body = await r.json();
+      if (!r.ok || body.error) throw new Error(body.error || 'sync failed');
+      appLog('info', 'Running configuration saved to startup', {
+        host: s.host, state: body.state, method: body.method, shape: body.shape
+      });
+      // The switch's own response is the authoritative confirmation: when it
+      // says startup now matches running, trust it rather than pulling BOTH
+      // configs over TFTP again just to re-diff (two switch copy operations per
+      // save - the dominant load). Mark the local diff clean and move on. If the
+      // switch did NOT report a clean match, fall back to the re-fetch so the
+      // user can see what did not take.
+      const switchConfirmsClean = body.state && /match|equal|same/i.test(String(body.state));
+      let left;
+      if (switchConfirmsClean) {
+        // Startup == running now: reflect that locally without a TFTP pull.
+        if (s.docs && s.docs.running && s.docs.startup) { s.docs.startup = Object.assign({}, s.docs.running, { label: s.docs.startup.label, key: 'startup' }); }
+        s.cfgDiff = (s.docs && s.docs.running && s.docs.startup) ? diffLines(s.docs.startup.text, s.docs.running.text) : s.cfgDiff;
+        s.cfgStale = false;
+        left = 0;
+      } else {
+        s.cfgBusy = 'Saved. Re-reading both configurations to confirm\u2026';
+        repaintConfig(s);
+        await fetchConfigs(s, true);
+        s.cfgView = 'diff';
+        left = s.cfgDiff ? s.cfgDiff.filter((d) => d.t !== ' ').length : 0;
+      }
+      if (left) {
+        // Still differing after a reported success: the optimistic "saved" was
+        // wrong, so revert the badge and re-open the viewer with the detail.
+        if (s.health && s.health.scalars && prevSavedScalar !== undefined) {
+          s.health.scalars.rlRunningCDBequalToStartupCDB = prevSavedScalar;
+          const hpr = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === 'health');
+          repaintConfigBadge(s);
+        }
+        s.cfgError = 'The switch reported the copy finished, but the two configurations ' +
+          'still differ by ' + left + ' line(s). Check the differences below.';
+        s.writeBusy = false; s.cfgSaving = false; s.cfgBusy = null;
+        openConfigDiff(s);   // re-open so the user sees what did not take
+        repaintConfig(s);
+      } else {
+        // Clean save confirmed by the switch. The overlay was already closed on
+        // click and the badge already shows "saved" optimistically, so there is
+        // nothing more to do here but settle the flags and confirm the badge.
+        s.writeBusy = false;
+        // The switch already confirmed "startup now matches running" in its sync
+        // response, so update the saved-state badge INSTANTLY from that - set the
+        // scalar locally and repaint, with ZERO extra traffic to the switch. (A
+        // confirming scalar read is unnecessary when the switch just told us.)
+        if (s.health && s.health.scalars) {
+          s.health.scalars.rlRunningCDBequalToStartupCDB = { value: 1, display: 'true', oid: '1.3.6.1.4.1.9.6.1.101.1.13.0' };
+        }
+        repaintConfigBadge(s);
+        return;
+      }
+    } catch (e) {
+      s.cfgBusy = null;
+      s.cfgError = 'Could not save the configuration: ' + e.message;
+      appLog('error', 'Configuration sync failed', { host: s.host, message: e.message });
+      // The save failed, so undo the optimistic "saved" badge and bring the
+      // overlay back (it was closed on click) with the error visible.
+      if (s.health && s.health.scalars && prevSavedScalar !== undefined) {
+        s.health.scalars.rlRunningCDBequalToStartupCDB = prevSavedScalar;
+        const hpf = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === 'health');
+        repaintConfigBadge(s);
+      }
+      if (typeof toast === 'function') toast('Could not save the configuration: ' + e.message, 'error');
+      s.cfgSaving = false; s.cfgBusy = null; s.writeBusy = false;
+      openConfigDiff(s);
+      repaintConfig(s);
+      return;
+    }
+    s.cfgSaving = false;
+    s.cfgBusy = null;
+    s.writeBusy = false;
+    repaintConfig(s);
+    // No full health walk after a save: a save changes only the saved-vs-running
+    // state (already reflected in the badge), not interfaces/VLANs/etc.
+  }
+
+  /** Fetch one configuration and save it straight to disk. */
+  function backupConfig(s, kind) {
+    if (!s.target) return;
+    s.cfgBusy = 'Fetching ' + kind + '-config\u2026';
+    s.cfgError = null;
+    repaintPanel(s, 'summary');
+    appLog('info', 'Backing up configuration', { host: s.host, kind });
+    fetch('/api/config/fetch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: s.target, kind })
+    })
+      .then((r) => r.json().then((b) => ({ ok: r.ok, body: b })))
+      .then(({ ok, body }) => {
+        s.cfgBusy = null;
+        if (!ok || body.error) {
+          s.cfgError = body.error || 'Configuration fetch failed.';
+          appLog('error', 'Backup failed', { host: s.host, kind, message: s.cfgError });
+          openConfigDiff(s);            // the error belongs where the detail is
+        } else {
+          storeDoc(s, kind, body.text, 'received over TFTP');
+          download(kind + '-' + safeHost(s.host) + '-' + stamp() + '.txt', body.text);
+          appLog('info', 'Configuration backed up', { host: s.host, kind, bytes: body.bytes });
+        }
+        repaintPanel(s, 'summary');
+        repaintConfig(s);
+      })
+      .catch((e) => {
+        s.cfgBusy = null; s.cfgError = e.message;
+        repaintPanel(s, 'summary');
+      });
+  }
+
+  /** Open the configuration overlay, fetching and diffing if needed. */
+  function openConfigDiff(s) {
+    openOverlay(s, 'cfgOverlay');
+    repaintConfig(s);
+    const have = s.docs && s.docs.running && s.docs.startup;
+    // Always re-fetch when opening this from the "not saved" card: the whole
+    // point is to show the CURRENT difference, and the configs on file may be
+    // stale from a previous view (which is why the second click used to show old
+    // data and force a manual Fetch). Also fetch when nothing is on file yet or
+    // a tool change is pending. Skip only if a fetch/save is already running.
+    if (!s.cfgBusy && !s.cfgSaving) {
+      s.cfgPendingFromTool = false;
+      fetchConfigs(s, true);   // show the up-to-date diff; no whole-switch walk
+    } else if (!have) {
+      // A fetch is in flight already; nothing to do.
+    }
+  }
+
+  const hasConsole = (s) => !!(s.consoleTarget && s.consoleTarget.path);
+  const hasSsh = (s) => !!(s.sshEverConnected || (s.sshUser.value && s.sshPass.value));
+
+  function cliTooltip(s) {
+    if (hasConsole(s)) return 'Console  \u2014  ' + s.consoleTarget.path + ' @ ' + s.consoleTarget.baudRate;
+    if (hasSsh(s)) return 'SSH  \u2014  ' + (s.sshHost.value || s.host);
+    return 'Set up SSH or console access in Settings';
+  }
+
+  /**
+   * Open the command line by whichever route exists, preferring the
+   * console: it is the one that still works when the network path is the
+   * problem. With neither set up, go to Settings and show both as the
+   * options they are rather than failing silently.
+   */
+  function openCli(s) {
+    if (hasConsole(s)) { openConsole(s, s.consoleTarget.path, s.consoleTarget.baudRate); return; }
+    if (hasSsh(s)) { openTerminal(s); return; }
+    /**
+     * Nothing is set up yet, so credentials come first -- but the request
+     * was for a terminal and it should survive the detour. Without this
+     * the operator asks for the CLI, fills in a serial port, is returned
+     * to the dashboard, and has to ask for the CLI all over again.
+     */
+    s.pendingCli = true;
+    showView(s, 'creds');
+    for (const card of [s.sshCard, s.consoleCard]) {
+      card.classList.add('needs-setup');
+      setTimeout(() => card.classList.remove('needs-setup'), 4000);
+    }
+    s.sshCard.scrollIntoView({ block: 'nearest' });
+    appLog('info', 'CLI access needs SSH or console credentials first', { host: s.host });
+  }
+
+  /**
+   * A session came up but SNMP was never configured, so the dashboard has
+   * nothing to read. Dropping straight into a terminal assumes that is
+   * what was wanted; often the reason for connecting at all is to *make*
+   * the switch pollable. So ask, and offer to do it.
+   */
+  /**
+   * A session came up but SNMP was never configured, so the dashboard has
+   * nothing to read. Say so, offer the terminal, and show the commands
+   * that would make the switch pollable -- driving a CLI blind proved too
+   * fragile to do on the operator's behalf, but the commands themselves
+   * are still the useful part.
+   */
+  /**
+   * Build the commands from what the operator has typed, so what gets
+   * pasted is theirs rather than a template with placeholders left in it.
+   * Placeholders are the reason copied examples get pasted wrong.
+   */
+  // Edit the switch's identity (sysName / sysLocation / sysContact) from the
+  // Details panel. These three fields are the only writable ones in the
+  // system group; they live in Details (not the SNMP panel) so the info is
+  // shown once, and this is the edit path for them. Writing needs a
+  // DefaultSuper credential — if the connected one is read-only the switch
+  // returns authorizationError, which is surfaced plainly.
+  const SYS_EDIT_OIDS = {
+    name: '1.3.6.1.2.1.1.5.0', location: '1.3.6.1.2.1.1.6.0', contact: '1.3.6.1.2.1.1.4.0'
+  };
+  function editSysIdentity(s, anchor) {
+    if (!s.target) return;
+    const h = s.health;
+    const cur = (k) => {
+      const v = h && h.scalars && h.scalars[k] ? h.scalars[k].display : '';
+      return (v && v !== '(empty)') ? v : '';
+    };
+    // Render a small inline form inside the hero's main column, below the
+    // name/details, so it sits in normal flow rather than becoming a stray
+    // flex item in the (wrapping) .hero row.
+    const heroMain = anchor && anchor.closest('.hero-main');
+    const host = heroMain || (anchor && anchor.closest('.hero'));
+    let form = document.getElementById('sysid-form');
+    if (form) form.remove();
+    form = el('div', 'snmp-form'); form.id = 'sysid-form'; form.style.marginTop = '10px';
+    form.appendChild(el('h5', '', 'Edit identity'));
+    const defs = [
+      ['name', 'System name', SYS_EDIT_OIDS.name, cur('sysName')],
+      ['location', 'Location', SYS_EDIT_OIDS.location, cur('sysLocation')],
+      ['contact', 'Contact', SYS_EDIT_OIDS.contact, cur('sysContact')]
+    ];
+    const grid = el('div', 'snmp-form-grid');
+    const inputs = {};
+    for (const [key, label, oid, value] of defs) {
+      const inp = textInput(value);
+      inputs[key] = { inp, oid, current: value, label };
+      grid.appendChild(snmpField(label, inp));
+    }
+    form.appendChild(grid);
+    const msg = el('div'); form.appendChild(msg);
+    const actions = el('div', 'snmp-form-actions');
+    const save = el('button', 'btn btn-small', 'Save');
+    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
+    cancel.addEventListener('click', () => form.remove());
+    withConfirm(save, (ev) => {
+      const changes = Object.values(inputs).filter((f) => f.inp.value !== f.current)
+        .map((f) => ({ label: f.label, oid: f.oid, value: f.inp.value }));
+      if (!changes.length) { form.remove(); return; }
+      runButtonAction(ev.currentTarget, {
+        failLabel: 'Save identity', spinLabel: 'Saving\u2026',
+        run: async () => {
+          for (const ch of changes) {
+            try {
+              const { body: j } = await apiPost('/api/snmp-config/status-set-apply', { target: s.target, cfg: { oid: ch.oid, value: ch.value } });
+              if (!j || !j.ok) return { ok: false, error: ch.label + ': ' + ((j && j.error) || 'failed') };
+              if (!j.applied.ok) { const d = (j.applied.log && j.applied.log[0] && j.applied.log[0].detail) || 'change failed'; return { ok: false, error: ch.label + ' could not be changed: ' + d }; }
+            } catch (e) { return { ok: false, error: 'Lost contact: ' + e.message }; }
+          }
+          return { ok: true };
+        },
+        ok: (r) => r && r.ok,
+        error: (r) => { msg.className = 'snmp-msg bad'; msg.textContent = (r && r.error) || 'failed'; return (r && r.error) || 'failed'; },
+        onApplied: () => markConfigDirty(s),
+        settle: () => {
+          const panel = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === 'summary');
+          if (panel) return Promise.resolve(refreshPanel(s, panel)); else { startHealth(s); return Promise.resolve(); }
+        }
+      });
+    });
+    actions.appendChild(save); actions.appendChild(cancel);
+    form.appendChild(actions);
+    if (host) host.appendChild(form); else if (anchor) anchor.parentElement.appendChild(form);
+    inputs.name.inp.focus();
+  }
+
+  // ===================================================================
+  // SNMP configuration module (the write side).
+  // ===================================================================
+  //
+  // A self-contained interactive panel: it loads on expand and on its own
+  // refresh, never on the health poll. The first thing it does is ask the
+  // switch whether this credential is an SNMP Admin (DefaultSuper); if it
+  // is not, a banner says so and the add/edit/delete controls are disabled,
+  // because the switch would refuse them anyway.
+
+  function snmpCfgPost(s, action, extra) {
+    return fetch('/api/snmp-config/' + action, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ target: s.target }, extra || {}))
+    }).then((r) => r.json());
+  }
+
+  // Packet capture (OPC) panel. The C1300's onboard capture records
+  // control-plane traffic only. A single named capture point: configure buffer
+  // and filter, start/stop, and export (to flash, then copied to this app over
+  // TFTP for download). All actions are writes guarded by writeBusy.
+  // Flash files module: list the switch flash, download a file over TFTP, or
+  // ===================================================================
+  // IP access-list module (standard IP ACLs: rlIpStdAclTable).
+  // ===================================================================
+  // A rule (ACE) is indexed by { aclName, aceIndex }. The SNMP index arrives as
+  // dotted sub-identifiers: <nameLen>.<name bytes...>.<aceIndex>. Decode it.
+  const ACL_OIDS = {
+    srcClass: '1.3.6.1.4.1.9.6.1.101.207.1.1.3',
+    srcType:  '1.3.6.1.4.1.9.6.1.101.207.1.1.4',
+    srcAddr:  '1.3.6.1.4.1.9.6.1.101.207.1.1.5',
+    srcPref:  '1.3.6.1.4.1.9.6.1.101.207.1.1.6',
+    dstClass: '1.3.6.1.4.1.9.6.1.101.207.1.1.7',
+    dstType:  '1.3.6.1.4.1.9.6.1.101.207.1.1.8',
+    dstAddr:  '1.3.6.1.4.1.9.6.1.101.207.1.1.9',
+    dstPref:  '1.3.6.1.4.1.9.6.1.101.207.1.1.10',
+    action:   '1.3.6.1.4.1.9.6.1.101.207.1.1.11',
+    rowStatus:'1.3.6.1.4.1.9.6.1.101.207.1.1.12',
+    freeAce:  '1.3.6.1.4.1.9.6.1.101.207.2.0'
+  };
+  const ACL_CLASS = { 1: 'any', 2: 'ipv4', 3: 'ipv6any', 4: 'ipv6' };
+  const ACL_ACTION = { 1: 'drop', 2: 'permit' };
+
+  // Turn an ACL table row index ("<len>.<bytes>.<ace>") into { name, ace }.
+  function parseAclIndex(idx) {
+    const parts = String(idx).split('.').map((n) => parseInt(n, 10));
+    if (!parts.length) return null;
+    const len = parts[0];
+    if (!Number.isFinite(len) || parts.length < len + 2) return null;
+    const name = parts.slice(1, 1 + len).map((c) => String.fromCharCode(c)).join('');
+    const ace = parts[1 + len];
+    return { name, ace };
+  }
+  // Build the index suffix for a given ACL name + ACE index.
+  function aclIndexSuffix(name, ace) {
+    const bytes = String(name).split('').map((ch) => ch.charCodeAt(0));
+    return [bytes.length].concat(bytes).concat([ace]).join('.');
+  }
+  // A dotted-IPv4 string -> hex OctetString of its 4 bytes (for InetAddress).
+  function ipv4ToHex(ip) {
+    const m = String(ip).trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!m) return null;
+    const o = m.slice(1).map(Number);
+    if (o.some((n) => n < 0 || n > 255)) return null;
+    return o.map((n) => n.toString(16).padStart(2, '0')).join('');
+  }
+  // Raw InetAddress bytes (from a GET) -> dotted IPv4, or '' if not 4 bytes.
+  function hexToIpv4(cell) {
+    if (!cell) return '';
+    // The value may arrive as a display string of bytes or a hex string.
+    const disp = cell.display !== undefined ? cell.display : cell.value;
+    const s = String(disp || '');
+    // "0A 00 00 01" or "10.0.0.1" or hex "0a000001"
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s)) return s;
+    const hex = s.replace(/0x|\s|:/gi, '');
+    if (/^[0-9a-f]{8}$/i.test(hex)) {
+      return [0, 2, 4, 6].map((i) => parseInt(hex.substr(i, 2), 16)).join('.');
+    }
+    return s;
+  }
+
+  // The VLANs panel: the VLAN list with SVI/IPv4 details, create and edit.
+  // Standalone (its own module) so the Interfaces panel stays focused on ports.
+  // ===========================================================================
+  // IP Routing & DNS panel. Read + write: global L3 status, the forwarding
+  // table (paginated), editable static routes, DNS client status, nameservers
+  // and static host mappings. Uses the keyed-table engine and runButtonAction
+  // like every other module. OIDs are the standard ipForwarding/ipCidrRouteTable
+  // and the Cisco rlIpStaticRoute/rlDnsCl tables (see health.js walks).
+  //
+  // Static route index (rlIpStaticRouteTable, plain IPv4): the row is addressed
+  // by <dest>.<mask>.<tos>.<nextHop>; create via RowStatus createAndGo(4) with
+  // Type set, delete via destroy(6). DNS domain/host/nameserver rows use their
+  // own RowStatus with the indices documented inline below.
+  // ===========================================================================
+  const ROUTE_PROTO = { 1: 'other', 2: 'local', 3: 'netmgmt', 4: 'icmp', 5: 'egp',
+    6: 'ggp', 7: 'hello', 8: 'rip', 9: 'isIs', 10: 'esIs', 11: 'ciscoIgrp',
+    12: 'bbnSpfIgp', 13: 'ospf', 14: 'bgp' };
+  const ROUTE_TYPE = { 1: 'other', 2: 'reject', 3: 'local', 4: 'remote' };
+  const STATIC_ROUTE_TYPE = { 1: 'other', 2: 'reject', 3: 'local', 4: 'remote' };
+  const DNS_ROUTE = {
+    forwarding: '1.3.6.1.2.1.4.1',                       // ipForwarding scalar
+    dnsEnable:  '1.3.6.1.4.1.9.6.1.101.93.2',            // rlDnsClEnable scalar
+    // rlIpStaticRouteTable columns (26.17.1.1.C)
+    srDest: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.1', srMask: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.2', srNextHop: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.4',
+    srType: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.6', srMetric: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.5',
+    srRowStatus: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.9',
+    // rlDnsClDomainNameTable (93.3.1.C), indexed by the domain name as OID
+    domOwner: '1.3.6.1.4.1.9.6.1.101.93.3.1.2', domRowStatus: '1.3.6.1.4.1.9.6.1.101.93.3.1.3',
+    // rlDnsClNamesTable (93.6.1.C) static host mapping, indexed by name + index
+    hostAddr: '1.3.6.1.4.1.9.6.1.101.93.6.1.4', hostRowStatus: '1.3.6.1.4.1.9.6.1.101.93.6.1.5',
+    // rlDnsResConfigSbeltInetTable (93.9.1.C) - the Cisco WRITABLE nameserver
+    // table (the standard MIB-II sbelt at 32.2.1.1.4 is read-only on this model).
+    // Index: AddrType . <len>.<addr bytes> . SubTree(root=0) . Class(IN=1).
+    nsInetName:   '1.3.6.1.4.1.9.6.1.101.93.9.1.3',   // rc: DnsName
+    nsInetPref:   '1.3.6.1.4.1.9.6.1.101.93.9.1.5',   // rc: preference
+    nsInetStatus: '1.3.6.1.4.1.9.6.1.101.93.9.1.8',   // rc: sbelt RowStatus (add path)
+    // DNS-client-v2 servers table RowStatus - the delete path the switch accepts.
+    v2ServerStatus: '1.3.6.1.4.1.9.6.1.101.93.15.1.8'
+  };
+
+  // Length-prefixed IPv4 address portion of an InetAddress OID index ("4.o.o.o.o"),
+  // matching the server-side aaa.js encoder. InetAddressType ipv4 = 1.
+  const INET_IPV4 = 1;
+  function ipv4IndexV4(ip) {
+    const m = String(ip || '').trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!m) return null;
+    const o = m.slice(1).map(Number);
+    if (o.some((n) => n < 0 || n > 255)) return null;
+    return '4.' + o.join('.');
+  }
+  // Full nameserver row index: AddrType . <len.bytes> . SubTree(root) . Class(IN).
+  function nameserverIndex(ip) {
+    const a = ipv4IndexV4(ip);
+    return a ? (INET_IPV4 + '.' + a + '.0.1') : null;
+  }
+  // Inverse: pull the IPv4 address out of a nameserver row index. The index is
+  // AddrType . <len> . <len address bytes> . <rest>; for ipv4(1) the four octets
+  // follow the length byte. Returns '' if it does not parse as an IPv4 inet index.
+  function inetIndexToIp(idx) {
+    const p = String(idx || '').split('.').map((n) => parseInt(n, 10));
+    if (p.length < 6 || p[0] !== INET_IPV4 || p[1] !== 4) return '';
+    const octets = p.slice(2, 6);
+    if (octets.some((o) => !Number.isFinite(o) || o < 0 || o > 255)) return '';
+    return octets.join('.');
+  }
+
+  // Decode a DNS-client-v2 servers-table row index (93.15), whose INDEX is
+  // Source . IfIndex . Preference . AddrType . InetAddr(len-prefixed) . SubTree
+  // (DnsNameAsIndex) . Class. Verified against switch rows like
+  // 1.1.0.1.4.192.168.1.69.0.1 (source static, if 1, pref 0, ipv4,
+  // 192.168.1.69, root subtree, class IN). Returns { addr, source, pref } for
+  // display, or null if it does not parse as an IPv4 server row.
+  function dnsV2ServerIndex(idx) {
+    const p = String(idx || '').split('.').map((n) => parseInt(n, 10));
+    if (p.length < 10) return null;
+    const source = p[0], ifIndex = p[1], pref = p[2], addrType = p[3], addrLen = p[4];
+    if (addrType !== 1 || addrLen !== 4) return null;          // IPv4 only
+    const octets = p.slice(5, 9);
+    if (octets.some((o) => !Number.isFinite(o) || o < 0 || o > 255)) return null;
+    void ifIndex;
+    return { addr: octets.join('.'), source: source, pref: pref };
+  }
+
+  // Encode a dotted IPv4 as the dot-separated OID index fragment it becomes in a
+  // table keyed by an IpAddress (each octet is one sub-identifier).
+  function ipToOidIndex(ip) { return String(ip || '').split('.').map((o) => parseInt(o, 10)).join('.'); }
+  // Encode a string as a length-prefixed OID index fragment (DnsNameAsIndex etc).
+  // DnsNameAsIndex (the real Cisco DNS table index, decoded from switch-created
+  // rows): <total-length> . <DNS wire-format name>. DNS wire format is, per label,
+  // <label-length><label-bytes>, terminated by a 0 byte. So "example" becomes
+  // 9.7.101.120.97.109.112.108.101.0  (9 = length of "7example\0"), and
+  // "internal.example.com" becomes 20.8.i..7.example.3.com.0. An earlier flat-ASCII
+  // encoding (dots as literal bytes) was rejected by the switch with
+  // NotWritable/NoCreation; these encode/decode the real DnsNameAsIndex format.
+  function dnsNameIndex(name) {
+    const labels = String(name || '').split('.').filter((l) => l.length);
+    const wire = [];
+    for (const lab of labels) { wire.push(lab.length); for (const ch of lab) wire.push(ch.charCodeAt(0)); }
+    wire.push(0);                       // root terminator
+    return [wire.length].concat(wire).join('.');   // total-length prefix + wire bytes
+  }
+  // Inverse: the leading DnsNameAsIndex portion of an OID index back to a name.
+  // Returns { name, rest } where rest is the array of index sub-ids after the name
+  // (e.g. the host table's Owner.Index), or null if it does not parse.
+  function dnsNameIndexParse(idx) {
+    const parts = String(idx || '').split('.').map((n) => parseInt(n, 10));
+    if (parts.length < 2 || !Number.isFinite(parts[0])) return null;
+    const total = parts[0];
+    const wire = parts.slice(1, 1 + total);
+    if (wire.length < total) return null;
+    const labels = []; let i = 0;
+    while (i < wire.length) {
+      const l = wire[i];
+      if (l === 0) break;
+      if (!Number.isFinite(l) || i + 1 + l > wire.length) return null;
+      labels.push(wire.slice(i + 1, i + 1 + l).map((c) => String.fromCharCode(c)).join(''));
+      i += 1 + l;
+    }
+    return { name: labels.join('.'), rest: parts.slice(1 + total) };
+  }
+  function dnsNameIndexToStr(idx) { const r = dnsNameIndexParse(idx); return r ? r.name : String(idx || ''); }
+
+  function paintRoutingPanel(s, body, p) {
+    if (!s._ktReconcile) clear(body);
+    const h = s.health;
+    const dv = (c, fb) => (c == null ? (fb !== undefined ? fb : '') : (c.display !== undefined && c.display !== null ? c.display : (c.value !== undefined ? c.value : c)));
+    const num = (c) => { const v = c && (c.value !== undefined ? c.value : c.display); const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
+
+    if (!h) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Waiting for data\u2026')); return; }
+
+    // Load the module's on-demand tables once per visit (standard §4). Skip while
+    // reconciling (we are mid-paint) to avoid re-entrancy.
+    if (!s._ktReconcile) ensureRoutingLoaded(s);
+
+    // Scaffolding helper (standard §2): builds a section title + optional add
+    // control, and is a no-op during a reconcile pass so the keyed tables diff
+    // in place without the panel being torn down.
+    const section = (title, note, addLabel, onAdd) => {
+      if (s._ktReconcile) return;
+      const st = el('div', 'section-title', title);
+      if (note) st.appendChild(el('span', 'st-note', note));
+      body.appendChild(st);
+      if (addLabel && s.target) body.appendChild(addControl(addLabel, onAdd));
+    };
+    const emptyNote = (msg) => { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', msg)); };
+    const refresh = () => routingRefresh(s);   // single shared refresh (standard §5)
+
+    // ---- Global L3 status ----
+    // The pill reads a scalar, so its VALUE can change on a reconcile even though
+    // its DOM structure does not. Build the container once (full paint) and keep
+    // a handle on it; refresh its contents every pass (including reconcile) so
+    // the status updates in place without a structural change (no scroll jump).
+    if (!s._ktReconcile) {
+      section('Global L3 status');
+      p._l3Line = el('div', 'card-sub');
+      body.appendChild(p._l3Line);
+    }
+    if (p._l3Line) {
+      const fwd = num(h.scalars && h.scalars.ipForwarding);
+      clear(p._l3Line);
+      p._l3Line.appendChild(el('span', 'pill ' + (fwd === 1 ? 'good' : 'idle'), fwd === 1 ? 'IP routing ON' : (fwd === 2 ? 'IP routing OFF' : 'unknown')));
+    }
+
+    // ---- Routing table (read-only, paginated) ----
+    const routes = (h.routeTable || []);
+    section('Routing table', routes.length ? routes.length + ' route(s)' : 'none');
+    if (routes.length) {
+      const rrows = routes.map((r) => {
+        const dest = dv(r.ipCidrRouteDest), mask = dv(r.ipCidrRouteMask), nh = dv(r.ipCidrRouteNextHop);
+        return { key: 'rt:' + dest + '/' + mask + '>' + nh, cells: [
+          { v: dest }, { v: mask }, { v: nh || '\u2014' }, { v: dv(r.ipCidrRouteIfIndex) },
+          { v: ROUTE_PROTO[num(r.ipCidrRouteProto)] || dv(r.ipCidrRouteProto) },
+          { v: ROUTE_TYPE[num(r.ipCidrRouteType)] || dv(r.ipCidrRouteType) } ] };
+      });
+      mountInto(body, s, p, 'routeTable',
+        ['Destination', 'Mask', 'Next hop', 'Interface', 'Protocol', 'Type'], rrows, { pageSize: 50 });
+    } else { emptyNote('No routes reported.'); }
+
+    // ---- Static routes (editable) ----
+    const statics = (h.staticRoutes || []);
+    section('Static routes', statics.length ? statics.length + ' configured' : '', 'Add static route', () => openStaticRouteForm(s));
+    if (statics.length) {
+      const srows = statics.map((r) => {
+        const dest = dv(r.rlIpStaticRouteDest), mask = dv(r.rlIpStaticRouteMask), nh = dv(r.rlIpStaticRouteNextHop);
+        const cells = [
+          { v: dest }, { v: mask }, { v: nh || '\u2014' },
+          { v: STATIC_ROUTE_TYPE[num(r.rlIpStaticRouteType)] || dv(r.rlIpStaticRouteType) },
+          { v: dv(r.rlIpStaticRouteMetric) },
+          { pill: true, v: num(r.rlIpStaticRouteForwardingStatus) === 1 ? 'active' : 'inactive' } ];
+        if (s.target) {
+          const risk = routeDeleteRisk(s, dest, mask, nh);
+          if (risk) {
+            // Locked: deleting this route could cut the app's SNMP path. Show a
+            // disabled control with the reason, same protection as the mgmt SVI.
+            const locked = el('span', 'card-sub'); locked.textContent = '\uD83D\uDD12 locked'; locked.title = risk;
+            cells.push({ cellNode: locked, sig: 'locked' });
+          } else {
+            const del = actGroup([actBtnConfirm('Delete', (e) => {
+              runButtonAction(e.currentTarget, {
+                failLabel: 'Delete route',
+                run: () => rowStatusDelete(s, DNS_ROUTE.srRowStatus + '.' + ipToOidIndex(dest) + '.' + ipToOidIndex(mask) + '.0.' + ipToOidIndex(nh)),
+                ok: (res) => res && res.ok && !(res.body && res.body.error),
+                onApplied: () => markConfigDirty(s), settle: () => routingRefresh(s)
+              });
+            }, 'danger', 'Delete static route ' + dest)]);
+            cells.push({ cellNode: del, sig: 'del' });
+          }
+        }
+        return { key: 'sr:' + dest + '/' + mask + '>' + nh, cells: cells };
+      });
+      const cols = ['Destination', 'Mask', 'Next hop', 'Type', 'Metric', 'Status'].concat(s.target ? [''] : []);
+      mountInto(body, s, p, 'staticRoutes', cols, srows);
+    } else { emptyNote('No static routes configured.'); }
+
+    // ---- DNS client status ----
+    // Same as L3 status: a scalar-driven pill + a toggle whose label depends on
+    // the scalar. Stable container built once; contents refreshed every pass so
+    // the pill and the toggle label update in place after a toggle write.
+    if (!s._ktReconcile) {
+      section('DNS client');
+      p._dnsRow = el('div', 'tbl-add');
+      body.appendChild(p._dnsRow);
+    }
+    if (p._dnsRow) {
+      const en = num(h.scalars && h.scalars.rlDnsClEnable);
+      clear(p._dnsRow);
+      if (s.target) {
+        // The button label and its colour carry the state: Disable (red = this
+        // action turns a thing off) when on, Enable (green = default action) when
+        // off. No separate status pill - the button already says which way it goes.
+        const on = en === 1;
+        const toggle = el('button', 'btn btn-small' + (on ? ' btn-danger' : ''), on ? 'Disable DNS' : 'Enable DNS'); toggle.type = 'button';
+        toggle.addEventListener('click', (e) => {
+          runButtonAction(e.currentTarget, {
+            failLabel: 'DNS toggle',
+            run: () => snmpSetResult(s, { oid: DNS_ROUTE.dnsEnable + '.0', type: 'Integer', value: on ? 2 : 1 }),
+            ok: (res) => res && res.ok && !(res.body && res.body.error),
+            onApplied: () => markConfigDirty(s), settle: () => refresh()
+          });
+        });
+        p._dnsRow.appendChild(toggle);
+      }
+    }
+
+    // ---- DNS domains / search suffixes (editable) ----
+    const domains = (h.dnsDomains || []);
+    section('Domain / search list', domains.length ? domains.length + ' entries' : '', 'Add domain', () => openDnsDomainForm(s));
+    if (domains.length) {
+      const drows = domains.map((r) => {
+        const name = dnsNameIndexToStr(dv(r.index));   // domain name is the DnsNameAsIndex
+        const cells = [{ v: name }];
+        if (s.target && r.index) {
+          // Delete by the row's authoritative index (what the switch stores),
+          // consistent with the host and nameserver deletes.
+          const del = actGroup([actBtnConfirm('Delete', (e) => {
+            runButtonAction(e.currentTarget, {
+              failLabel: 'Delete domain',
+              run: () => rowStatusDelete(s, DNS_ROUTE.domRowStatus + '.' + r.index),
+              ok: (res) => res && res.ok && !(res.body && res.body.error),
+              onApplied: () => markConfigDirty(s), settle: () => routingRefresh(s)
+            });
+          }, 'danger', 'Delete domain ' + name)]);
+          cells.push({ cellNode: del, sig: 'del' });
+        }
+        return { key: 'dom:' + (r.index || name), cells: cells };
+      });
+      mountInto(body, s, p, 'dnsDomains', ['Domain'].concat(s.target ? [''] : []), drows);
+    }
+
+    // ---- Nameservers (static sbelt + DHCP-learned) ----
+    // Nameservers come from the DNS-client-v2 servers table (93.15) - the table
+    // the CLI "ip name-server" uses and the only one whose RowStatus delete the
+    // switch accepts. Everything is in the row index (address, source 1=static /
+    // 3=dhcpv6 / 4=dhcpv4, preference); only RowStatus is a readable value.
+    const serversV2 = (h.dnsServersV2 || []);
+    section('Nameservers', serversV2.length + ' total', 'Add nameserver', () => openNameserverForm(s));
+    if (serversV2.length) {
+      const nrows = [];
+      serversV2.forEach((r, i) => {
+        const info = dnsV2ServerIndex(r.index);
+        const addr = info ? info.addr : dv(r.index);
+        const isStatic = info ? info.source === 1 : true;    // 1=static, 3/4=dhcp
+        const source = (info && info.source !== 1) ? 'dhcp' : 'static';
+        const cells = [{ v: addr }, { v: source }, { v: info ? String(info.pref) : '' }];
+        if (s.target && r.index && isStatic) {
+          // Delete via the v2 RowStatus with the row's own index (rule 6: the
+          // authoritative index the switch stores). This is the path the switch
+          // accepts, unlike the sbelt table.
+          const del = actGroup([actBtnConfirm('Delete', (e) => {
+            runButtonAction(e.currentTarget, {
+              failLabel: 'Delete nameserver',
+              run: () => rowStatusDelete(s, DNS_ROUTE.v2ServerStatus + '.' + r.index),
+              ok: (res) => res && res.ok && !(res.body && res.body.error),
+              onApplied: () => markConfigDirty(s), settle: () => routingRefresh(s)
+            });
+          }, 'danger', 'Delete nameserver ' + addr)]);
+          cells.push({ cellNode: del, sig: 'del' });
+        } else if (s.target) {
+          // A dhcp-sourced server is switch-owned; no SNMP delete.
+          const locked = el('span', 'card-sub'); locked.textContent = '\uD83D\uDD12';
+          locked.title = 'DHCP-provided server (switch-owned) - remove it by changing DHCP.';
+          cells.push({ cellNode: locked, sig: 'locked' });
+        }
+        nrows.push({ key: 'ns:' + (r.index || addr) + ':' + i, cells: cells });
+      });
+      const cols = ['Address', 'Source', 'Pref'].concat(s.target ? [''] : []);
+      mountInto(body, s, p, 'nameservers', cols, nrows);
+    } else { emptyNote('No nameservers configured or learned.'); }
+
+    // ---- Static host mappings (editable) ----
+    const hosts = (h.dnsHosts || []);
+    section('Static host mappings', hosts.length ? hosts.length + ' entries' : '', 'Add host mapping', () => openDnsHostForm(s));
+    if (hosts.length) {
+      const hrows = hosts.map((r) => {
+        // The row's full index (DnsNameAsIndex . Owner . Index) is authoritative -
+        // use it for delete rather than reconstructing it. The readable name is the
+        // DnsNameAsIndex component at the front.
+        const name = dnsNameIndexToStr(dv(r.index));
+        const addr = dv(r.rlDnsClNamesAddr);
+        const cells = [{ v: name }, { v: addr }];
+        if (s.target && r.index) {
+          const del = actGroup([actBtnConfirm('Delete', (e) => {
+            runButtonAction(e.currentTarget, {
+              failLabel: 'Delete host',
+              run: () => rowStatusDelete(s, DNS_ROUTE.hostRowStatus + '.' + r.index),
+              ok: (res) => res && res.ok && !(res.body && res.body.error),
+              onApplied: () => markConfigDirty(s), settle: () => routingRefresh(s)
+            });
+          }, 'danger', 'Delete host mapping ' + name)]);
+          cells.push({ cellNode: del, sig: 'del' });
+        }
+        return { key: 'host:' + (r.index || name), cells: cells };
+      });
+      mountInto(body, s, p, 'dnsHosts', ['Host name', 'IP address'].concat(s.target ? [''] : []), hrows);
+    }
+  }
+
+  // --- Add-forms for the routing/DNS writes ---
+  // The single refresh for the routing/DNS module. Delegates to refreshTables -
+  // the canonical table-refresh path every other module uses - so it inherits
+  // the proven behavior: it captures/restores scroll around the reconcile (no
+  // bounce), defers when a full collection or a write is already in flight (no
+  // colliding double-walk), reconciles the keyed panel in place, and returns a
+  // promise that resolves once the UI has reflected the change (so a button
+  // action spins until then). The module's tables are on-demand, which only
+  // means they are not in the periodic walk; an explicit refreshTables request
+  // fetches them normally. Marking _routingFetchedAt keeps the panel's lazy-load
+  // guard from firing a redundant fetch on the reconcile paint.
+  // Includes 'scalars' so the global L3 status and DNS-client status (both read
+  // from scalars, not tables) update after a toggle - refreshTables merges the
+  // scalar batch and the reconcile below repaints the scalar sections.
+  const ROUTING_TABLES = ['routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'];
+  function routingRefresh(s) {
+    if (!s.target) return Promise.resolve();
+    s._routingFetchedAt = Date.now();
+    return refreshTables(s, ROUTING_TABLES);
+  }
+  // One-per-visit on-demand loader (standard §4): guard with both an in-flight
+  // flag and a 30s timestamp so an empty result does not re-fetch every repaint.
+  function ensureRoutingLoaded(s) {
+    if (s._routingFetching || !s.target) return;
+    if (Date.now() - (s._routingFetchedAt || 0) < 30000) return;
+    s._routingFetching = true;
+    routingRefresh(s).then(() => { s._routingFetching = false; },
+                          () => { s._routingFetching = false; });
+  }
+
+  // Would deleting this static route risk cutting the app's own SNMP path to the
+  // switch? True for the default route (0.0.0.0/0) - the usual way off-subnet
+  // traffic (including ours, when the app is not on the switch's local subnet)
+  // leaves the switch - and for any route whose destination network contains the
+  // management IP we are talking to. Those routes get their Delete locked, the
+  // same protection VLAN delete gives the management SVI. Returns a reason string
+  // to show, or '' if the route is safe to delete.
+  function routeDeleteRisk(s, dest, mask, nextHop) {
+    const host = s && s.target && s.target.host;
+    if (!host) return '';
+    const toInt = (ip) => { const o = String(ip || '').split('.').map((n) => parseInt(n, 10)); return (o.length === 4 && o.every((n) => n >= 0 && n <= 255)) ? ((o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3]) >>> 0 : null; };
+    const d = toInt(dest), m = toInt(mask), h = toInt(host);
+    // The default route: destination and mask both 0.0.0.0.
+    if (d === 0 && m === 0) return 'the default route (0.0.0.0/0) carries this app\u2019s traffic to the switch; deleting it could cut off SNMP access, so it is locked.';
+    // A route whose network contains the management IP (dest == host & mask).
+    if (d != null && m != null && h != null && (h & m) === (d & m) && m !== 0) {
+      return 'this route covers the management IP (' + host + ') this app uses to reach the switch; deleting it could cut off access, so it is locked.';
+    }
+    return '';
+  }
+
+  // DNS write diagnostic. Every DNS write path (domain add, host add, nameserver
+  // delete) is failing with a different SNMP error (NotWritable / NoCreation /
+  // CommitFailed) even though the OIDs match the MIB, so rather than keep
+  // inferring index structure we dump what the switch actually HAS: walk each DNS
+  // subtree and print every raw OID suffix and value. The report shows the exact
+  // index the switch uses for each existing row, which is what a create/delete
+  // must match. Reuses /api/snmp/walk and the download() helper (no new endpoint).
+
+  // Nameserver DELETE probe. The MIB says sbelt rows ARE deletable via SNMP
+  // (confirmed by reading CISCOSB-dnscl.mib and rfc1612.mib), and the host-map
+  // delete works on this firmware - yet destroy(6) on the sbelt row returns
+  // CommitFailed. Rather than guess the right teardown, this tries each documented
+  // variant in order, stops at the first that succeeds, and reports every result,
+  // so the next run tells us exactly which delete path the switch accepts. It
+  // targets ONE nameserver by address; if a variant succeeds the server is removed
+  // (the desired outcome), if all fail the row is left intact.
+
+  function openStaticRouteForm(s) {
+    const tabs = [{ label: 'Add static route', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const { sec, body } = formSection('Static route');
+      const destIn = el('input'); destIn.type = 'text'; destIn.placeholder = '0.0.0.0 (destination network)';
+      const maskIn = el('input'); maskIn.type = 'text'; maskIn.placeholder = '0.0.0.0 (mask)';
+      const nhIn = el('input'); nhIn.type = 'text'; nhIn.placeholder = 'next-hop IP';
+      const metricIn = el('input'); metricIn.type = 'number'; metricIn.min = '1'; metricIn.value = '1';
+      body.appendChild(field('Destination', destIn));
+      body.appendChild(field('Mask', maskIn));
+      body.appendChild(field('Next hop', nhIn));
+      body.appendChild(field('Metric', metricIn));
+      form.appendChild(sec);
+      const msg = el('div', 'port-detail-msg');
+      const apply = el('button', 'btn btn-small btn-blue', 'Add route'); apply.type = 'button';
+      apply.addEventListener('click', (e) => {
+        const dest = destIn.value.trim(), mask = maskIn.value.trim(), nh = nhIn.value.trim();
+        const metric = parseInt(metricIn.value, 10) || 1;
+        if (!/^\d+\.\d+\.\d+\.\d+$/.test(dest) || !/^\d+\.\d+\.\d+\.\d+$/.test(mask) || !/^\d+\.\d+\.\d+\.\d+$/.test(nh)) {
+          clear(msg); msg.appendChild(el('div', 'sw-err', 'Destination, mask and next hop must all be valid IPv4 addresses.')); return;
+        }
+        // Index = dest.mask.tos(0).nextHop; createAndGo(4) with type remote(4).
+        const suffix = ipToOidIndex(dest) + '.' + ipToOidIndex(mask) + '.0.' + ipToOidIndex(nh);
+        runButtonAction(e.currentTarget, {
+          failLabel: 'Add route',
+          run: () => snmpSetResult(s, [
+            { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.6.' + suffix, type: 'Integer', value: 4 },   // type=remote
+            { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.5.' + suffix, type: 'Integer', value: metric },
+            { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.9.' + suffix, type: 'Integer', value: 4 }    // RowStatus createAndGo
+          ]),
+          ok: (res) => res && res.ok && !(res.body && res.body.error),
+          onApplied: () => markConfigDirty(s),
+          settle: () => routingRefresh(s).then(() => close())
+        });
+      });
+      const row = el('div', 'tbl-add'); row.appendChild(apply);
+      form.appendChild(row); form.appendChild(msg);
+      pane.appendChild(form);
+    } }];
+    openTabbedPopout(s, 'Add static route', tabs, []);
+  }
+
+  function openDnsDomainForm(s) {
+    const tabs = [{ label: 'Add domain', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const { sec, body } = formSection('Domain / search suffix');
+      const nameIn = el('input'); nameIn.type = 'text'; nameIn.placeholder = 'example.com';
+      body.appendChild(field('Domain name', nameIn));
+      form.appendChild(sec);
+      const msg = el('div', 'port-detail-msg');
+      const apply = el('button', 'btn btn-small btn-blue', 'Add domain'); apply.type = 'button';
+      apply.addEventListener('click', (e) => {
+        const name = nameIn.value.trim();
+        if (!name) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a domain name.')); return; }
+        const suffix = dnsNameIndex(name);
+        runButtonAction(e.currentTarget, {
+          failLabel: 'Add domain',
+          // Set the mandatory Owner column WITH createAndGo in one PDU - a bare
+          // RowStatus set returns NotWritable (the diagnostic showed the add of a
+          // nameserver only worked when its columns were set together). Owner
+          // static(1) marks it a user-defined entry.
+          run: () => snmpSetResult(s, [
+            { oid: DNS_ROUTE.domOwner + '.' + suffix, type: 'Integer', value: 1 },       // Owner = static
+            { oid: DNS_ROUTE.domRowStatus + '.' + suffix, type: 'Integer', value: 4 }     // createAndGo
+          ]),
+          ok: (res) => res && res.ok && !(res.body && res.body.error),
+          onApplied: () => markConfigDirty(s),
+          settle: () => routingRefresh(s).then(() => close())
+        });
+      });
+      const row = el('div', 'tbl-add'); row.appendChild(apply);
+      form.appendChild(row); form.appendChild(msg);
+      pane.appendChild(form);
+    } }];
+    openTabbedPopout(s, 'Add domain', tabs, []);
+  }
+
+  function openNameserverForm(s) {
+    const tabs = [{ label: 'Add nameserver', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const { sec, body } = formSection('Nameserver');
+      const addrIn = el('input'); addrIn.type = 'text'; addrIn.placeholder = '8.8.8.8';
+      body.appendChild(field('Server IP', addrIn));
+      form.appendChild(sec);
+      const msg = el('div', 'port-detail-msg');
+      const apply = el('button', 'btn btn-small btn-blue', 'Add nameserver'); apply.type = 'button';
+      apply.addEventListener('click', (e) => {
+        const addr = addrIn.value.trim();
+        const nsIdx = nameserverIndex(addr);
+        if (!nsIdx) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
+        // rlDnsResConfigSbeltInetTable: create the row with its rc columns set in
+        // the SAME PDU as createAndGo - a bare RowStatus set returns
+        // InconsistentValue because the mandatory columns are not yet populated.
+        // Pref 0 (default), Name = root ".".
+        runButtonAction(e.currentTarget, {
+          failLabel: 'Add nameserver',
+          run: () => snmpSetResult(s, [
+            { oid: DNS_ROUTE.nsInetName + '.' + nsIdx, type: 'OctetString', value: '.' },
+            { oid: DNS_ROUTE.nsInetPref + '.' + nsIdx, type: 'Integer', value: 0 },
+            { oid: DNS_ROUTE.nsInetStatus + '.' + nsIdx, type: 'Integer', value: 4 }   // createAndGo
+          ]),
+          ok: (res) => res && res.ok && !(res.body && res.body.error),
+          onApplied: () => markConfigDirty(s),
+          settle: () => routingRefresh(s).then(() => close())
+        });
+      });
+      const row = el('div', 'tbl-add'); row.appendChild(apply);
+      form.appendChild(row); form.appendChild(msg);
+      pane.appendChild(form);
+    } }];
+    openTabbedPopout(s, 'Add nameserver', tabs, []);
+  }
+
+  function openDnsHostForm(s) {
+    const tabs = [{ label: 'Add host mapping', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const { sec, body } = formSection('Static host mapping');
+      const nameIn = el('input'); nameIn.type = 'text'; nameIn.placeholder = 'hostname';
+      const addrIn = el('input'); addrIn.type = 'text'; addrIn.placeholder = '10.0.0.5';
+      body.appendChild(field('Host name', nameIn));
+      body.appendChild(field('IP address', addrIn));
+      form.appendChild(sec);
+      const msg = el('div', 'port-detail-msg');
+      const apply = el('button', 'btn btn-small btn-blue', 'Add mapping'); apply.type = 'button';
+      apply.addEventListener('click', (e) => {
+        const name = nameIn.value.trim(), addr = addrIn.value.trim();
+        if (!name || !/^\d+\.\d+\.\d+\.\d+$/.test(addr)) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a host name and a valid IPv4 address.')); return; }
+        // rlDnsClNamesTable index = name . index(1). Set the address + createAndGo.
+        // Host index is DnsNameAsIndex . Owner . Index, exactly as the switch
+        // stores it (decoded from a switch-created row: <wire-name> . 1 . 0).
+        const suffix = dnsNameIndex(name) + '.1.0';
+        runButtonAction(e.currentTarget, {
+          failLabel: 'Add mapping',
+          run: () => snmpSetResult(s, [
+            { oid: '1.3.6.1.4.1.9.6.1.101.93.6.1.4.' + suffix, type: 'IpAddress', value: addr },
+            { oid: '1.3.6.1.4.1.9.6.1.101.93.6.1.5.' + suffix, type: 'Integer', value: 4 }   // createAndGo
+          ]),
+          ok: (res) => res && res.ok && !(res.body && res.body.error),
+          onApplied: () => markConfigDirty(s),
+          settle: () => routingRefresh(s).then(() => close())
+        });
+      });
+      const row = el('div', 'tbl-add'); row.appendChild(apply);
+      form.appendChild(row); form.appendChild(msg);
+      pane.appendChild(form);
+    } }];
+    openTabbedPopout(s, 'Add host mapping', tabs, []);
+  }
+
+
+  function paintVlanPanel(s, body, p) {
+    if (!s._ktReconcile) clear(body);
+    const h = s.health;
+    if (!h || !h.vlans || !h.vlans.length) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'No VLANs reported.')); return; }
+    const dv = (c, fb) => (c == null ? (fb !== undefined ? fb : '') : (c.display !== undefined && c.display !== null ? c.display : (c.value !== undefined ? c.value : c)));
+
+    // Map the VLAN id -> its SVI interface row (named after the VLAN id in the
+    // interface table), for oper status and IPv4.
+    const vlanIds = new Set(h.vlans.map((v) => String(v.index)));
+    const sviByVlan = new Map();
+    for (const r of (h.interfaces || [])) {
+      const nm = String(dv(r.rlifPresentName) || '').trim();
+      if (/^\d+$/.test(nm) && vlanIds.has(nm)) sviByVlan.set(nm, r);
+    }
+
+    if (!s._ktReconcile) {
+      const st = el('div', 'section-title', 'VLANs');
+      st.appendChild(el('span', 'st-note', h.vlans.length + ' defined'));
+      body.appendChild(st);
+      if (s.target) body.appendChild(addControl('New VLAN', () => openVlanCreate(s)));
+    }
+
+    const anySvi = sviByVlan.size > 0;
+    // SVI ifIndex -> IPv4 "addr/mask", from rsIpAddrTable (owner static/dhcp, real IPs).
+    const ipByIfIndex = new Map();
+    const cellVal = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
+    for (const a of (h.sviAddrs || [])) {
+      const owner = parseInt(cellVal(a.rsIpAdEntOwner), 10);
+      if (owner !== 1 && owner !== 2) continue;
+      const ifx = String(cellVal(a.rsIpAdEntIfIndex)); const ip = String(a.index);
+      if (!ifx) continue;
+      if (owner === 2) ipByIfIndex.set(ifx, isRealIp(ip) ? (ip + ' (DHCP)') : 'DHCP (no lease)');
+      else if (isRealIp(ip)) {
+        const mask = String(cellVal(a.rsIpAdEntNetMask) || '');
+        const pref = mask ? ((mask.split('.').reduce((n, o) => n + ((parseInt(o, 10) || 0).toString(2).match(/1/g) || []).length, 0)) || '') : '';
+        ipByIfIndex.set(ifx, pref ? ip + '/' + pref : ip);
+      }
+    }
+    const vlanIp = (vlanIndex) => { const svi = sviByVlan.get(String(vlanIndex)); return svi ? (ipByIfIndex.get(String(svi.index)) || '') : ''; };
+
+    const cols = ['VLAN', 'Name', 'Members', 'Untagged ports', 'Tagged ports']
+      .concat(anySvi ? ['Interface', 'IPv4'] : [])
+      .concat(s.target ? [''] : []);
+    // VLANs that just changed should flash (one-shot).
+    const flashVids = new Set();
+    if (s._vlanFlash != null) flashVids.add(Number(s._vlanFlash));
+    if (s._vlanFlashSet) for (const v of s._vlanFlashSet) flashVids.add(Number(v));
+    s._vlanFlash = null; s._vlanFlashSet = null;
+
+    const krows = h.vlans.map((r) => {
+      const vid = Number(r.index);
+      const svi = sviByVlan.get(String(r.index)) || null;
+      const base = [
+        { v: String(r.index), click: s.target ? { open: () => openVlanEditor(s, { id: vid, name: dv(r.name), svi }) } : undefined },
+        { v: dv(r.name) }, { v: dv(r.memberCount) }, { v: dv(r.untagged) }, { v: dv(r.tagged) }
+      ];
+      const withSvi = anySvi
+        ? base.concat([{ v: (sviByVlan.get(String(r.index)) ? dv(sviByVlan.get(String(r.index)).rlifPresentOperStatus) : '') }, { v: vlanIp(r.index) || '\u2014' }])
+        : base;
+      let cells = withSvi;
+      if (s.target) {
+        const delNode = vid !== 1
+          ? actGroup([actBtnConfirm('Delete', (e) => {
+              runButtonAction(e.currentTarget, {
+                failLabel: 'Delete VLAN',
+                run: () => deleteVlan(s, vid).then((res) => ({ ok: res.ok, body: { error: res.error } })),
+                error: (res) => (res && res.body && res.body.error) || 'the switch rejected it',
+                onApplied: () => markConfigDirty(s),
+                settle: () => refreshVlanPanels(s)
+              });
+            }, 'danger', 'Delete VLAN ' + vid)])
+          : el('span', '');
+        cells = withSvi.concat([{ cellNode: delNode, sig: 'del' + (vid === 1 ? '0' : '1') }]);
+      }
+      if (flashVids.has(vid) && cells[0]) cells[0] = Object.assign({}, cells[0], { _flash: true });
+      return { key: 'vlan:' + r.index, cells: cells };
+    });
+    mountInto(body, s, p, 'vlans', cols, krows);
+
+    // ===== Voice VLAN (CISCOSB-vlanvoice.mib) =====
+    const num = (c) => { const v = c && (c.value !== undefined ? c.value : c.display); const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
+    const sc = h.scalars || {};
+    const scn = (name) => num(sc[name]);
+    // A section title helper local to the voice sections (the VLAN table above
+    // builds its own title inline; these match that style via section-title).
+    const vsection = (title, note) => {
+      if (s._ktReconcile) return;
+      const stt = el('div', 'section-title', title);
+      if (note) stt.appendChild(el('span', 'st-note', note));
+      body.appendChild(stt);
+    };
+    const VOICE = {
+      adminState: '1.3.6.1.4.1.9.6.1.101.48.54.6',
+      adminVid:   '1.3.6.1.4.1.9.6.1.101.48.54.8',
+      autoVpt:    '1.3.6.1.4.1.9.6.1.101.48.54.11.1.1',
+      autoDscp:   '1.3.6.1.4.1.9.6.1.101.48.54.11.1.2',
+      ouiPriority:'1.3.6.1.4.1.9.6.1.101.48.54.12.1',
+      ouiRemark:  '1.3.6.1.4.1.9.6.1.101.48.54.12.2',
+      ouiAging:   '1.3.6.1.4.1.9.6.1.101.48.54.12.6',
+      ouiRowStatus:'1.3.6.1.4.1.9.6.1.101.48.54.12.4.1.3',
+      ouiDescr:   '1.3.6.1.4.1.9.6.1.101.48.54.12.4.1.2',
+      portEnable: '1.3.6.1.4.1.9.6.1.101.48.54.12.5.1.1'   // per-port Enable (for the OUI->auto guard)
+    };
+    const VOICE_MODE = { 0: 'Disabled', 1: 'Auto (dynamic)', 2: 'Auto (triggered)', 3: 'OUI-based' };
+    const UC_TYPE = { 0: 'Default', 1: 'Static', 2: 'UC' };
+    const voiceRefresh = () => refreshVlanPanels(s, { voiceOnly: true });
+
+    // ---- Voice VLAN status (scalar, refreshed in place) ----
+    if (!s._ktReconcile) {
+      vsection('Voice VLAN');
+      p._voiceStatus = el('div', 'card-sub'); body.appendChild(p._voiceStatus);
+      if (s.target) { p._voiceControls = el('div', 'tbl-add'); body.appendChild(p._voiceControls); }
+    }
+    if (p._voiceStatus) {
+      clear(p._voiceStatus);
+      const adm = scn('vlanVoiceAdminState'), op = scn('vlanVoiceOperState');
+      const vid = scn('vlanVoiceAdminVid'), opvid = scn('vlanVoiceOperVid');
+      const cos = scn('vlanVoiceAutoOperVpt'), dscp = scn('vlanVoiceAutoOperDscp');
+      p._voiceStatus.appendChild(el('span', 'pill ' + (adm && adm !== 0 ? 'good' : 'idle'),
+        'Admin: ' + (VOICE_MODE[adm] || 'unknown')));
+      const bits = [];
+      bits.push('Oper: ' + (VOICE_MODE[op] || 'unknown'));
+      if (vid != null) bits.push('VLAN ' + vid + (opvid != null && opvid !== vid ? ' (oper ' + opvid + ')' : ''));
+      if (cos != null) bits.push('CoS ' + cos);
+      if (dscp != null) bits.push('DSCP ' + dscp);
+      p._voiceStatus.appendChild(document.createTextNode('  \u00b7  ' + bits.join('  \u00b7  ')));
+    }
+    if (p._voiceControls) {
+      clear(p._voiceControls);
+      const adm = scn('vlanVoiceAdminState');
+      const modeSel = el('select', 'sw-mini-select');
+      for (const v of [0, 1, 2, 3]) { const o = el('option', '', VOICE_MODE[v]); o.value = String(v); if (v === adm) o.selected = true; modeSel.appendChild(o); }
+      // Voice VLAN ID + CoS + DSCP editors (compact).
+      const vidIn = el('input'); vidIn.type = 'number'; vidIn.min = '1'; vidIn.max = '4094'; vidIn.style.width = '70px';
+      vidIn.value = String(scn('vlanVoiceAdminVid') || '');
+      const cosIn = el('input'); cosIn.type = 'number'; cosIn.min = '0'; cosIn.max = '7'; cosIn.style.width = '52px';
+      cosIn.value = String(scn('vlanVoiceAutoAdminVpt') || '0');
+      const dscpIn = el('input'); dscpIn.type = 'number'; dscpIn.min = '0'; dscpIn.max = '63'; dscpIn.style.width = '58px';
+      dscpIn.value = String(scn('vlanVoiceAutoAdminDscp') || '0');
+      const applyCfg = el('button', 'btn btn-small btn-blue', 'Apply'); applyCfg.type = 'button'; applyCfg.style.marginLeft = '6px';
+      applyCfg.addEventListener('click', (e) => {
+        const curMode = scn('vlanVoiceAdminState');
+        const mode = parseInt(modeSel.value, 10);
+        const vid = parseInt(vidIn.value, 10), cos = parseInt(cosIn.value, 10), dscp = parseInt(dscpIn.value, 10);
+        // Non-mode settings (VLAN/CoS/DSCP) that changed.
+        const cfgVbs = [];
+        if (Number.isFinite(vid) && vid >= 1 && vid <= 4094 && vid !== scn('vlanVoiceAdminVid')) cfgVbs.push({ oid: VOICE.adminVid + '.0', type: 'Integer', value: vid });
+        if (Number.isFinite(cos) && cos >= 0 && cos <= 7 && cos !== scn('vlanVoiceAutoAdminVpt')) cfgVbs.push({ oid: VOICE.autoVpt + '.0', type: 'Integer', value: cos });
+        if (Number.isFinite(dscp) && dscp >= 0 && dscp <= 63 && dscp !== scn('vlanVoiceAutoAdminDscp')) cfgVbs.push({ oid: VOICE.autoDscp + '.0', type: 'Integer', value: dscp });
+        const modeChanged = Number.isFinite(mode) && mode !== curMode;
+        if (!modeChanged && !cfgVbs.length) return;
+        runButtonAction(e.currentTarget, {
+          failLabel: 'Apply Voice VLAN settings',
+          run: async () => {
+            if (modeChanged) {
+              // Leaving OUI-based for an auto mode requires no ports still be
+              // candidates in the Voice VLAN - remove them first. Auto modes are
+              // 1 (auto-enabled) and 2 (auto-triggered); OUI is 3.
+              if (curMode === 3 && (mode === 1 || mode === 2)) {
+                const walk = await apiPost('/api/snmp/walk', { target: s.target, oid: VOICE.portEnable, mode: 'getbulk' }).catch(() => null);
+                const rows = (walk && walk.body && walk.body.results) || [];
+                const enabled = rows.filter((r) => { const v = r.value && (r.value.value !== undefined ? r.value.value : r.value); return parseInt(v, 10) === 1; }).length;
+                if (enabled > 0) return { ok: false, body: { error: 'Remove all ' + enabled + ' port(s) from the Voice VLAN before switching to an auto mode (set each port\u2019s Voice VLAN to Disabled first).' } };
+              }
+              // A direct swap between two active modes isn't accepted; the switch
+              // requires passing through Disabled. Set Disabled first, then target.
+              if (curMode !== 0 && mode !== 0) {
+                const r0 = await snmpSetResult(s, { oid: VOICE.adminState + '.0', type: 'Integer', value: 0 });
+                if (!(r0 && r0.ok) || (r0.body && r0.body.error)) return r0;
+              }
+              const rm = await snmpSetResult(s, { oid: VOICE.adminState + '.0', type: 'Integer', value: mode });
+              if (!(rm && rm.ok) || (rm.body && rm.body.error)) return rm;
+            }
+            if (cfgVbs.length) return snmpSetResult(s, cfgVbs);
+            return { ok: true, body: {} };
+          },
+          ok: (res) => res && res.ok && !(res.body && res.body.error),
+          error: (res) => (res && res.body && res.body.error) || 'the switch rejected it',
+          onApplied: () => markConfigDirty(s), settle: () => voiceRefresh()
+        });
+      });
+      p._voiceControls.appendChild(el('span', 'sw-mini-label', 'Mode')); p._voiceControls.appendChild(modeSel);
+      p._voiceControls.appendChild(el('span', 'sw-mini-label', 'VLAN')); p._voiceControls.appendChild(vidIn);
+      p._voiceControls.appendChild(el('span', 'sw-mini-label', 'CoS')); p._voiceControls.appendChild(cosIn);
+      p._voiceControls.appendChild(el('span', 'sw-mini-label', 'DSCP')); p._voiceControls.appendChild(dscpIn);
+      p._voiceControls.appendChild(applyCfg);
+    }
+
+    // ---- Voice VLAN local source table (read-only) ----
+    const locals = (h.voiceLocalSrc || []);
+    if (locals.length) {
+      vsection('Voice VLAN local source', locals.length + ' entries');
+      const lrows = locals.map((r) => {
+        return { key: 'vsrc:' + r.index, cells: [
+          { v: UC_TYPE[num(r.vlanVoiceUcDeviceType)] || dv(r.vlanVoiceUcDeviceType) },
+          { v: dv(r.vlanVoiceUcDeviceMacAddress) || 'N/A' },
+          { v: dv(r.vlanVoiceUcDeviceInterface) || 'N/A' },
+          { v: dv(r.vlanVoiceUcDeviceVid) },
+          { v: dv(r.vlanVoiceUcDeviceVpt) },
+          { v: dv(r.vlanVoiceUcDeviceDscp) },
+          { v: num(r.vlanVoiceUcDeviceIsBest) === 1 ? 'Yes' : 'No' } ] };
+      });
+      mountInto(body, s, p, 'voiceLocalSrc', ['Type', 'Source MAC', 'Interface', 'VLAN', 'CoS', 'DSCP', 'Best'], lrows);
+    }
+
+    // ---- Telephony OUI table + settings: only in OUI mode (adminState=3) ----
+    // The OUI sections are structural scaffold, so a mode change that crosses the
+    // OUI boundary must rebuild them. On a reconcile the scaffold isn't re-run, so
+    // if visibility changed since the last full paint, request a full repaint.
+    const ouiMode = (scn('vlanVoiceAdminState') === 3);
+    if (s._ktReconcile && p._voiceOuiShown !== ouiMode) { repaintPanel(s, 'vlans'); return; }
+    p._voiceOuiShown = ouiMode;
+    if (!ouiMode) { p._voiceOuiCfg = null; }
+    if (ouiMode) {
+    // ---- Telephony OUI table (editable) ----
+    const ouis = (h.voiceOUI || []);
+    vsection('Telephony OUI', ouis.length ? ouis.length + ' entries' : '');
+    if (!s._ktReconcile && s.target) body.appendChild(addControl('Add OUI', () => openVoiceOuiForm(s)));
+    if (ouis.length) {
+      const orows = ouis.map((r) => {
+        // Index is the 3-byte OUI prefix (OctetString). Decode to AA-BB-CC.
+        const prefix = ouiIndexToStr(r.index);
+        const descr = dv(r.vlanVoiceOUIBasedDescription);
+        const cells = [{ v: prefix }, { v: descr }];
+        if (s.target && r.index) {
+          const del = actGroup([actBtnConfirm('Delete', (e) => {
+            runButtonAction(e.currentTarget, {
+              failLabel: 'Delete OUI',
+              run: () => rowStatusDelete(s, VOICE.ouiRowStatus + '.' + r.index),
+              ok: (res) => res && res.ok && !(res.body && res.body.error),
+              onApplied: () => markConfigDirty(s), settle: () => voiceRefresh()
+            });
+          }, 'danger', 'Delete OUI ' + prefix)]);
+          cells.push({ cellNode: del, sig: 'del' });
+        }
+        return { key: 'oui:' + (r.index || prefix), cells: cells };
+      });
+      mountInto(body, s, p, 'voiceOUI', ['OUI prefix', 'Description'].concat(s.target ? [''] : []), orows);
+    } else if (!s._ktReconcile) { body.appendChild(el('div', 'card-sub', 'No OUI entries.')); }
+
+    // ---- OUI settings (scalars, refreshed in place) ----
+    if (!s._ktReconcile && s.target) {
+      vsection('OUI settings');
+      p._voiceOuiCfg = el('div', 'tbl-add'); body.appendChild(p._voiceOuiCfg);
+    }
+    if (p._voiceOuiCfg) {
+      clear(p._voiceOuiCfg);
+      const cos = scn('vlanVoiceOUIBasedAdminPriority'), remark = scn('vlanVoiceOUIBasedAdminRemark'), aging = scn('vlanVoiceOUIBasedAgingTimeout');
+      const cosIn = el('input'); cosIn.type = 'number'; cosIn.min = '0'; cosIn.max = '7'; cosIn.style.width = '52px'; cosIn.value = String(cos != null ? cos : 0);
+      const remarkChk = el('input'); remarkChk.type = 'checkbox'; remarkChk.checked = (remark === 1);
+      const agingIn = el('input'); agingIn.type = 'number'; agingIn.min = '1'; agingIn.max = '43200'; agingIn.style.width = '72px'; agingIn.value = String(aging != null ? aging : 1);
+      const apply = el('button', 'btn btn-small btn-blue', 'Apply'); apply.type = 'button'; apply.style.marginLeft = '6px';
+      apply.addEventListener('click', (e) => {
+        const nc = parseInt(cosIn.value, 10), na = parseInt(agingIn.value, 10), nr = remarkChk.checked ? 1 : 2;
+        const vbs = [];
+        if (Number.isFinite(nc) && nc >= 0 && nc <= 7 && nc !== cos) vbs.push({ oid: VOICE.ouiPriority + '.0', type: 'Integer', value: nc });
+        if (nr !== (remark === 1 ? 1 : 2)) vbs.push({ oid: VOICE.ouiRemark + '.0', type: 'Integer', value: nr });
+        if (Number.isFinite(na) && na >= 1 && na <= 43200 && na !== aging) vbs.push({ oid: VOICE.ouiAging + '.0', type: 'Integer', value: na });
+        if (!vbs.length) return;
+        runButtonAction(e.currentTarget, {
+          failLabel: 'Apply OUI settings',
+          run: () => snmpSetResult(s, vbs),
+          ok: (res) => res && res.ok && !(res.body && res.body.error),
+          onApplied: () => markConfigDirty(s), settle: () => voiceRefresh()
+        });
+      });
+      p._voiceOuiCfg.appendChild(el('span', 'sw-mini-label', 'CoS/802.1p')); p._voiceOuiCfg.appendChild(cosIn);
+      const rl = el('label', 'sw-mini-label', 'Remark CoS'); rl.style.marginLeft = '8px'; rl.appendChild(remarkChk); p._voiceOuiCfg.appendChild(rl);
+      p._voiceOuiCfg.appendChild(el('span', 'sw-mini-label', 'Aging (min)')); p._voiceOuiCfg.appendChild(agingIn);
+      p._voiceOuiCfg.appendChild(apply);
+    }
+    } // end if (ouiMode)
+  }
+
+  // ACL is a keyed panel (standard B1b): its three tables (aclNames/aclAces/
+  // aclTuples) are raw-mode health tables, loaded on demand and refreshed on the
+  // health cycle. The panel reads them via s._acl.{acls,aces,tuples} pointers set
+  // from s.health, so the existing client-side join (renderAclPanel) is unchanged.
+  const ACL_TABLES = ['aclNames', 'aclAces', 'aclTuples'];
+  function aclSyncFromHealth(s) {
+    s._acl = s._acl || {};
+    s._acl.acls = (s.health && s.health.aclNames) || [];
+    s._acl.aces = (s.health && s.health.aclAces) || [];
+    s._acl.tuples = (s.health && s.health.aclTuples) || [];
+  }
+  function aclRefresh(s) {
+    if (!s.target) return Promise.resolve();
+    s._aclFetchedAt = Date.now();
+    return refreshTables(s, ACL_TABLES);
+  }
+  function ensureAclLoaded(s) {
+    if (s._aclFetching || !s.target) return;
+    if (Date.now() - (s._aclFetchedAt || 0) < 30000) return;
+    s._aclFetching = true;
+    aclRefresh(s).then(() => { s._aclFetching = false; }, () => { s._aclFetching = false; });
+  }
+  function paintAclPanel(s, body) {
+    if (!s._ktReconcile) clear(body);
+    if (!s.target) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Add SNMP credentials for this switch first.')); return; }
+    s._acl = s._acl || {};
+    if (!s._ktReconcile) {
+      const root = el('div', 'acl-cfg');
+      body.appendChild(root);
+      s._acl.root = root;
+      ensureAclLoaded(s);
+    }
+    aclSyncFromHealth(s);
+    if (s._acl.root) renderAclPanel(s);
+  }
+
+  // --- QoS ACL tables (where this switch actually stores ACLs) ---
+  const QOS_ACL = {
+    // ACL table (88.7), indexed by aclIndex.
+    name:   '1.3.6.1.4.1.9.6.1.101.88.7.1.2',   // rlQosAclName
+    type:   '1.3.6.1.4.1.9.6.1.101.88.7.1.3',   // rlQosAclType (AclObjectType: mac1 ip2 ipv6 3)
+    aclStatus:'1.3.6.1.4.1.9.6.1.101.88.7.1.4', // rlQosAclStatus (RowStatus)
+    numAces:'1.3.6.1.4.1.9.6.1.101.88.7.1.5',
+    // ACE table (88.31), indexed by aclIndex.aceIndex.
+    aceTidx:'1.3.6.1.4.1.9.6.1.101.88.31',
+    aceAction:'1.3.6.1.4.1.9.6.1.101.88.31.1.3',  // rlQosAceTidxAction
+    aceType:'1.3.6.1.4.1.9.6.1.101.88.31.1.4',    // rlQosAceTidxType
+    aceTupleBase: '1.3.6.1.4.1.9.6.1.101.88.31.1.', // +col (5..15) for Tuple1..11
+    aceStatus:'1.3.6.1.4.1.9.6.1.101.88.31.1.14', // rlQosAceTidxStatus (RowStatus)
+    // Tuple table (88.5), indexed by tupleIndex.
+    tuple:  '1.3.6.1.4.1.9.6.1.101.88.5',
+    tupType:'1.3.6.1.4.1.9.6.1.101.88.5.1.2',   // rlQosTupleType (ClassTupleType)
+    tupVal1:'1.3.6.1.4.1.9.6.1.101.88.5.1.3',   // rlQosTupleValue1 (INTEGER)
+    tupVal2:'1.3.6.1.4.1.9.6.1.101.88.5.1.4',   // rlQosTupleValue2 (OctetString value||mask)
+    tupStatus:'1.3.6.1.4.1.9.6.1.101.88.5.1.5'  // rlQosTupleStatus (RowStatus)
+  };
+  // The Tuple column index for each ACE Tuple pointer (Tuple1..11 -> cols 5..15).
+  const ACE_TUPLE_COLS = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+  // Reverse maps for building writes.
+  const TUPLE_TYPE_VAL = { protocol: 1, 'ip-src': 2, 'ip-dest': 3, 'tcp-src': 8, 'tcp-dst': 9, 'udp-src': 6, 'udp-dst': 7, 'tcp-flags': 18 };
+  const ACE_ACTION_VAL = { permit: 1, deny: 2, 'deny-shutdown': 3, 'deny-log': 4, 'permit-log': 5 };
+  const ACE_TYPE_VAL = { ip: 1, 'ip-tcp': 2, 'ip-udp': 3 };
+  // ACE action enum (rlQosAceTidxAction / AceActionType), verified from the MIB.
+  const ACE_ACTION = { 1: 'permit', 2: 'deny', 3: 'deny-shutdown', 4: 'deny-log', 5: 'permit-log' };
+  // ACE type enum (AceObjectType).
+  const ACE_TYPE = { 1: 'ip', 2: 'ip-tcp', 3: 'ip-udp', 4: 'ip-offset', 5: 'mac', 6: 'mac-offset', 7: 'ip-icmp', 8: 'ip-igmp', 9: 'ipv6' };
+  // ClassTupleType -> field name.
+  const TUPLE_TYPE = { 1: 'protocol', 2: 'ip-src', 3: 'ip-dest', 4: 'dscp', 5: 'ip-prec',
+    6: 'udp-src', 7: 'udp-dst', 8: 'tcp-src', 9: 'tcp-dst', 10: 'mac-src', 11: 'mac-dest',
+    12: 'vlan', 13: 'in-port', 14: 'out-port', 17: 'ethertype', 18: 'tcp-flags',
+    19: 'icmp-type', 20: 'icmp-code', 23: 'ipv6-src', 24: 'ipv6-dest' };
+
+  // Build a lookup of tuple index -> { type, value1Hex, value2Hex }.
+  function buildTupleMap(tupleRows) {
+    const m = new Map();
+    for (const r of tupleRows) {
+      const ix = String(r.index);
+      if (!m.has(ix)) m.set(ix, {});
+      const t = m.get(ix);
+      const col = r.column || '';
+      if (/TupleType$/.test(col)) t.type = parseInt(aclNum(r), 10);
+      else if (/TupleValue1$/.test(col)) t.v1 = aclHex(r);
+      else if (/TupleValue2$/.test(col)) t.v2 = aclHex(r);
+    }
+    return m;
+  }
+  // Numeric value from a cell (strip "(n)" display formatting).
+  function aclNum(cell) { const s = String(dvc(cell)); const m = s.match(/\((\d+)\)/) || s.match(/^(\d+)/); return m ? m[1] : s; }
+  // Raw hex bytes from a cell's value/display.
+  function aclHex(cell) {
+    const s = String(cell && (cell.display !== undefined ? cell.display : cell.value) || '');
+    const hex = s.replace(/0x|\s|\(hex\)|:/gi, '');
+    return /^[0-9a-f]*$/i.test(hex) ? hex.toLowerCase() : '';
+  }
+  // Decode a tuple (type + value2 which holds value||mask) to a human string.
+  function decodeTuple(t) {
+    if (!t || t.type === undefined) return null;
+    const field = TUPLE_TYPE[t.type] || ('type' + t.type);
+    const hex = t.v2 || t.v1 || '';
+    // ip-src/ip-dest: 8 bytes = 4 value + 4 wildcard-mask.
+    if ((t.type === 2 || t.type === 3) && hex.length >= 8) {
+      const ip = [0, 2, 4, 6].map((i) => parseInt(hex.substr(i, 2), 16)).join('.');
+      let pref = 32;
+      if (hex.length >= 16) {
+        const wild = parseInt(hex.substr(8, 8), 16) >>> 0;
+        const net = (~wild) >>> 0;
+        pref = (net.toString(2).match(/1/g) || []).length;
+      }
+      return { field: t.type === 2 ? 'src' : 'dst', text: ip + '/' + pref };
+    }
+    // protocol: 1 byte value + 1 byte mask.
+    if (t.type === 1 && hex.length >= 2) {
+      const p = parseInt(hex.substr(0, 2), 16);
+      const names = { 1: 'icmp', 6: 'tcp', 17: 'udp' };
+      return { field: 'proto', text: names[p] || ('proto ' + p) };
+    }
+    // L4 ports.
+    if ((t.type >= 6 && t.type <= 9) && hex.length >= 2) {
+      const port = parseInt(hex.substr(0, 4) || hex.substr(0, 2), 16);
+      return { field: field, text: field + ' ' + port };
+    }
+    // tcp-flags: byte1 = value (1=Set, 0=Unset), byte2 = don't-care mask
+    // (1=don't care, 0=care). Verified against the switch UI: pnp "11 00" =
+    // ACK+FIN Set, the rest Unset, all cared about. Show only the flags we care
+    // about, with a + for Set and - for Unset.
+    if (t.type === 18 && hex.length >= 2) {
+      const val = parseInt(hex.substr(0, 2), 16);
+      const dc = hex.length >= 4 ? parseInt(hex.substr(2, 2), 16) : 0;
+      const parts = [];
+      for (const [name, bit] of TCP_FLAGS) { if (!(dc & bit)) parts.push((val & bit ? '+' : '-') + name); }
+      return { field: 'flags', text: parts.length ? ('flags ' + parts.join(' ')) : 'flags any' };
+    }
+    // Fallback: show the field name and raw hex.
+    return { field: field, text: field + '=' + hex };
+  }
+  // TCP flag bit layout and helpers.
+  const TCP_FLAGS = [['urg', 0x20], ['ack', 0x10], ['psh', 0x08], ['rst', 0x04], ['syn', 0x02], ['fin', 0x01]];
+  function tcpFlagNames(flags, mask) {
+    const out = [];
+    for (const [name, bit] of TCP_FLAGS) { if ((mask & bit) && (flags & bit)) out.push(name); }
+    return out;
+  }
+  // A routable unicast IPv4: first octet 1-223, not loopback/link-local. Rules
+  // out the 0.x / uninitialised placeholders a DHCP interface shows before it
+  // has a lease. Shared by the VLAN table and the IPv4 editor.
+  function isRealIp(ip) {
+    const o = String(ip).split('.').map(Number);
+    return o.length === 4 && o.every((n) => n >= 0 && n <= 255) && o[0] >= 1 && o[0] <= 223 && o[0] !== 127 && !(o[0] === 169 && o[1] === 254);
+  }
+
+  // "192.168.1.0/24" -> { any:false, ip:'192.168.1.0', pref:24 } for pre-filling.
+  function parseCidr(text) {
+    const m = String(text).match(/^(\d+\.\d+\.\d+\.\d+)\/(\d+)$/);
+    if (!m) return { any: true };
+    return { any: false, ip: m[1], pref: parseInt(m[2], 10) };
+  }
+  // A tcp-flags tuple -> { <flag>: 'set'|'unset'|'care' } per-flag state, from
+  // byte1 (value) and byte2 (don't-care mask).
+  function parseFlagsTuple(t) {
+    const hex = (t && (t.v2 || t.v1)) || '';
+    if (hex.length < 2) return null;
+    const val = parseInt(hex.substr(0, 2), 16);
+    const dc = hex.length >= 4 ? parseInt(hex.substr(2, 2), 16) : 0;
+    const out = {};
+    for (const [name, bit] of TCP_FLAGS) {
+      out[name] = (dc & bit) ? 'care' : (val & bit ? 'set' : 'unset');
+    }
+    return out;   // e.g. { ack:'set', fin:'set', urg:'unset', ... }
+  }
+
+  function renderAclPanel(s) {
+    const root = s._acl.root;
+    // ACL is a keyed panel: scroll is preserved by repaintPanel's scrollKeeper
+    // around the reconcile paint (standard A7), so this just clears and rebuilds.
+    clear(root);
+    // ACL names: index -> name.
+    const nameByIdx = new Map();
+    const typeByIdx = new Map();
+    for (const r of (s._acl.acls || [])) {
+      const col = r.column || '';
+      if (/QosAclName$/.test(col)) nameByIdx.set(String(r.index), String(dvc(r)));
+      else if (/QosAclType$/.test(col)) typeByIdx.set(String(r.index), aclNum(r));
+    }
+    // Tuple values.
+    const tupleMap = buildTupleMap(s._acl.tuples || []);
+    // ACEs grouped by ACL index. Each ACE index is "<aclIdx>.<aceIdx>".
+    const aceByAcl = new Map();   // aclIdx -> Map(aceIdx -> {action, type, tuples:[]})
+    for (const r of (s._acl.aces || [])) {
+      const parts = String(r.index).split('.');
+      if (parts.length < 2) continue;
+      const aclIdx = parts[0], aceIdx = parts.slice(1).join('.');
+      if (!aceByAcl.has(aclIdx)) aceByAcl.set(aclIdx, new Map());
+      const bucket = aceByAcl.get(aclIdx);
+      if (!bucket.has(aceIdx)) bucket.set(aceIdx, { tuples: [] });
+      const ace = bucket.get(aceIdx);
+      const col = r.column || '';
+      if (/TidxAction$/.test(col)) ace.action = parseInt(aclNum(r), 10);
+      else if (/TidxType$/.test(col)) ace.type = parseInt(aclNum(r), 10);
+      else if (/TidxTuple\d+$/.test(col)) { const p = parseInt(dvc(r), 10); if (p > 0) ace.tuples.push(String(p)); }
+    }
+
+
+    if (!nameByIdx.size) {
+      root.appendChild(el('div', 'card-sub', 'No access lists found.'));
+    }
+
+    for (const [aclIdx, name] of nameByIdx) {
+      const aces = aceByAcl.get(aclIdx) || new Map();
+      const aceList = Array.from(aces.entries()).sort((a, b) => parseInt(a[0], 10) - parseInt(b[0], 10));
+      section2(root, 'ACL \u00b7 ' + name, aceList.length + ' rule(s)');
+      const cols = ['#', 'Action', 'Protocol', 'Source', 'Destination', 'Extra', ''];
+      const rowClicks = [];
+      const trows = aceList.map(([aceIdx, ace]) => {
+        const action = ACE_ACTION[ace.action] || (ace.action ? ('action ' + ace.action) : '?');
+        const isPermit = /permit/.test(action);
+        const actionPill = el('span', 'pill ' + (isPermit ? 'good' : 'warn'), action);
+        // Resolve the ACE's tuples - both for display and to pre-fill an edit.
+        let proto = ACE_TYPE[ace.type] || 'ip', src = 'any', dst = 'any', extra = [];
+        const init = { action: ace.action, proto: 'ip', src: { any: true }, dst: { any: true } };
+        if (ace.type === 2) init.proto = 'tcp'; else if (ace.type === 3) init.proto = 'udp';
+        for (const tp of ace.tuples) {
+          const t = tupleMap.get(tp);
+          const dec = decodeTuple(t);
+          if (!dec) continue;
+          if (dec.field === 'src') { src = dec.text; init.src = parseCidr(dec.text); }
+          else if (dec.field === 'dst') { dst = dec.text; init.dst = parseCidr(dec.text); }
+          else if (dec.field === 'proto') proto = dec.text;
+          else if (dec.field === 'flags') { extra.push(dec.text); init.flags = parseFlagsTuple(t); }
+          else extra.push(dec.text);
+        }
+        const openEdit = () => openEditPopout(s, 'Edit rule', (pane) => qosAceAddForm(s, pane, null, { edit: { aclIdx, aceIdx, aclName: name, init } }));
+        rowClicks.push(openEdit);
+        const editBtn = actBtn('Edit', openEdit);
+        const delBtn = actBtnConfirm('Delete', () => deleteQosAce(s, aclIdx, aceIdx), 'danger', 'Delete this rule');
+        const delCell = actGroup([editBtn, delBtn]);
+        return [String(aceIdx), actionPill, proto, src, dst, extra.join(', ') || '\u2014', delCell];
+      });
+      // Clicking a row (anywhere but the action buttons) opens its edit pane.
+      root.appendChild(plainTable(s, cols, trows, (rowIdx) => { const h = rowClicks[rowIdx]; if (h) h(); }));
+      // Per-ACL add control: the ACL is known, so no list picker is needed.
+      root.appendChild(addControl('Add rule to ' + name, () => openEditPopout(s, 'Add rule to ' + name, (pane, close) => qosAceAddForm(s, pane, close, { fixedAcl: name }))));
+    }
+
+    // Top-level control: create a brand-new ACL (and its first rule).
+    const newRow = el('div', 'acl-new-row');
+    newRow.appendChild(addControl('New ACL', () => openEditPopout(s, 'New access list', (pane, close) => qosAceAddForm(s, pane, close, { newAcl: true }))));
+    root.appendChild(newRow);
+  }
+
+  // ---- Interface / VLAN ACL binding (rlQosIfPolicyTable, base 88.13) ----
+  // Indexed by { ifIndex, ifType } where ifType is port(2) or vlan(1).
+  const QOS_IFPOL = {
+    aclIn:   '1.3.6.1.4.1.9.6.1.101.88.13.1.14',   // rlQosIfAclIn  (ACL index, 0=none)
+    aclOut:  '1.3.6.1.4.1.9.6.1.101.88.13.1.15',   // rlQosIfAclOut
+    defIn:   '1.3.6.1.4.1.9.6.1.101.88.13.1.12',   // rlQosAclDefaultAction (ingress)
+    defOut:  '1.3.6.1.4.1.9.6.1.101.88.13.1.22'    // rlQosAclDefaultActionOut
+  };
+  const ACL_DEFACTION = { 1: 'deny-all', 2: 'forward-all', 3: 'application-specific' };
+  const IFTYPE_PORT = 2, IFTYPE_VLAN = 1;
+
+  // Read the current binding for an interface (ifIndex + ifType). Returns
+  // { inAcl, outAcl, defIn, defOut } as numbers (ACL index / action enum).
+  async function readIfAclBinding(s, ifIndex, ifType) {
+    const suffix = ifIndex + '.' + ifType;
+    const oids = [QOS_IFPOL.aclIn + '.' + suffix, QOS_IFPOL.aclOut + '.' + suffix, QOS_IFPOL.defIn + '.' + suffix, QOS_IFPOL.defOut + '.' + suffix];
+    const results = await snmpGet(s, oids);
+    const byOid = {};
+    for (const r of results) { if (!r.error) byOid[String(r.oid).replace(/^\./, '')] = r.value; }
+    const pick = (base) => { const k = Object.keys(byOid).find((o) => o.indexOf(base) !== -1); return k ? parseInt(byOid[k], 10) : null; };
+    return { inAcl: pick(QOS_IFPOL.aclIn), outAcl: pick(QOS_IFPOL.aclOut), defIn: pick(QOS_IFPOL.defIn), defOut: pick(QOS_IFPOL.defOut) };
+  }
+
+  // Build the ACL-binding editor for an interface. ifType port(2) or vlan(1).
+  // For VLANs, pass opts.noDirection to show a single (default-action-only) set.
+  async function buildIfAclBinding(s, detail, pane, opts) {
+    opts = opts || {};
+    const ifType = opts.ifType || IFTYPE_PORT;
+    const ifIndex = detail.ifIndex;
+    pane.appendChild(el('div', 'card-sub', 'Loading ACL binding\u2026'));
+    // Need the list of ACLs (index -> name) to offer in the picker.
+    let acls = [];
+    try {
+      const [aclRes, bind] = await Promise.all([
+        apiPost('/api/snmp/walk', { target: s.target, oid: QOS_ACL.name, mode: 'getbulk' }),
+        readIfAclBinding(s, ifIndex, ifType)
+      ]);
+      acls = (aclRes.body && aclRes.body.results) || [];
+      clear(pane);
+      renderIfAclBinding(s, pane, ifIndex, ifType, acls, bind, opts);
+    } catch (e) { clear(pane); pane.appendChild(el('div', 'sw-err', 'Could not read ACL binding: ' + e.message)); }
+  }
+
+  function renderIfAclBinding(s, pane, ifIndex, ifType, aclRows, bind, opts) {
+    const aclOptions = [{ label: '(none)', value: '0' }];
+    const nameByIdx = {};
+    for (const r of aclRows) { if (/QosAclName$/.test(r.column || '')) { const idx = String(r.index); nameByIdx[idx] = String(dvc(r)); aclOptions.push({ label: String(dvc(r)), value: idx }); } }
+    const defOptions = [{ label: 'Deny Any', value: '1' }, { label: 'Permit Any (forward)', value: '2' }];
+
+    const form = el('div', 'snmp-form acl-form');
+    const mkDir = (titleWord, aclOid, defOid, curAcl, curDef) => {
+      const sec = formSection(titleWord);
+      const aclSel = selectInput(aclOptions, curAcl != null ? String(curAcl) : '0');
+      sec.body.appendChild(field(opts.noDirection ? 'IPv4-based ACL' : (titleWord + ' ACL'), aclSel));
+      const defSel = selectInput(defOptions, curDef === 2 ? '2' : '1');
+      sec.body.appendChild(field('Default action', defSel));
+      form.appendChild(sec.sec);
+      return { aclSel, defSel, aclOid, defOid };
+    };
+
+    const controls = [];
+    if (opts.noDirection) {
+      // VLAN: a single binding (no in/out direction), default action only.
+      controls.push(mkDir('Access list', QOS_IFPOL.aclIn, QOS_IFPOL.defIn, bind.inAcl, bind.defIn));
+    } else {
+      controls.push(mkDir('Input', QOS_IFPOL.aclIn, QOS_IFPOL.defIn, bind.inAcl, bind.defIn));
+      controls.push(mkDir('Output', QOS_IFPOL.aclOut, QOS_IFPOL.defOut, bind.outAcl, bind.defOut));
+    }
+
+    const { actions, apply } = applyActions('Apply binding');
+    const msg = el('div', 'port-detail-msg');
+    withConfirm(apply, async () => {
+      const suffix = ifIndex + '.' + ifType;
+      const vbs = [];
+      const changedCtls = [];
+      for (const c of controls) {
+        vbs.push({ oid: c.aclOid + '.' + suffix, type: 'Integer', value: parseInt(c.aclSel.value, 10) });
+        vbs.push({ oid: c.defOid + '.' + suffix, type: 'Integer', value: parseInt(c.defSel.value, 10) });
+        changedCtls.push(c.aclSel, c.defSel);
+      }
+      clear(msg);
+      runButtonAction(apply, {
+        failLabel: 'Apply binding',
+        run: () => snmpSet(s, vbs).then(() => ({ ok: true }), (e) => ({ ok: false, error: e.message })),
+        ok: (r) => r && r.ok,
+        error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not apply binding \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+        onApplied: () => markConfigDirty(s, changedCtls),
+        settle: () => Promise.resolve()
+      });
+    });
+    form.appendChild(actions); form.appendChild(msg);
+    pane.appendChild(form);
+  }
+
+  // ---- ACL writes (QoS tuple model) ----
+  // The write path mirrors what we learned from the live data: an ACE is a row
+  // in rlQosAceTidxTable that points (via Tuple columns) at value rows in
+  // rlQosTupleTable, all under an ACL in rlQosAclTable. So creating a rule is:
+  //   1. ensure the ACL exists (create it if the name is new),
+  //   2. create one tuple row per match field (type + value||mask + createAndGo),
+  //   3. create the ACE row (action, type, the tuple pointers, createAndGo).
+  // Every step is a single atomic SET and its result is checked, so a rejection
+  // is attributed to the exact step. Indices are chosen as max-existing + 1
+  // because this firmware exposes no free-index scalar for these tables.
+
+  // Highest index currently in a walked set of rows (by their first index arc).
+  function maxIndex(rows, firstArcOnly) {
+    let m = 0;
+    for (const r of rows || []) {
+      const first = parseInt(String(r.index).split('.')[0], 10);
+      if (Number.isFinite(first) && first > m) m = first;
+    }
+    return m;
+  }
+
+  // Delete one ACE: destroy its rlQosAceTidxTable row via the shared
+  // rowStatusDelete (so it gets the notInService->destroy fallback for a row the
+  // switch won't destroy directly), consistent with every other RowStatus delete.
+  function deleteQosAce(s, aclIdx, aceIdx) {
+    const suffix = aclIdx + '.' + aceIdx;
+    rowStatusDelete(s, QOS_ACL.aceStatus + '.' + suffix)
+      .then((res) => {
+        if (!res.ok || (res.body && res.body.error)) { toast('Could not delete rule: ' + ((res.body && res.body.error) || 'the switch rejected it'), 'error'); return; }
+        markConfigDirty(s);
+        aclRefresh(s);
+      }).catch((e) => toast('Could not delete rule: ' + e.message, 'error'));
+  }
+
+  // Build the value||mask octet string for an ip-src/ip-dest tuple from a
+  // dotted IP and prefix length: 4 value bytes + 4 wildcard-mask bytes.
+  function ipTupleHex(ip, pref) {
+    const v = ipv4ToHex(ip);
+    if (!v) return null;
+    const p = Math.max(0, Math.min(32, parseInt(pref, 10) || 32));
+    const netMask = p === 0 ? 0 : (0xffffffff << (32 - p)) >>> 0;
+    const wild = (~netMask) >>> 0;
+    const wildHex = wild.toString(16).padStart(8, '0');
+    return v + wildHex;
+  }
+  // protocol tuple value||mask: 1 value byte + 1 exact mask (ff).
+  function protoTupleHex(proto) { return proto.toString(16).padStart(2, '0') + 'ff'; }
+
+  // Create a rule. cfg: { aclName, aclType(1 ip), action, aceType, srcAny, srcIp,
+  // srcPref, dstAny, dstIp, dstPref, proto }. Returns on success, throws with the
+  // failing step on error.
+  async function createQosAce(s, cfg) {
+    // 1. Resolve or create the ACL by name.
+    let aclIdx = null;
+    for (const r of (s._acl.acls || [])) { if (/QosAclName$/.test(r.column || '') && String(dvc(r)) === cfg.aclName) aclIdx = String(r.index); }
+    if (aclIdx === null) {
+      aclIdx = String(maxIndex(s._acl.acls || []) + 1);
+      try {
+        await snmpSet(s, [
+          { oid: QOS_ACL.aclStatus + '.' + aclIdx, type: 'Integer', value: 4 },         // createAndGo
+          { oid: QOS_ACL.name + '.' + aclIdx, type: 'OctetString', value: cfg.aclName },
+          { oid: QOS_ACL.type + '.' + aclIdx, type: 'Integer', value: cfg.aclType || 2 } // ip
+        ]);
+      } catch (e) { throw new Error('creating ACL "' + cfg.aclName + '": ' + e.message); }
+    }
+
+    // 2. Create the tuple rows for each requested match field.
+    const tupleRows = s._acl.tuples || [];
+    let nextTuple = maxIndex(tupleRows) + 1;
+    const pointers = [];   // tuple indices this ACE will reference
+    const addTuple = async (typeVal, valueHex) => {
+      const tIdx = String(nextTuple++);
+      try {
+        await snmpSet(s, [
+          { oid: QOS_ACL.tupStatus + '.' + tIdx, type: 'Integer', value: 4 },     // createAndGo
+          { oid: QOS_ACL.tupType + '.' + tIdx, type: 'Integer', value: typeVal },
+          { oid: QOS_ACL.tupVal2 + '.' + tIdx, type: 'OctetString', valueHex }
+        ]);
+      } catch (e) { throw new Error('creating tuple (type ' + typeVal + '): ' + e.message); }
+      pointers.push(tIdx);
+    };
+    if (cfg.proto) await addTuple(TUPLE_TYPE_VAL.protocol, protoTupleHex(cfg.proto));
+    if (!cfg.srcAny) { const h = ipTupleHex(cfg.srcIp, cfg.srcPref); if (!h) throw new Error('bad source address'); await addTuple(TUPLE_TYPE_VAL['ip-src'], h); }
+    if (!cfg.dstAny) { const h = ipTupleHex(cfg.dstIp, cfg.dstPref); if (!h) throw new Error('bad destination address'); await addTuple(TUPLE_TYPE_VAL['ip-dest'], h); }
+    // TCP flags tuple: byte1 = value (Set bits), byte2 = don't-care mask.
+    // e.g. ACK+FIN Set, rest Unset-and-cared -> "11 00" (matches the switch).
+    if (cfg.tcpFlags) {
+      const fh = cfg.tcpFlags.val.toString(16).padStart(2, '0') + cfg.tcpFlags.dc.toString(16).padStart(2, '0');
+      await addTuple(TUPLE_TYPE_VAL['tcp-flags'], fh);
+    }
+
+    // 3. Create the ACE under the ACL, pointing at the tuples.
+    const aceRows = s._acl.aces || [];
+    let maxAce = 0;
+    for (const r of aceRows) { const parts = String(r.index).split('.'); if (parts[0] === aclIdx) { const a = parseInt(parts[1], 10); if (a > maxAce) maxAce = a; } }
+    const aceIdx = String(maxAce + 1);
+    const suffix = aclIdx + '.' + aceIdx;
+    const vbs = [
+      { oid: QOS_ACL.aceStatus + '.' + suffix, type: 'Integer', value: 4 },  // createAndGo
+      { oid: QOS_ACL.aceAction + '.' + suffix, type: 'Integer', value: cfg.action },
+      { oid: QOS_ACL.aceType + '.' + suffix, type: 'Integer', value: cfg.aceType }
+    ];
+    pointers.forEach((tIdx, i) => {
+      if (i < ACE_TUPLE_COLS.length) vbs.push({ oid: QOS_ACL.aceTupleBase + ACE_TUPLE_COLS[i] + '.' + suffix, type: 'Integer', value: parseInt(tIdx, 10) });
+    });
+    try { await snmpSet(s, vbs); } catch (e) { throw new Error('creating ACE: ' + e.message); }
+  }
+
+  // Edit an ACE. The tuple model has no clean in-place "change the match fields"
+  // operation (the ACE points at tuple rows; changing the match means different
+  // tuples), so editing is: destroy the old ACE, then create the replacement
+  // under the same ACL. The ACE index may change - fine, ACEs are index-ordered.
+  async function editQosAce(s, aclIdx, aceIdx, cfg) {
+    try {
+      await snmpSet(s, { oid: QOS_ACL.aceStatus + '.' + aclIdx + '.' + aceIdx, type: 'Integer', value: 6 });
+    } catch (e) { throw new Error('removing the old rule: ' + e.message); }
+    // Re-read so createQosAce picks correct free indices after the delete.
+    try {
+      const [aces, tuples] = await Promise.all([
+        apiPost('/api/snmp/walk', { target: s.target, oid: QOS_ACL.aceTidx, mode: 'getbulk' }),
+        apiPost('/api/snmp/walk', { target: s.target, oid: QOS_ACL.tuple, mode: 'getbulk' })
+      ]);
+      s._acl.aces = (aces.body && aces.body.results) || [];
+      s._acl.tuples = (tuples.body && tuples.body.results) || [];
+    } catch (e) { /* fall back to existing cached rows */ }
+    await createQosAce(s, cfg);
+  }
+
+  // A titled section inside an editor form.
+  function formSection(title) {
+    const sec = el('div', 'acl-fsec');
+    sec.appendChild(el('div', 'acl-fsec-title', title));
+    const body = el('div', 'acl-fsec-body');
+    sec.appendChild(body);
+    return { sec, body };
+  }
+  // An address group: "Any" toggle + IP + prefix, wired so the inputs enable
+  // only when "Any" is off. init: { any, ip, pref }.
+  function addressGroup(labelWord, init) {
+    init = init || {};
+    const wrap = el('div', 'acl-addr');
+    const anyLab = el('label', 'acl-any');
+    const any = el('input'); any.type = 'checkbox'; any.checked = init.any !== false;
+    anyLab.appendChild(any); anyLab.appendChild(el('span', '', 'Any ' + labelWord));
+    wrap.appendChild(anyLab);
+    const detail = el('div', 'acl-addr-detail');
+    const ip = el('input'); ip.type = 'text'; ip.placeholder = '192.168.1.0'; ip.className = 'acl-ip-in';
+    if (init.ip) ip.value = init.ip;
+    const pref = el('input'); pref.type = 'number'; pref.min = '0'; pref.max = '32'; pref.value = init.pref != null ? String(init.pref) : '24'; pref.className = 'acl-pref-in';
+    const slash = el('span', 'acl-slash', '/');
+    detail.appendChild(ip); detail.appendChild(slash); detail.appendChild(pref);
+    wrap.appendChild(detail);
+    const sync = () => { const off = any.checked; ip.disabled = off; pref.disabled = off; detail.classList.toggle('is-off', off); };
+    any.addEventListener('change', sync); sync();
+    return { wrap, any, ip, pref };
+  }
+
+  // The create/edit-rule form (QoS tuple model). opts:
+  //   { fixedAcl: name }          -> add a rule to that existing ACL
+  //   { newAcl: true }            -> create a new ACL by name
+  //   { edit: {aclIdx, aceIdx, aclName, init} } -> edit an existing ACE
+  function qosAceAddForm(s, pane, close, opts) {
+    opts = opts || {};
+    const editing = !!opts.edit;
+    const init = (opts.edit && opts.edit.init) || {};
+    const aclName = opts.fixedAcl || (opts.edit && opts.edit.aclName) || '';
+    const form = el('div', 'snmp-form acl-form');
+    const title = editing ? ('Edit rule \u00b7 ' + aclName) : (opts.fixedAcl ? ('Add rule to ' + opts.fixedAcl) : 'New access list');
+    form.appendChild(el('h5', '', title));
+
+    // --- Section: the list (only when naming a new one) + the basics ---
+    const basics = formSection(editing ? 'Rule' : (opts.fixedAcl ? 'Rule' : 'List & rule'));
+    let nameIn = null;
+    if (!opts.fixedAcl && !editing) {
+      nameIn = el('input'); nameIn.type = 'text'; nameIn.maxLength = 32; nameIn.placeholder = 'list name';
+      basics.body.appendChild(field('ACL name', nameIn));
+    }
+    const actionSel = selectInput([
+      { label: 'permit', value: '1' }, { label: 'deny', value: '2' },
+      { label: 'deny + log', value: '4' }, { label: 'permit + log', value: '5' }
+    ], init.action ? String(init.action) : '1');
+    basics.body.appendChild(field('Action', actionSel));
+    const protoSel = selectInput([
+      { label: 'any IP', value: 'ip' }, { label: 'TCP', value: 'tcp' }, { label: 'UDP', value: 'udp' }
+    ], init.proto || 'ip');
+    basics.body.appendChild(field('Protocol', protoSel));
+    form.appendChild(basics.sec);
+
+    // --- Section: match (source, then destination stacked below it so each
+    //     address line - IP / prefix - has the full width and is never cut) ---
+    const match = formSection('Match');
+    match.body.classList.add('acl-stack');
+    const src = addressGroup('source', init.src || { any: true });
+    const dst = addressGroup('destination', init.dst || { any: true });
+    match.body.appendChild(field('Source', src.wrap));
+    match.body.appendChild(field('Destination', dst.wrap));
+    form.appendChild(match.sec);
+
+    // --- Section: TCP flags (only for TCP). Each flag is tri-state: Set (must
+    //     be 1), Unset (must be 0), or Don't care (ignored) - matching the
+    //     switch's value + don't-care-mask encoding. ---
+    const flagsSec = formSection('TCP flags');
+    const flagRow = el('div', 'acl-flags-row');
+    const flagCtl = {};
+    const initFlags = (init.flags && typeof init.flags === 'object') ? init.flags : {};
+    for (const [name] of TCP_FLAGS) {
+      const cell = el('div', 'acl-flag-cell');
+      cell.appendChild(el('div', 'acl-flag-name', name.toUpperCase()));
+      const state = initFlags[name] || 'care';   // default don't care
+      const radios = {};
+      for (const opt of [['set', 'Set'], ['unset', 'Unset'], ['care', "Don't care"]]) {
+        const rl = el('label', 'acl-flag-opt');
+        const r = el('input'); r.type = 'radio'; r.name = 'flag-' + name + '-' + (editing ? 'e' : 'n'); r.value = opt[0];
+        if (state === opt[0]) r.checked = true;
+        rl.appendChild(r); rl.appendChild(el('span', '', opt[1]));
+        cell.appendChild(rl);
+        radios[opt[0]] = r;
+      }
+      flagRow.appendChild(cell);
+      flagCtl[name] = radios;
+    }
+    flagsSec.body.appendChild(flagRow);
+    form.appendChild(flagsSec.sec);
+    const syncFlagsVisible = () => { flagsSec.sec.style.display = (protoSel.value === 'tcp') ? '' : 'none'; };
+    protoSel.addEventListener('change', syncFlagsVisible);
+    syncFlagsVisible();
+
+    const { actions, apply } = applyActions(editing ? 'Save rule' : (opts.fixedAcl ? 'Add rule' : 'Create ACL'));
+    const msg = el('div', 'port-detail-msg');
+    withConfirm(apply, async () => {
+      const name = aclName || (nameIn ? (nameIn.value || '').trim() : '');
+      clear(msg);
+      if (!name) { msg.appendChild(el('div', 'sw-err', 'Enter an ACL name.')); return; }
+      if (!src.any.checked && !ipv4ToHex(src.ip.value)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid source IPv4 address.')); return; }
+      if (!dst.any.checked && !ipv4ToHex(dst.ip.value)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid destination IPv4 address.')); return; }
+      const protoName = protoSel.value;
+      const proto = protoName === 'tcp' ? 6 : (protoName === 'udp' ? 17 : 0);
+      const aceType = protoName === 'tcp' ? ACE_TYPE_VAL['ip-tcp'] : (protoName === 'udp' ? ACE_TYPE_VAL['ip-udp'] : ACE_TYPE_VAL.ip);
+      let tcpFlags = null;
+      if (protoName === 'tcp') {
+        let val = 0, dc = 0;
+        for (const [nm, bit] of TCP_FLAGS) {
+          const st = flagCtl[nm].set.checked ? 'set' : (flagCtl[nm].unset.checked ? 'unset' : 'care');
+          if (st === 'care') dc |= bit; else if (st === 'set') val |= bit;
+        }
+        // Only emit a flags tuple if at least one flag is actually constrained.
+        if (dc !== 0x3f) tcpFlags = { val, dc };
+      }
+      const cfg = {
+        aclName: name, aclType: 2, action: parseInt(actionSel.value, 10), aceType, proto: proto || 0,
+        srcAny: src.any.checked, srcIp: src.ip.value, srcPref: parseInt(src.pref.value, 10),
+        dstAny: dst.any.checked, dstIp: dst.ip.value, dstPref: parseInt(dst.pref.value, 10),
+        tcpFlags
+      };
+      clear(msg);
+      runButtonAction(apply, {
+        failLabel: editing ? 'Save rule' : 'Add rule',
+        spinLabel: editing ? 'Saving\u2026' : (opts.fixedAcl ? 'Adding\u2026' : 'Creating\u2026'),
+        run: async () => {
+          try {
+            if (editing) await editQosAce(s, opts.edit.aclIdx, opts.edit.aceIdx, cfg);
+            else await createQosAce(s, cfg);
+            return { ok: true };
+          } catch (e) { return { ok: false, error: e.message }; }
+        },
+        ok: (r) => r && r.ok,
+        error: (r) => { msg.appendChild(el('div', 'sw-err', (editing ? 'Could not save rule \u2014 ' : 'Could not add rule \u2014 ') + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+        onApplied: () => { const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove(); markConfigDirty(s); },
+        settle: () => aclRefresh(s)
+      });
+    });
+    form.appendChild(actions); form.appendChild(msg);
+    pane.appendChild(form);
+  }
+
+  // Walk the candidate ACL tables and show what each returns, including the
+  // actual row contents of the QoS ACL/ACE/Ref tables (where this switch keeps
+  // its ACLs) so we can see the real structure, not just counts.
+
+  // Helper: a classification value accessor (display or value) for ACL cells.
+  function dvc(cell) { return cell ? (cell.display !== undefined && cell.display !== null && cell.display !== '' ? cell.display : cell.value) : ''; }
+  // A sub-heading inside the ACL panel (mirrors the SNMP sub-sections).
+  function section2(root, title, note) {
+    const h = el('div', 'aaa-sub', title);
+    if (note) h.appendChild(el('span', 'st-note', '  ' + note));
+    root.appendChild(h);
+  }
+
+  // delete it (rlFileRowStatus destroy). Delete is suppressed for directory
+  // entries and anything the switch marks non-writable (system files).
+  function paintFlashPanel(s, body) {
+    clear(body);
+    if (!s.target) { body.appendChild(el('div', 'card-sub', 'Connect with SNMP to browse flash.')); return; }
+
+    const fmtSize = (n) => {
+      const v = Number(n); if (!Number.isFinite(v)) return String(n);
+      if (v >= 1048576) return (v / 1048576).toFixed(1) + ' MB';
+      if (v >= 1024) return (v / 1024).toFixed(1) + ' KB';
+      return v + ' B';
+    };
+
+    const title = el('div', 'section-title', 'Flash files');
+    const note = el('span', 'st-note', ''); title.appendChild(note);
+    body.appendChild(title);
+
+    const listBody = el('div', 'flash-files'); listBody.style.marginTop = '8px'; body.appendChild(listBody);
+    const msg = el('div', 'sw-msg'); body.appendChild(msg);
+
+    // Download a flash file over TFTP (flash -> this app -> browser).
+    const download = (fileName) => {
+      clear(msg);
+      s.writeBusy = true;
+      return fetch('/api/opc/fetch-flash', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: s.target, flashFileName: fileName }) })
+        .then((r) => r.json().then((b) => ({ ok: r.ok, b })))
+        .then(({ ok, b }) => {
+          s.writeBusy = false;
+          if (ok && b.ok && b.pcapBase64) {
+            const bytes = atob(b.pcapBase64);
+            const arr = new Uint8Array(bytes.length);
+            for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+            const blob = new Blob([arr], { type: 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = String(fileName).replace(/^flash:\/\//i, '').replace(/^flash:/i, '');
+            document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+            return true;
+          }
+          // Only surface a message on failure.
+          clear(msg); msg.appendChild(el('div', 'sw-err', 'Download failed: ' + (b.error || 'unknown error')));
+          return false;
+        })
+        .catch((e) => { s.writeBusy = false; clear(msg); msg.appendChild(el('div', 'sw-err', 'Download failed: ' + e.message)); return false; });
+    };
+
+    // The Delete button confirms itself (two-tap), so this acts directly.
+    const doDeleteFlash = (f) => {
+      clear(msg); s.writeBusy = true;
+      return fetch('/api/flash/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: s.target, fileName: f.name }) })
+        .then((r) => r.json().then((bb) => ({ ok: r.ok, bb })))
+        .then(({ ok, bb }) => {
+          s.writeBusy = false;
+          // No success text — the file just disappears from the reloaded list.
+          if (ok && bb.ok) { load(); return true; }
+          clear(msg); msg.appendChild(el('div', 'sw-err', 'Delete failed: ' + (bb.error || 'unknown error')));
+          return false;
+        })
+        .catch((e) => { s.writeBusy = false; clear(msg); msg.appendChild(el('div', 'sw-err', 'Delete failed: ' + e.message)); return false; });
+    };
+
+    const load = (highlightName) => {
+      clear(listBody); clear(msg);
+      listBody.appendChild(el('div', 'card-sub', 'Listing flash\u2026'));
+      fetch('/api/flash/list', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: s.target }) })
+        .then((r) => r.json())
+        .then((b) => {
+          clear(listBody);
+          // Normalise the name to highlight (strip any flash:// prefix so it
+          // matches the listing's bare names).
+          const hl = highlightName ? String(highlightName).replace(/^flash:\/\//i, '').replace(/^flash:/i, '') : null;
+          if (!b || b.error) { listBody.appendChild(el('div', 'card-sub', 'Could not list flash: ' + ((b && b.error) || 'error'))); return; }
+          const files = b.files || [];
+          note.textContent = files.length + ' entr' + (files.length === 1 ? 'y' : 'ies') +
+            (b.flash && b.flash.free != null ? '  \u00b7  ' + fmtSize(b.flash.free) + ' free of ' + fmtSize(b.flash.total) : '');
+          if (!files.length) { listBody.appendChild(el('div', 'card-sub', 'No files found.')); return; }
+          // Render the file list through plainTable (the keyed render helper) so
+          // it diffs cells and stays consistent with every other data table
+          // (standard A5/B3), instead of a hand-built <table>.
+          const cols = ['Name', 'Perm', 'Size', 'Modified', ''];
+          const rows = files.map((f) => {
+            const permKnown = (f.permByte !== undefined && f.permByte !== null);
+            const nameCell = el('span', '', f.isDir ? (f.name + '/') : f.name);
+            if (hl && String(f.name).replace(/^flash:\/\//i, '').replace(/^flash:/i, '') === hl) {
+              nameCell.className = 'flash-new';
+              setTimeout(() => { nameCell.classList.remove('flash-new'); }, 6000);
+            }
+            const btns = [];
+            // Download for anything that isn't a directory. Routed through
+            // runButtonAction (standard B6) so it spins until the TFTP copy +
+            // browser download resolves, then shows Done.
+            if (!f.isDir) btns.push(actBtn('Download', (e) => {
+              runButtonAction(e.currentTarget, {
+                failLabel: 'Download', spinLabel: 'Fetching\u2026',
+                run: () => download(f.name),
+                ok: (okFlag) => okFlag === true,
+                settle: () => Promise.resolve()
+              });
+            }, 'primary', 'Download this file'));
+            // Delete rules: never for directories or read-only (system) files;
+            // offered for writable or unknown-permission files.
+            let noteLabel = null;
+            if (f.isDir) { noteLabel = ' directory'; }
+            else if (permKnown && f.writable === false) { noteLabel = ' read-only'; }
+            else {
+              btns.push(actBtnConfirm('Delete', (e) => {
+                runButtonAction(e.currentTarget, {
+                  failLabel: 'Delete',
+                  run: () => doDeleteFlash(f),
+                  ok: (okFlag) => okFlag === true,
+                  settle: () => Promise.resolve()   // doDeleteFlash reloads the list itself
+                });
+              }, 'danger', 'Delete this file'));
+            }
+            // A span.tbl-acts (from actGroup) is detected by ktRenderCell as an
+            // action cell (clicks stopped); append the informational note, if any.
+            const actCell = actGroup(btns);
+            if (noteLabel) actCell.appendChild(el('span', 'card-sub', noteLabel));
+            return [
+              nameCell,
+              permKnown ? ('0x' + Number(f.permByte).toString(16).padStart(2, '0')) : '?',
+              f.isDir ? '' : (f.size !== undefined ? fmtSize(f.size) : ''),
+              [f.date, f.time].filter(Boolean).join(' '),
+              actCell
+            ];
+          });
+          listBody.appendChild(plainTable(s, cols, rows));
+        })
+        .catch((e) => { clear(listBody); listBody.appendChild(el('div', 'card-sub', 'Could not list flash: ' + e.message)); });
+    };
+
+    // Expose so the capture panel's Export can download a file and reload this
+    // list without the user switching panels.
+    s._flashDownload = download;
+    s._flashReload = load;
+    load();
+  }
+
+  function paintCapturePanel(s, body) {
+    clear(body);
+    if (!s.target) {
+      body.appendChild(el('div', 'card-sub', 'Connect with SNMP to use packet capture.'));
+      return;
+    }
+    // Existing captures on the switch, discovered by walking the capture table.
+    const existing = el('div', 'capture-existing'); existing.style.margin = '10px 0';
+    body.appendChild(existing);
+
+    const grid = el('div', 'snmp-form-grid'); grid.style.marginTop = '10px';
+
+    const nameIn = el('input'); nameIn.type = 'text'; nameIn.maxLength = 32; nameIn.value = s.captureName || 'capture1';
+    nameIn.addEventListener('input', () => { s._captureExisting = false; });
+    grid.appendChild(field('Capture name', nameIn));
+
+    const dirSel = el('select');
+    for (const d of ['both', 'in', 'out']) { const o = el('option', '', d); o.value = d; dirSel.appendChild(o); }
+    grid.appendChild(field('Control-plane direction', dirSel));
+
+    const bufSel = el('select');
+    for (const b2 of ['linear', 'circular']) { const o = el('option', '', b2); o.value = b2; bufSel.appendChild(o); }
+    grid.appendChild(field('Buffer type', bufSel));
+
+    const sizeIn = el('input'); sizeIn.type = 'number'; sizeIn.min = '1'; sizeIn.placeholder = 'MB (optional)';
+    grid.appendChild(field('Buffer size (MB)', sizeIn));
+
+    const filterSel = el('select');
+    for (const f2 of ['any', 'acl']) { const o = el('option', '', f2 === 'any' ? 'match any' : 'match ACL'); o.value = f2; filterSel.appendChild(o); }
+    grid.appendChild(field('Filter', filterSel));
+
+    const aclIn = el('input'); aclIn.type = 'text'; aclIn.maxLength = 32; aclIn.placeholder = 'ACL name';
+    const aclField = field('ACL name', aclIn);
+    grid.appendChild(aclField);
+
+    const durIn = el('input'); durIn.type = 'number'; durIn.min = '0'; durIn.placeholder = 'seconds (0 = none)';
+    grid.appendChild(field('Limit: duration', durIn));
+
+    const pktIn = el('input'); pktIn.type = 'number'; pktIn.min = '0'; pktIn.placeholder = 'packets (0 = none)';
+    grid.appendChild(field('Limit: packets', pktIn));
+
+    body.appendChild(grid);
+    const syncFilter = () => { aclField.style.display = filterSel.value === 'acl' ? '' : 'none'; };
+    filterSel.addEventListener('change', syncFilter); syncFilter();
+
+    const msg = el('div', 'sw-msg');
+
+    // Per-capture status (state, packets, dropped, buffer) is shown inline in
+    // the captures list, so "refresh status" just reloads that list rather than
+    // maintaining a separate, redundant status block.
+    const readStatus = () => { if (s._captureListReload) s._captureListReload(); };
+
+    const cfg = () => ({
+      target: s.target, name: (nameIn.value || '').trim(), direction: dirSel.value,
+      bufferType: bufSel.value, bufferSizeMb: parseInt(sizeIn.value, 10),
+      filter: filterSel.value, aclName: (aclIn.value || '').trim(),
+      limitDurationSec: parseInt(durIn.value, 10), limitPackets: parseInt(pktIn.value, 10),
+      existing: !!s._captureExisting
+    });
+    const run = (label, url, payload, after) => {
+      clear(msg);
+      s.writeBusy = true;
+      return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+        .then((r) => r.json().then((b) => ({ ok: r.ok, b })))
+        .then(({ ok, b }) => {
+          s.writeBusy = false;
+          // No success text — the list updates to reflect the new state. Only
+          // surface failures.
+          if (ok && b.ok) { if (after) after(b); readStatus(); if (s._captureListReload) s._captureListReload(); }
+          else { clear(msg); msg.appendChild(el('div', 'sw-err', label + ' failed: ' + (b.error || 'unknown error'))); }
+          return { ok: ok && b.ok, b };
+        })
+        .catch((e) => { s.writeBusy = false; clear(msg); msg.appendChild(el('div', 'sw-err', label + ' failed: ' + e.message)); return { ok: false }; });
+    };
+
+    const actions = el('div', 'snmp-form-actions'); actions.style.marginTop = '10px';
+    const applyBtn = el('button', 'btn btn-small btn-blue', 'Configure'); applyBtn.type = 'button';
+
+    const nameOf = () => (nameIn.value || '').trim();
+    const needName = () => { if (!nameOf()) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a capture name.')); return false; } return true; };
+
+    applyBtn.addEventListener('click', () => { if (needName()) { s.captureName = nameOf(); run('Configure', '/api/opc/configure', cfg()); } });
+    actions.appendChild(applyBtn);
+    body.appendChild(actions);
+
+    body.appendChild(msg);
+
+    // Export a stopped, non-empty capture to a flash .pcap via the rlCopyTable
+    // copy engine (sourceFileType=pcap -> capture://). This is the proven,
+    // non-crashing path. Exposed on s so the inline per-capture Export button
+    // (in the list above) can call it.
+    s._exportCapture = (captureName, btn) => {
+      clear(msg);
+      // The export button spins through the WHOLE operation - copying the capture
+      // to a flash file AND the TFTP download of that file - and only says Done
+      // once the file has actually downloaded. The copy result is carried from
+      // run() into settle() so the download targets the right flash file.
+      let copyResult = null;
+      runButtonAction(btn, {
+        failLabel: 'Export',
+        run: () => apiPost('/api/copy/capture-to-flash', { target: s.target, name: captureName, confirm: true })
+          .then((res) => { copyResult = res.body; return res; }),
+        // Success means the copy to flash genuinely finished (server waits for it).
+        ok: (res) => res && res.ok && res.body && res.body.ok && res.body.flashFileName,
+        error: (res) => {
+          const b = res && res.body;
+          if (b && b.finished === false && !b.failed) {
+            // Still being written (a very large capture beyond the server's wait):
+            // show the file in the Flash list so the user can grab it when ready.
+            if (b.flashFileName && s._flashReload) s._flashReload(b.flashFileName);
+            return 'still writing to flash - it will appear in the Flash files list shortly; download it from there once it finishes';
+          }
+          return (b && b.error) || 'unknown error';
+        },
+        // settle = the TFTP download. The button keeps spinning until it lands,
+        // and a failed download rejects so the helper reports it rather than
+        // showing a false Done.
+        settle: () => {
+          const fn = copyResult && copyResult.flashFileName;
+          if (!fn) return Promise.resolve();
+          if (s._flashReload) s._flashReload(fn);
+          if (!s._flashDownload) return Promise.resolve();
+          return Promise.resolve(s._flashDownload(fn)).then((okDl) => { if (okDl === false) throw new Error('download from flash failed'); });
+        }
+      }).catch(() => { /* toast already shown by the helper */ });
+    };
+
+    // Populate the config form from an existing capture object.
+    const loadIntoForm = (cap) => {
+      nameIn.value = cap.name || '';
+      s.captureName = cap.name;
+      s._captureExisting = true;
+      if (cap.bufferTypeText) bufSel.value = cap.bufferTypeText;
+      if (Number(cap.bufferSize) > 0) sizeIn.value = String(cap.bufferSize); else sizeIn.value = '';
+      if (cap.filterText === 'acl') { filterSel.value = 'acl'; aclIn.value = cap.aclName || ''; }
+      else filterSel.value = 'any';
+      syncFilter();
+      durIn.value = Number(cap.limitDuration) > 0 ? String(cap.limitDuration) : '';
+      pktIn.value = Number(cap.limitPackets) > 0 ? String(cap.limitPackets) : '';
+      readStatus();
+    };
+
+    // Discover and render existing captures.
+    const loadCaptureList = () => {
+      clear(existing);
+      existing.appendChild(el('div', 'card-sub', 'Looking for existing captures\u2026'));
+      fetch('/api/opc/list', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: s.target }) })
+        .then((r) => r.json())
+        .then((b) => {
+          const caps = (b && !b.error) ? (b.captures || []) : null;
+          if (caps) s._anyCaptureActive = caps.some((c) => c.stateText === 'active');
+          // Render with scroll preserved around the rebuild (standard B5), and
+          // through plainTable (the keyed render helper) like every other table.
+          selfManagedRender(s, () => {
+            clear(existing);
+            if (!caps) { existing.appendChild(el('div', 'card-sub', 'Could not list captures: ' + ((b && b.error) || 'error'))); return; }
+            // Nothing to show when there are no captures — the create form below
+            // is how one is made, so this section simply stays hidden.
+            if (!caps.length) return;
+            const title = el('div', 'section-title', 'Captures on the switch');
+            title.appendChild(el('span', 'st-note', caps.length + ' found'));
+            existing.appendChild(title);
+            const cols = ['Name', 'State', 'Buffer', 'Filter', 'Packets', 'Dropped', 'Used', 'Pkts/s', ''];
+            const rows = caps.map((cap) => {
+              const nm = cap.name;
+              const btns = [];
+              // Every capture action goes through runButtonAction: spinner on
+              // click, held until the switch state (and the capture list) actually
+              // reflect the change, then Done - consistent with the rest of the app.
+              const captureAction = (btn, label, url, payload) => runButtonAction(btn, {
+                failLabel: label,
+                run: () => apiPost(url, payload),
+                ok: (r) => r && r.ok && r.body && r.body.ok,
+                error: (r) => (r && r.body && r.body.error) || 'unknown error',
+                onApplied: () => { readStatus(); },
+                settle: () => selfManagedReload(s, s._captureListReload)
+              });
+              if (cap.stateText === 'active') {
+                btns.push(actBtn('Stop', (e) => captureAction(e.currentTarget, 'Stop', '/api/opc/action', { target: s.target, name: nm, action: 'stop' }), '', 'Stop capturing'));
+              } else {
+                btns.push(actBtn('Start', (e) => captureAction(e.currentTarget, 'Start', '/api/opc/action', { target: s.target, name: nm, action: 'start' }), '', 'Start capturing'));
+              }
+              btns.push(actBtn('Edit', () => loadIntoForm(cap), '', 'Load this capture into the form below to reconfigure'));
+              const exp = actBtn('Export', (e) => { if (s._exportCapture) s._exportCapture(nm, e.currentTarget); }, '', 'Export to a flash .pcap and download it');
+              const capPkts = Number(cap.packets) || 0;
+              if (cap.stateText === 'active' || capPkts <= 0) {
+                exp.disabled = true;
+                exp.title = cap.stateText === 'active' ? 'Stop the capture before exporting.' : 'Nothing to export yet — this capture has no packets.';
+              }
+              btns.push(exp);
+              // Clear empties the capture buffer so the same capture can be
+              // re-run without deleting and recreating it. Only meaningful when it
+              // is stopped and actually has captured packets.
+              const clr = actBtnConfirm('Clear', (e) => captureAction(e.currentTarget, 'Clear', '/api/opc/action', { target: s.target, name: nm, action: 'clear' }), '', 'Empty the capture buffer so you can capture again (keeps the capture configured)');
+              if (cap.stateText === 'active' || capPkts <= 0) {
+                clr.disabled = true;
+                clr.title = cap.stateText === 'active' ? 'Stop the capture before clearing.' : 'Nothing to clear \u2014 this capture has no packets.';
+              }
+              btns.push(clr);
+              btns.push(actBtnConfirm('Delete', (e) => captureAction(e.currentTarget, 'Delete', '/api/opc/delete', { target: s.target, name: nm }), 'danger', 'Delete this capture'));
+              return [
+                cap.name,
+                cap.stateText,
+                (cap.bufferTypeText || '') + (Number(cap.bufferSize) ? ' ' + cap.bufferSize + 'MB' : ''),
+                cap.filterText === 'acl' ? ('acl ' + (cap.aclName || '')) : (cap.filterText || ''),
+                cap.packets === undefined ? '' : String(cap.packets),
+                cap.dropped === undefined ? '' : String(cap.dropped),
+                cap.bufferUsed === undefined ? '' : String(cap.bufferUsed),
+                cap.pps === undefined ? '' : String(cap.pps),
+                actGroup(btns)
+              ];
+            });
+            existing.appendChild(plainTable(s, cols, rows));
+          });
+        })
+        .catch((e) => { clear(existing); existing.appendChild(el('div', 'card-sub', 'Could not list captures: ' + e.message)); });
+    };
+    // Expose so action handlers can refresh the list after changes.
+    s._captureListReload = loadCaptureList;
+    s._captureLoadIntoForm = loadIntoForm;
+
+    loadCaptureList();
+
+    // Auto-update the capture stats every 3s while any capture is running, so
+    // packet counts update live without a refresh button. The timer is torn
+    // down when the panel is repainted (a fresh paint starts a new one) or when
+    // no capture is active, and pauses during writes.
+    if (s._captureStatsTimer) { clearInterval(s._captureStatsTimer); s._captureStatsTimer = null; }
+    // Capture status is walked from the switch each time, so poll gently - a
+    // packet capture's state does not change second-to-second, and a 3s loop was
+    // a constant SNMP drain whenever the capture panel sat open with an active
+    // capture. 15s is responsive enough for status while far lighter.
+    s._captureStatsTimer = setInterval(() => {
+      // Stop if this panel is gone from the DOM.
+      if (!document.body.contains(existing)) { clearInterval(s._captureStatsTimer); s._captureStatsTimer = null; return; }
+      if (s._anyCaptureActive && !s.writeBusy) loadCaptureList();
+    }, 15000);
+    readStatus();
+  }
+
+  function paintSnmpPanel(s, body) {
+    if (!s.target) {
+      body.appendChild(el('div', 'card-sub', 'Add SNMP credentials for this switch first.'));
+      return;
+    }
+    s._snmp = s._snmp || {};
+    const root = el('div', 'snmp-cfg');
+    body.appendChild(root);
+
+    const banner = el('div', 'snmp-access-banner'); banner.style.display = 'none';
+    root.appendChild(banner);
+    const sections = el('div', 'snmp-sections');
+    root.appendChild(sections);
+
+    // Fresh DOM nodes each paint, but the fetched DATA is cached: the section
+    // node handles are tied to this root, so drop the stale handles.
+    s._snmp.root = root; s._snmp.banner = banner; s._snmp.sections = sections;
+    s._snmp.secNodes = {};
+    // Behave like a keyed panel on open: if we have ANY cached data, render it
+    // immediately (no blocking "Reading…" reload), regardless of age - a keyed
+    // panel always shows its last-known state instantly. Then, if the cache is
+    // stale (>30s) or absent, refresh in the BACKGROUND so the panel never
+    // blocks on open. Only a true cold start (never loaded) shows the loading
+    // state, exactly as a keyed panel shows "waiting for data" before its first
+    // walk. The 30s guard prevents re-fetching on rapid open/close.
+    if (s._snmp.lastData) {
+      paintSnmpBanner(s);
+      if (s._snmp.access && s._snmp.access.ok && s._snmp.access.level === 'limited') { clear(sections); }
+      else renderSnmpSections(s);
+      if (Date.now() - (s._snmp.fetchedAt || 0) >= 30000 && !s._snmp.loading) {
+        s._snmp.loading = true;
+        loadSnmpPanel(s, root, false).then(() => { s._snmp.loading = false; }, () => { s._snmp.loading = false; });
+      }
+    } else if (!s._snmp.loading) {
+      s._snmp.loading = true;
+      loadSnmpPanel(s, root, false).then(() => { s._snmp.loading = false; }, () => { s._snmp.loading = false; });
+    }
+  }
+
+  // Paint the access banner from the cached access result (shared by the fresh
+  // re-open path and loadSnmpPanel).
+  function paintSnmpBanner(s) {
+    const access = s._snmp.access, banner = s._snmp.banner;
+    if (access && access.ok && access.level !== 'full') {
+      banner.style.display = '';
+      banner.className = 'snmp-access-banner ' + (access.level === 'limited' ? 'warn' : 'info');
+      clear(banner);
+      banner.appendChild(el('span', 'snmp-access-icon', access.level === 'limited' ? '\u26A0' : '\u2139'));
+      banner.appendChild(el('span', '', access.summary));
+    } else {
+      banner.style.display = 'none';
+    }
+  }
+
+  async function loadSnmpPanel(s, root, force) {
+    const sections = s._snmp.sections;
+    // Only show the blocking "Reading…" placeholder on a cold start (no cached
+    // data yet). A background refresh over already-rendered sections must NOT
+    // clear them - that would be the "reloads on every open" flash. The fetched
+    // data lands via renderSnmpSections at the end, updating in place.
+    if (!s._snmp.lastData) {
+      clear(sections);
+      sections.appendChild(el('div', 'card-sub', 'Reading SNMP configuration\u2026'));
+    }
+    let access;
+    try { access = await snmpCfgPost(s, 'access'); }
+    catch (e) { clear(sections); sections.appendChild(el('div', 'panel-err', 'Lost contact with the local server: ' + e.message)); return; }
+    s._snmp.access = access;
+
+    // Access banner. editable is true only for a full DefaultSuper credential.
+    const editable = access.ok && access.level === 'full';
+    s._snmp.editable = editable;
+    paintSnmpBanner(s);
+
+    // If the credential can't even read the config tables, there is nothing
+    // to list — show only the banner and stop.
+    if (access.ok && access.level === 'limited') {
+      clear(sections);
+      return;
+    }
+
+    // Load the four lists ONE AT A TIME, not in parallel. Each request opens
+    // its own SNMP session on the server and walks several tables; firing all
+    // four at once meant four concurrent sessions doing ~15 table walks
+    // simultaneously, which a C1300's SNMP agent handles badly — especially
+    // right after a VACM/community change or alongside a config save. Serial
+    // keeps the switch under the load of a single session at a time.
+    // System identity (name/location/contact) lives in the Details panel.
+    const recips = await snmpCfgPost(s, 'recipients').catch(() => null);
+    const comms = await snmpCfgPost(s, 'communities').catch(() => null);
+    const groups = await snmpCfgPost(s, 'groups').catch(() => null);
+    const users = await snmpCfgPost(s, 'users').catch(() => null);
+    // Integrity check: malformed snmpTargetAddrTable rows cause the switch's
+    // %SNMP-F-BADTDOMAIN fault and can crash config processing. If any are
+    // found, show them first with one-click removal — this is the usual debris
+    // of a write interrupted by an earlier crash.
+    const tcheck = await snmpCfgPost(s, 'target-check').catch(() => null);
+    // Preserve scroll across the rebuild (standard A7). A self-managed module's
+    // reload clears and repopulates its sections, which would otherwise jump the
+    // page after an edit.
+    // Render with scroll preserved around the rebuild (standard B5). Each section
+    // lives in its own stable wrapper node kept on s._snmp.secNodes, so a single
+    // create/delete can refresh just that section's data and re-render only its
+    // wrapper (reloadSnmpSection) instead of reloading the whole module.
+    s._snmp.lastData = { recips: recips, comms: comms, groups: groups, users: users, tcheck: tcheck };
+    s._snmp.editable = editable;
+    s._snmp.fetchedAt = Date.now();   // for the on-open freshness check (§B4)
+    renderSnmpSections(s);
+  }
+
+  // Render all SNMP sections from cached data (s._snmp.lastData) into the stable
+  // wrapper nodes. Called by loadSnmpPanel after a fetch, and by paintSnmpPanel
+  // on a re-open when the cache is still fresh (no re-fetch). Each section lives
+  // in its own wrapper on s._snmp.secNodes, so reloadSnmpSection can refresh one.
+  function renderSnmpSections(s) {
+    const sections = s._snmp.sections;
+    const d = s._snmp.lastData || {};
+    const editable = s._snmp.editable;
+    s._snmp.secNodes = s._snmp.secNodes || {};
+    const mount = (name, node) => {
+      const wrap = s._snmp.secNodes[name] || el('div', 'snmp-sec-wrap');
+      s._snmp.secNodes[name] = wrap;
+      clear(wrap);
+      // An empty placeholder (no real section content) collapses the wrapper so
+      // the flex gap doesn't leave a phantom blank where e.g. bad-rows would be.
+      if (node && node.childNodes.length) { wrap.appendChild(node); wrap.style.display = ''; }
+      else { wrap.style.display = 'none'; }
+      return wrap;
+    };
+    selfManagedRender(s, () => {
+      clear(sections);
+      sections.appendChild(mount('badRows',
+        (d.tcheck && d.tcheck.ok && d.tcheck.bad && d.tcheck.bad.length) ? snmpBadRowsSection(s, d.tcheck.bad, editable) : el('div')));
+      sections.appendChild(mount('recipients', snmpRecipientsSection(s, d.recips, editable)));
+      sections.appendChild(mount('communities', snmpCommunitiesSection(s, d.comms, editable)));
+      sections.appendChild(mount('groups', snmpGroupsSection(s, d.groups, editable)));
+      sections.appendChild(mount('users', snmpUsersSection(s, d.users, editable)));
+    });
+  }
+
+  // Refresh ONE SNMP-config section in place: re-fetch only that section's data
+  // and re-render only its wrapper node, instead of reloading the whole module
+  // (6 serial fetches). `which` is one or more of recipients/communities/groups/
+  // users; 'target-check' is refreshed alongside recipient/community changes
+  // because those affect target bindings and the bad-rows banner. Returns a
+  // promise so a write's runButtonAction settle can hold the spinner until the
+  // section updates (standard B5). Falls back to a full reload if the panel
+  // hasn't been rendered yet (no stable wrappers).
+  async function reloadSnmpSection(s, which) {
+    const names = Array.isArray(which) ? which : [which];
+    if (!s._snmp || !s._snmp.secNodes || !s._snmp.editable) { return loadSnmpPanel(s, s._snmp && s._snmp.root, true); }
+    const editable = s._snmp.editable;
+    const touchesTargets = names.some((n) => n === 'recipients' || n === 'communities');
+    const render = (name, node) => {
+      const wrap = s._snmp.secNodes[name];
+      if (!wrap) return;
+      selfManagedRender(s, () => {
+        clear(wrap);
+        if (node && node.childNodes.length) { wrap.appendChild(node); wrap.style.display = ''; }
+        else { wrap.style.display = 'none'; }
+      });
+    };
+    for (const name of names) {
+      if (name === 'recipients') { const d = await snmpCfgPost(s, 'recipients').catch(() => null); s._snmp.lastData.recips = d; render('recipients', snmpRecipientsSection(s, d, editable)); }
+      else if (name === 'communities') { const d = await snmpCfgPost(s, 'communities').catch(() => null); s._snmp.lastData.comms = d; render('communities', snmpCommunitiesSection(s, d, editable)); }
+      else if (name === 'groups') { const d = await snmpCfgPost(s, 'groups').catch(() => null); s._snmp.lastData.groups = d; render('groups', snmpGroupsSection(s, d, editable)); }
+      else if (name === 'users') { const d = await snmpCfgPost(s, 'users').catch(() => null); s._snmp.lastData.users = d; render('users', snmpUsersSection(s, d, editable)); }
+    }
+    if (touchesTargets) {
+      const tcheck = await snmpCfgPost(s, 'target-check').catch(() => null);
+      s._snmp.lastData.tcheck = tcheck;
+      render('badRows', (tcheck && tcheck.ok && tcheck.bad && tcheck.bad.length) ? snmpBadRowsSection(s, tcheck.bad, editable) : el('div'));
+    }
+  }
+
+  function snmpSection(title, actionBtn) {
+    const sec = el('div', 'snmp-section');
+    const head = el('div', 'snmp-section-head');
+    head.appendChild(el('h4', 'snmp-section-title', title));
+    if (actionBtn) head.appendChild(actionBtn);
+    sec.appendChild(head);
+    return sec;
+  }
+
+  // Build a table. If rowKey(rowData,i) is given, each <tr> is tagged so an
+  // inline editor row can be opened directly beneath it with openRowEditor().
+
+  // Open an inline editor directly under a table row. Returns the host <div>
+  // inside a full-width cell. Any existing inline editor is closed first.
+  function openRowEditor(tr, colspan) {
+    closeRowEditors(tr.closest('table'));
+    const editTr = el('tr', 'snmp-edit-row');
+    const td = el('td'); td.colSpan = colspan;
+    const host = el('div', 'snmp-edit-host');
+    td.appendChild(host); editTr.appendChild(td);
+    tr.insertAdjacentElement('afterend', editTr);
+    host.scrollIntoView({ block: 'nearest' });
+    return host;
+  }
+  function closeRowEditors(scope) {
+    const root = scope || document;
+    root.querySelectorAll('.snmp-edit-row').forEach((r) => r.remove());
+  }
+
+  // ---- Malformed target rows (BADTDOMAIN debris) ----
+  function snmpBadRowsSection(s, bad, editable) {
+    const sec = snmpSection('Malformed target rows');
+    const warn = el('div', 'snmp-access-banner warn');
+    warn.appendChild(el('span', 'snmp-access-icon', '\u26A0'));
+    warn.appendChild(el('span', '', 'These snmpTargetAddrTable rows have a transport domain the switch cannot turn into a UDP address. ' +
+      'They trigger the switch\u2019s %SNMP-F-BADTDOMAIN fault and can crash configuration saves. ' +
+      'They are usually left behind by a write that was interrupted. Removing them is safe.'));
+    sec.appendChild(warn);
+    const cols = ['Row', 'Transport domain', 'TAddress bytes', 'Problem'].concat(editable ? [''] : []);
+    const rows = bad.map((b) => {
+      const base = [b.name, b.domain || '(none)', String(b.taddrLen), b.reason];
+      if (editable) base.push(actGroup([
+        actBtnConfirm('Remove', (e) => delBadTargetRow(s, b), 'danger', 'Remove this malformed row')
+      ]));
+      return base;
+    });
+    sec.appendChild(plainTable(s, cols, rows));
+    return sec;
+  }
+  function delBadTargetRow(s, b) {
+    snmpDeleteDirect(s, 'target-row-delete-apply', { key: { destroyOid: b.destroyOid } }, 'malformed row ' + b.name);
+  }
+
+  // ---- Recipients ----
+  function snmpRecipientsSection(s, data, editable) {
+    const sec = snmpSection('Notification recipients');
+    const addHost = editable ? addControl('Add recipient', () => openEditPopout(s, 'Add recipient', (pane, close) => addSnmpRecipient(s, pane, close))) : null;
+    if (addHost) sec._addHost = addHost;
+    if (!data || !data.ok) { sec.appendChild(el('div', 'card-sub', 'Recipients unavailable.')); return sec; }
+    const recips = data.recipients || [];
+    if (data.auth_failure_traps && data.auth_failure_traps !== 'unknown') {
+      sec.appendChild(el('div', 'snmp-subnote', 'Authentication-failure traps: ' + data.auth_failure_traps));
+    }
+    if (!recips.length) { sec.appendChild(el('div', 'card-sub', 'No notification recipients configured.')); if (addHost) sec.appendChild(addHost); return sec; }
+    const cols = ['Address', 'Port', 'Type', 'Version', 'Community / user', 'Status'].concat(editable ? [''] : []);
+    const rows = recips.map((r) => {
+      const base = [r.address, r.port, r.type, r.version, r.security_name, r.status];
+      if (editable) base.push(r.key ? actGroup([
+        actBtnConfirm('Delete', (e) => delSnmpRecipient(s, r), 'danger', 'Delete this recipient')
+      ]) : '');
+      return base;
+    });
+    sec.appendChild(plainTable(s, cols, rows));
+    if (addHost) sec.appendChild(addHost);
+    return sec;
+  }
+
+  function delSnmpRecipient(s, r) {
+    snmpDeleteDirect(s, 'recipient-delete-apply', { key: r.key }, 'recipient ' + r.address);
+  }
+
+  function snmpCommunitiesSection(s, data, editable) {
+    const sec = snmpSection('SNMP communities');
+    const addHost = editable ? addControl('Add community', () => openEditPopout(s, 'Add community', (pane, close) => addSnmpCommunity(s, pane, close))) : null;
+    if (!data || !data.ok) { sec.appendChild(el('div', 'card-sub', 'Communities unavailable.')); return sec; }
+    const comms = data.communities || [];
+    s._snmp.communities = comms;
+    if (!comms.length) { sec.appendChild(el('div', 'card-sub', 'No communities found.')); if (addHost) sec.appendChild(addHost); return sec; }
+    // Traps and Status are not shown: Traps is only populated for the legacy
+    // Cisco station-restricted community table (unused here, always blank), and
+    // Status cannot be changed through the tool (a community is present or
+    // deleted), so it is an assumed constant.
+    const cols = ['Community', 'Station', 'Access', 'View'].concat(editable ? [''] : []);
+    const rows = comms.map((c, i) => {
+      const base = [c.community, c.station || 'any', c.access || '', c.view || '\u2014'];
+      if (editable) base.push(c.key ? actGroup([
+        actBtnConfirm('Delete', (e) => runButtonAction(e.currentTarget, {
+          failLabel: 'Delete community',
+          run: () => snmpDeleteDirect(s, 'community-delete-apply', { key: c.key }, 'community \u201C' + c.community + '\u201D'),
+          ok: (r) => r && r.ok,
+          error: (r) => (r && r.error) || 'the switch rejected it',
+          settle: () => reloadSnmpSection(s, 'communities')
+        }), 'danger', 'Delete this community')
+      ]) : '');
+      return base;
+    });
+    // Row-click opens the standard tabbed popout hosting the editor.
+    sec.appendChild(plainTable(s, cols, rows, editable ? (i) => {
+      const c = comms[i];
+      if (c && c.key) openEditPopout(s, 'Community \u00b7 ' + c.community,
+        (pane, close) => editSnmpCommunity(s, c, pane, close));
+    } : null));
+    if (addHost) sec.appendChild(addHost);
+    return sec;
+  }
+
+  function snmpGroupsSection(s, data, editable) {
+    const sec = snmpSection('SNMPv3 groups');
+    const addHost = editable ? addControl('Add group', () => openEditPopout(s, 'Add group', (pane, close) => addSnmpGroup(s, pane, close))) : null;
+    if (!data || !data.ok) { sec.appendChild(el('div', 'card-sub', 'Groups unavailable.')); return sec; }
+    const groups = data.groups || [];
+    s._snmp.groups = groups;
+    if (!groups.length) { sec.appendChild(el('div', 'card-sub', 'No SNMPv3 groups found.')); if (addHost) sec.appendChild(addHost); return sec; }
+    const vcell = (views, lvl) => { const v = (views || {})[lvl]; if (!v) return '\u2014'; return [v.read, v.write, v.notify].map((x) => x || '\u2014').join(' / '); };
+    // Group editing is now via row-click (its only action was Edit), so no
+    // action column is needed.
+    const cols = ['Group', 'No Auth (R/W/N)', 'Auth (R/W/N)', 'Privacy (R/W/N)', 'Members'];
+    const rows = groups.map((g) => [g.group, vcell(g.views, 'noAuthNoPriv'), vcell(g.views, 'authNoPriv'), vcell(g.views, 'authPriv'), g.members]);
+    sec.appendChild(plainTable(s, cols, rows, editable ? (i) => {
+      const g = groups[i];
+      openEditPopout(s, 'Group \u00b7 ' + g.group, (pane, close) => editSnmpGroup(s, g, pane, close));
+    } : null));
+    if (addHost) sec.appendChild(addHost);
+    return sec;
+  }
+
+  function snmpUsersSection(s, data, editable) {
+    const sec = snmpSection('SNMPv3 users');
+    if (!data || !data.ok) { sec.appendChild(el('div', 'card-sub', 'Users unavailable.')); return sec; }
+    const users = data.users || [];
+    sec.appendChild(el('div', 'snmp-subnote', 'Users are created in the switch web GUI; this lists them, their group mapping, and can delete them.'));
+    if (!users.length) { sec.appendChild(el('div', 'card-sub', 'No SNMPv3 users found.')); return sec; }
+    const cols = ['User', 'Auth', 'Privacy', 'Group', 'Status'].concat(editable ? [''] : []);
+    const rows = users.map((u) => {
+      const base = [u.name, u.auth, u.priv, u.group, u.status];
+      if (editable) base.push(u.key ? actGroup([
+        actBtnConfirm('Delete', (e) => runButtonAction(e.currentTarget, {
+          failLabel: 'Delete user',
+          run: () => snmpDeleteDirect(s, 'user-delete-apply', { key: u.key }, 'SNMPv3 user \u201C' + u.name + '\u201D'),
+          ok: (r) => r && r.ok,
+          error: (r) => (r && r.error) || 'the switch rejected it',
+          settle: () => reloadSnmpSection(s, 'users')
+        }), 'danger', 'Delete this user')
+      ]) : '');
+      return base;
+    });
+    sec.appendChild(plainTable(s, cols, rows));
+    return sec;
+  }
+
+  // Delete an SNMP object (the two-tap button already confirmed). Returns a
+  // normalized result for runButtonAction; the caller owns the button lifecycle
+  // and the per-section refresh in settle. The two-tap confirm already happened.
+  async function snmpDeleteDirect(s, applyAction, payload, label) {
+    s.writeBusy = true;
+    try {
+      const j = await snmpCfgPost(s, applyAction, payload);
+      s.writeBusy = false;
+      if (!j.ok || (j.applied && !j.applied.ok)) {
+        const detail = (j.applied && (j.applied.log || []).find((x) => !x.ok)) || null;
+        return { ok: false, error: j.error || (detail && detail.detail) || 'the switch rejected it' };
+      }
+      markConfigDirty(s);
+      return { ok: true };
+    } catch (e) { s.writeBusy = false; return { ok: false, error: e.message }; }
+  }
+
+  // ---- inline form infrastructure ----
+  // Forms render inline: add forms into a host at the foot of their section,
+  // and row actions (edit group, delete) into an editor row directly beneath
+  // the item. This keeps every edit as close to its target as possible. The
+  // original tool's inline add/edit UX: fill fields, Preview to see the exact
+  // SETs, then Apply. No browser prompt dialogs.
+
+  // Dismiss a form/preview: if it sits in an inline row-editor, remove that
+  // whole row; otherwise just empty the host it rendered into.
+  function dismissHost(host) {
+    if (!host) return;
+    const editRow = host.closest ? host.closest('.snmp-edit-row') : null;
+    if (editRow) editRow.remove(); else clear(host);
+  }
+
+  function snmpField(label, control) {
+    const f = el('div', 'snmp-field');
+    f.appendChild(el('label', '', label));
+    f.appendChild(control);
+    return f;
+  }
+  function textInput(value, placeholder) {
+    const i = el('input'); i.type = 'text'; if (value != null) i.value = value; if (placeholder) i.placeholder = placeholder;
+    return i;
+  }
+  function selectInput(options, value) {
+    const sel = el('select');
+    for (const o of options) {
+      const opt = el('option', '', o.label); opt.value = o.value;
+      if (o.value === value) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    return sel;
+  }
+
+  // Render a plan preview with an Apply button; on apply, run the action and
+  // reload. cfgProvider returns the config/key object to send (captured now).
+  function snmpFormMsg(host, kind, text) {
+    let m = host.querySelector('.snmp-msg');
+    if (!m) { m = el('div', 'snmp-msg'); host.appendChild(m); }
+    m.className = 'snmp-msg ' + kind; m.textContent = text;
+  }
+
+  // Preview helper: POST the preview action, then show the plan.
+  // Apply an SNMP add/modify directly. The old two-step preview (show the VACM
+  // plan, then Apply) was a debugging aid; an end user just wants the change
+  // made. The calling button already carries two-tap confirmation, so this
+  // commits straight away and reloads the panel.
+  // Apply an SNMP-config create/modify. Button lifecycle via runButtonAction
+  // (standard B6); on success the form's popout closes and ONLY the affected
+  // section is refreshed in place (standard B5), not the whole module. `section`
+  // is which section to reload (communities/recipients/groups). Detailed errors
+  // go to the form's own message line, which is better UX than a toast here.
+  function snmpPreview(s, host, previewAction, applyAction, payload, title, applyBtn, section) {
+    runButtonAction(applyBtn, {
+      failLabel: title || 'Apply',
+      run: async () => {
+        s.writeBusy = true;
+        try {
+          const j = await snmpCfgPost(s, applyAction, payload);
+          s.writeBusy = false;
+          if (!j.ok) return { ok: false, error: j.error };
+          const r = j.applied;
+          if (r && !r.ok) { const bad = (r.log || []).find((x) => !x.ok); return { ok: false, error: 'Did not complete: ' + (bad ? bad.detail : 'unknown error') }; }
+          return { ok: true };
+        } catch (e) { s.writeBusy = false; return { ok: false, error: 'Lost contact with the local server: ' + e.message }; }
+      },
+      ok: (r) => r && r.ok,
+      error: (r) => { snmpFormMsg(host, 'bad', (r && r.error) || 'the switch rejected it'); return (r && r.error) || 'the switch rejected it'; },
+      onApplied: () => {
+        const pop = host.closest && host.closest('.port-detail-back');
+        if (pop) pop.remove();
+        markConfigDirty(s);
+      },
+      settle: () => reloadSnmpSection(s, section || ['recipients', 'communities', 'groups', 'users'])
+    });
+  }
+
+  // ---- Add recipient (inline form) ----
+  async function addSnmpRecipient(s, host, onCancel) {
+    clear(host);
+    const form = el('div', 'snmp-form');
+    form.appendChild(el('h5', '', 'Add notification recipient'));
+    form.appendChild(el('p', 'intro', 'Creates the snmpTargetAddr / Params / Notify rows the switch uses for an snmp-server host, plus the community mapping row for v1/v2c.'));
+
+    const ip = textInput('', '192.168.1.50');
+    const port = textInput('162');
+    const ntype = selectInput([{ label: 'Trap', value: 'trap' }, { label: 'Inform (acknowledged)', value: 'inform' }], 'trap');
+    const version = selectInput([{ label: 'SNMPv2c', value: '2c' }, { label: 'SNMPv1', value: '1' }, { label: 'SNMPv3', value: '3' }], '2c');
+    // Community is a dropdown of the communities that exist on the switch.
+    let commNames = [];
+    try { const cj = await snmpCfgPost(s, 'communities'); if (cj.ok) commNames = (cj.communities || []).map((c) => c.community).filter(Boolean); } catch (e) {}
+    const community = selectInput(commNames.length
+      ? commNames.map((c) => ({ label: c, value: c }))
+      : [{ label: '(no communities found)', value: '' }], commNames[0] || '');
+    const user = textInput('', 'existing SNMPv3 user');
+    const level = selectInput([{ label: 'authPriv', value: 'authPriv' }, { label: 'authNoPriv', value: 'authNoPriv' }, { label: 'noAuthNoPriv', value: 'noAuthNoPriv' }], 'authPriv');
+    const timeout = textInput('15'); const retries = textInput('3');
+
+    const grid = el('div', 'snmp-form-grid');
+    grid.appendChild(snmpField('Recipient IPv4 address', ip));
+    grid.appendChild(snmpField('UDP port', port));
+    grid.appendChild(snmpField('Notification type', ntype));
+    grid.appendChild(snmpField('Version', version));
+    const commField = snmpField('Community sent in notifications', community);
+    const userField = snmpField('SNMPv3 user (must exist on switch)', user);
+    const levelField = snmpField('Security level', level);
+    const toField = snmpField('Inform timeout (s)', timeout);
+    const rtField = snmpField('Inform retries', retries);
+    grid.appendChild(commField); grid.appendChild(userField); grid.appendChild(levelField);
+    grid.appendChild(toField); grid.appendChild(rtField);
+    form.appendChild(grid);
+
+    function sync() {
+      const v3 = version.value === '3';
+      const inform = ntype.value === 'inform';
+      commField.style.display = v3 ? 'none' : '';
+      userField.style.display = v3 ? '' : 'none';
+      levelField.style.display = v3 ? '' : 'none';
+      toField.style.display = inform ? '' : 'none';
+      rtField.style.display = inform ? '' : 'none';
+    }
+    version.addEventListener('change', sync); ntype.addEventListener('change', sync); sync();
+
+    const actions = el('div', 'snmp-form-actions');
+    const preview = el('button', 'btn btn-small btn-blue', 'Apply');
+    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
+      cancel.addEventListener('click', () => { if (onCancel) onCancel(); else dismissHost(host); });
+    withConfirm(preview, () => {
+      const cfg = { ip: ip.value.trim(), port: port.value.trim(), ntype: ntype.value, version: version.value };
+      if (version.value === '3') { cfg.user = user.value.trim(); cfg.level = level.value; }
+      else cfg.community = community.value;
+      if (ntype.value === 'inform') { cfg.timeout = timeout.value; cfg.retries = retries.value; }
+      snmpPreview(s, host, 'recipient-add-preview', 'recipient-add-apply', { cfg }, 'Add recipient ' + cfg.ip, preview, 'recipients');
+    });
+    actions.appendChild(preview); actions.appendChild(cancel);
+    form.appendChild(actions);
+    host.appendChild(form); host.scrollIntoView({ block: 'nearest' });
+    ip.focus();
+  }
+
+  // ---- Add community (inline form) ----
+  // Edit a community: all fields shown, but only access mode and view are
+  // editable — the others are greyed out (read-only) because only the VACM
+  // access row can be meaningfully changed over SNMP.
+  async function editSnmpCommunity(s, c, host, onCancel) {
+    const form = el('div', 'snmp-form');
+    form.appendChild(el('h5', '', 'Edit community ' + c.community));
+    form.appendChild(el('p', 'intro', 'Only the access mode and view can be changed. The community string and allowed stations are fixed — to change those, delete and re-add the community.'));
+    // Community string — shown, disabled.
+    const nameRO = textInput(c.community); nameRO.disabled = true;
+    const station = textInput(c.station || 'any'); station.disabled = true;
+    const access = selectInput([{ label: 'Read Only', value: 'read-only' }, { label: 'Read Write', value: 'read-write' }, { label: 'SNMP Admin', value: 'snmp-admin' }],
+      /write/i.test(c.access || '') ? (/admin/i.test(c.access || '') ? 'snmp-admin' : 'read-write') : 'read-only');
+    const views = await viewOptions(s);
+    const view = selectInput([{ label: '(default for the mode)', value: '' }].concat(views.map((v) => ({ label: v, value: v }))),
+      (c.view && c.view !== '\u2014') ? c.view : '');
+    const grid = el('div', 'snmp-form-grid');
+    grid.appendChild(snmpField('Community string', nameRO));
+    grid.appendChild(snmpField('Station', station));
+    grid.appendChild(snmpField('Access mode', access));
+    grid.appendChild(snmpField('View', view));
+    form.appendChild(grid);
+    const actions = el('div', 'snmp-form-actions');
+    const preview = el('button', 'btn btn-small btn-blue', 'Apply');
+    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
+    cancel.addEventListener('click', () => { if (onCancel) onCancel(); });
+    withConfirm(preview, () => {
+      snmpPreview(s, host, 'community-modify-preview', 'community-modify-apply',
+        { cfg: { community: c.community, access: access.value, view: view.value } },
+        'Modify community \u201C' + c.community + '\u201D', preview, 'communities');
+    });
+    actions.appendChild(preview); actions.appendChild(cancel);
+    form.appendChild(actions);
+    host.appendChild(form);
+  }
+
+  async function addSnmpCommunity(s, host, onCancel) {
+    clear(host);
+    const form = el('div', 'snmp-form');
+    form.appendChild(el('h5', '', 'Add SNMP community'));
+    form.appendChild(el('p', 'intro', "Adds a community with its VACM group rows and the matched IPv4 + IPv6 manager-binding rows, exactly the way the switch's own Community page does. Pick an access mode and, optionally, a specific view (loaded from the switch; leave as the mode default)."));
+    const name = textInput('', 'community string');
+    const access = selectInput([{ label: 'Read Only', value: 'read-only' }, { label: 'Read Write', value: 'read-write' }, { label: 'SNMP Admin', value: 'snmp-admin' }], 'read-only');
+    const views = await viewOptions(s);
+    const view = selectInput([{ label: '(default for the mode)', value: '' }].concat(views.map((v) => ({ label: v, value: v }))), '');
+    const grid = el('div', 'snmp-form-grid');
+    grid.appendChild(snmpField('Community string', name));
+    grid.appendChild(snmpField('Access mode', access));
+    grid.appendChild(snmpField('View', view));
+    form.appendChild(grid);
+    const actions = el('div', 'snmp-form-actions');
+    const preview = el('button', 'btn btn-small btn-blue', 'Apply');
+    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
+      cancel.addEventListener('click', () => { if (onCancel) onCancel(); else dismissHost(host); });
+    withConfirm(preview, () => {
+      if (!name.value.trim()) { snmpFormMsg(host, 'bad', 'Enter a community string.'); return; }
+      snmpPreview(s, host, 'community-add-preview', 'community-add-apply',
+        { cfg: { community: name.value.trim(), access: access.value, view: view.value } },
+        'Add community \u201C' + name.value.trim() + '\u201D', preview, 'communities');
+    });
+    actions.appendChild(preview); actions.appendChild(cancel);
+    form.appendChild(actions);
+    host.appendChild(form); host.scrollIntoView({ block: 'nearest' }); name.focus();
+  }
+
+  // ---- group view grid (shared by add + edit) ----
+  async function viewOptions(s) {
+    let views = [];
+    try { const j = await snmpCfgPost(s, 'views'); if (j.ok) views = j.views || []; } catch (e) {}
+    return views;
+  }
+  function viewSelect(views, current) {
+    const opts = [{ label: '(none)', value: '' }].concat(views.map((v) => ({ label: v, value: v })));
+    if (current && !views.includes(current)) opts.push({ label: current + ' (current)', value: current });
+    return selectInput(opts, current || '');
+  }
+  function groupLevelGrid(views, existing) {
+    // returns { table, read(level), write(level), notify(level) accessors }
+    const table = el('table', 'snmp-view-table');
+    const thead = el('thead'); const htr = el('tr');
+    ['Security level', 'Read view', 'Write view', 'Notify view'].forEach((h) => htr.appendChild(el('th', '', h)));
+    thead.appendChild(htr); table.appendChild(thead);
+    const tb = el('tbody');
+    const cells = {};
+    const levels = [['noAuthNoPriv', 'No Authentication'], ['authNoPriv', 'Authentication'], ['authPriv', 'Privacy']];
+    for (const [key, label] of levels) {
+      const lv = (existing || {})[key] || {};
+      const tr = el('tr');
+      const lc = el('td');
+      lc.appendChild(el('div', 'snmp-lvl-label', label));
+      lc.appendChild(el('div', 'snmp-lvl-sub', key));
+      tr.appendChild(lc);
+      const rSel = viewSelect(views, lv.read), wSel = viewSelect(views, lv.write), nSel = viewSelect(views, lv.notify);
+      [rSel, wSel, nSel].forEach((sel) => { const td = el('td'); td.appendChild(sel); tr.appendChild(td); });
+      cells[key] = { read: rSel, write: wSel, notify: nSel };
+      tb.appendChild(tr);
+    }
+    table.appendChild(tb);
+    return { table, cells };
+  }
+  function collectLevels(cells) {
+    const levels = {};
+    for (const key of Object.keys(cells)) {
+      levels[key] = { read: cells[key].read.value, write: cells[key].write.value, notify: cells[key].notify.value };
+    }
+    return levels;
+  }
+
+  // ---- Add group (inline form with view grid) ----
+  async function addSnmpGroup(s, host, onCancel) {
+    clear(host);
+    const form = el('div', 'snmp-form');
+    form.appendChild(el('h5', '', 'Add SNMPv3 group'));
+    form.appendChild(el('p', 'intro', "A group sets Read / Write / Notify views per security level, like the switch's Groups page. Leave a level's views as (none) to not configure it. Views load from the switch."));
+    const name = textInput('', 'group name');
+    const grid = el('div', 'snmp-form-grid'); grid.appendChild(snmpField('Group name', name));
+    form.appendChild(grid);
+    const views = await viewOptions(s);
+    const { table, cells } = groupLevelGrid(views, { authPriv: { read: 'DefaultSuper', notify: 'DefaultSuper' } });
+    const tw = el('div', 'tablewrap'); tw.appendChild(table); form.appendChild(tw);
+    const actions = el('div', 'snmp-form-actions');
+    const preview = el('button', 'btn btn-small btn-blue', 'Apply');
+    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
+      cancel.addEventListener('click', () => { if (onCancel) onCancel(); else dismissHost(host); });
+    withConfirm(preview, () => {
+      if (!name.value.trim()) { snmpFormMsg(host, 'bad', 'Enter a group name.'); return; }
+      snmpPreview(s, host, 'group-add-preview', 'group-add-apply',
+        { cfg: { group: name.value.trim(), levels: collectLevels(cells) } }, 'Add group \u201C' + name.value.trim() + '\u201D', preview, 'groups');
+    });
+    actions.appendChild(preview); actions.appendChild(cancel);
+    form.appendChild(actions);
+    host.appendChild(form); host.scrollIntoView({ block: 'nearest' }); name.focus();
+  }
+
+  // ---- Edit group views (inline form with view grid, prefilled) ----
+  async function editSnmpGroup(s, g, host, onCancel) {
+    const form = el('div', 'snmp-form');
+    form.appendChild(el('h5', '', 'Edit views for group ' + g.group));
+    form.appendChild(el('p', 'intro', "Change the Read / Write / Notify view for each security level. Clearing all three of a level removes that level's access row. Levels you don't change are left as-is."));
+    const views = await viewOptions(s);
+    const { table, cells } = groupLevelGrid(views, g.views || {});
+    const tw = el('div', 'tablewrap'); tw.appendChild(table); form.appendChild(tw);
+    const actions = el('div', 'snmp-form-actions');
+    const preview = el('button', 'btn btn-small btn-blue', 'Apply');
+    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
+    cancel.addEventListener('click', () => { if (onCancel) onCancel(); });
+    withConfirm(preview, () => {
+      snmpPreview(s, host, 'group-modify-preview', 'group-modify-apply',
+        { cfg: { group: g.key.display || g.group, levels: collectLevels(cells) } }, 'Modify group \u201C' + g.group + '\u201D', preview, 'groups');
+    });
+    actions.appendChild(preview); actions.appendChild(cancel);
+    form.appendChild(actions);
+    host.appendChild(form);
+  }
+
+
+  function offerSetup(s) {
+    s.setupIntro.textContent = 'Connected to ' + (s.host || 'the switch') +
+      '. There are no SNMP credentials for it yet. Enter SNMP credentials to use the ' +
+      'dashboard, or go to the CLI.';
+    showView(s, 'setup');
+  }
+
+  function initSetup(s) {
+    q2(s, '.f-setup-cli').addEventListener('click', () => {
+      s.wantTerminal = true;
+      openOverlay(s, 'termOverlay');
+    });
+    q2(s, '.f-setup-snmp').addEventListener('click', () => {
+      if (s.subMode !== 'ready') selectCredCard(s, 'snmp');
+      showView(s, 'creds');
+      s.hostInput.focus();
+    });
+  }
+
+  const q2 = (s, sel) => s.pane.querySelector(sel);
+
+
+  /**
+   * One metric, at full size, over as long as it has been recorded.
+   *
+   * The sparkline on a card answers "is this moving"; this answers "when
+   * did it start" and "is today unusual", which needs axes, a range and
+   * the numbers spelled out.
+   */
+  const METRICS = {
+    cpu: { label: 'CPU utilisation', unit: '%', colour: 'var(--green)', max: 100 },
+    poeW: { label: 'PoE load', unit: 'W', colour: 'var(--blue)' },
+    cpuPps: { label: 'CPU input rate', unit: 'pps', colour: 'var(--amber)' }
+  };
+
+  function initGraph(s) {
+    s.graphOverlay = s.pane.querySelector('.f-graph-overlay');
+    s.graphBody = s.pane.querySelector('.f-graph-body');
+    s.graphTitle = s.pane.querySelector('.f-graph-title');
+    s.graphStatus = s.pane.querySelector('.f-graph-status');
+    s.graphRange = 24 * 60 * 60 * 1000;
+
+    s.pane.querySelector('.f-graph-close').addEventListener('click', () => closeOverlays(s));
+    for (const btn of s.pane.querySelectorAll('.graph-ranges .tr')) {
+      btn.addEventListener('click', () => {
+        for (const b of s.pane.querySelectorAll('.graph-ranges .tr')) b.classList.remove('active');
+        btn.classList.add('active');
+        s.graphRange = Number(btn.dataset.range);
+        // The range decides how far back to *ask*, not only what to draw:
+        // choosing "7 days" while holding one day would silently show a
+        // day and label it a week.
+        loadHistory(s, s.graphRange || 0).then(() => drawGraph(s));
+      });
+    }
+    s.pane.querySelector('.f-graph-save').addEventListener('click', () => {
+      const rows = graphSamples(s);
+      const key = s.graphMetric;
+      const csv = 'time,' + key + '\n' + rows
+        .map((r) => new Date(r.t).toISOString() + ',' + (r[key] === undefined ? '' : r[key]))
+        .join('\n');
+      download(safeHost(s.host) + '-' + key + '-' + stamp() + '.csv', csv);
+    });
+  }
+
+  function openGraph(s, key) {
+    if (!METRICS[key]) return;
+    s.graphMetric = key;
+    s.graphTitle.textContent = METRICS[key].label + '  \u00b7  ' + (s.sysName || s.host);
+    openOverlay(s, 'graphOverlay');
+    // The card's own hour is in memory; everything older has to be asked
+    // for, and the range decides how much. graphRange may legitimately be 0
+    // ("All"), which must be passed through rather than replaced by a default.
+    const win = Number.isFinite(s.graphRange) ? s.graphRange : 24 * 60 * 60 * 1000;
+    loadHistory(s, win).then(() => drawGraph(s));
+    drawGraph(s);
+  }
+
+  function graphSamples(s) {
+    const key = s.graphMetric;
+    const since = s.graphRange ? Date.now() - s.graphRange : 0;
+    return (s.history || [])
+      .filter((x) => x.t >= since && x[key] !== null && x[key] !== undefined &&
+        Number.isFinite(x[key]));
+  }
+
+  function drawGraph(s) {
+    const host = s.graphBody;
+    if (!host) return;
+    clear(host);
+    const key = s.graphMetric;
+    const meta = METRICS[key] || {};
+    const pts = graphSamples(s);
+
+    if (pts.length < 2) {
+      host.appendChild(el('div', 'empty-state', pts.length
+        ? 'Only one reading so far in this range \u2014 a line needs two.'
+        : 'Nothing recorded in this range yet.'));
+      s.graphStatus.textContent = '';
+      return;
+    }
+
+    const values = pts.map((p) => p[key]);
+    const min = Math.min.apply(null, values);
+    const max = Math.max.apply(null, values);
+    const avg = values.reduce((a, b) => a + b, 0) / values.length;
+    const peak = pts[values.indexOf(max)];
+
+    const stats = el('div', 'graph-stats');
+    const stat = (label, value) => {
+      const span = el('span', '', label);
+      span.appendChild(el('b', '', value));
+      stats.appendChild(span);
+    };
+    stat('Now', groupNum(values[values.length - 1]) + ' ' + (meta.unit || ''));
+    stat('Peak', groupNum(max) + ' ' + (meta.unit || '') +
+      '  at ' + new Date(peak.t).toLocaleString());
+    stat('Average', groupNum(Math.round(avg * 10) / 10) + ' ' + (meta.unit || ''));
+    stat('Lowest', groupNum(min) + ' ' + (meta.unit || ''));
+    host.appendChild(stats);
+
+    const W = 1000, H = 420, L = 62, R = 18, T = 16, B = 34;
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    svg.setAttribute('preserveAspectRatio', 'none');
+
+    const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+    const tspan = (t1 - t0) || 1;
+    // A y-axis that starts at zero tells the truth about proportion; one
+    // that starts at the minimum shows detail. Utilisation gets zero,
+    // because "40% versus 45%" should not look like a doubling.
+    const top = meta.max ? meta.max : (max <= 0 ? 1 : max * 1.1);
+    const bottom = 0;
+    const x = (t) => L + ((t - t0) / tspan) * (W - L - R);
+    const y = (v) => T + (1 - (v - bottom) / ((top - bottom) || 1)) * (H - T - B);
+
+    const line = (x1, y1, x2, y2, cls) => {
+      const el2 = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      el2.setAttribute('x1', x1); el2.setAttribute('y1', y1);
+      el2.setAttribute('x2', x2); el2.setAttribute('y2', y2);
+      el2.setAttribute('class', cls);
+      svg.appendChild(el2);
+    };
+    const text = (tx, ty, str, anchor) => {
+      const el2 = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      el2.setAttribute('x', tx); el2.setAttribute('y', ty);
+      el2.setAttribute('class', 'graph-tick');
+      if (anchor) el2.setAttribute('text-anchor', anchor);
+      el2.textContent = str;
+      svg.appendChild(el2);
+    };
+
+    for (let i = 0; i <= 4; i++) {
+      const v = bottom + ((top - bottom) * i) / 4;
+      const yy = y(v);
+      line(L, yy, W - R, yy, 'graph-grid');
+      text(L - 8, yy + 3, groupNum(Math.round(v)), 'end');
+    }
+    line(L, T, L, H - B, 'graph-axis');
+    line(L, H - B, W - R, H - B, 'graph-axis');
+
+    // Time labels: a date when the range spans days, a clock when it does
+    // not -- "14:05" on a week-long graph is meaningless.
+    const spansDays = tspan > 36 * 60 * 60 * 1000;
+    for (let i = 0; i <= 4; i++) {
+      const t = t0 + (tspan * i) / 4;
+      const d = new Date(t);
+      text(x(t), H - B + 16,
+        spansDays ? (d.getDate() + '/' + (d.getMonth() + 1))
+          : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        i === 0 ? 'start' : (i === 4 ? 'end' : 'middle'));
+    }
+
+    const d = pts.map((p, i) => (i ? 'L' : 'M') + x(p.t).toFixed(1) + ' ' + y(p[key]).toFixed(1))
+      .join(' ');
+    const area = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    area.setAttribute('d', d + ' L' + x(t1).toFixed(1) + ' ' + y(bottom) +
+      ' L' + x(t0).toFixed(1) + ' ' + y(bottom) + ' Z');
+    area.setAttribute('class', 'graph-area');
+    area.setAttribute('fill', meta.colour || 'var(--green)');
+    svg.appendChild(area);
+
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', d);
+    path.setAttribute('class', 'graph-line');
+    path.setAttribute('stroke', meta.colour || 'var(--green)');
+    svg.appendChild(path);
+
+    /**
+     * Every reading is a point. Above a few hundred they would merge into
+     * a band and hide the line they belong to, so past that they are drawn
+     * smaller and fainter -- still every reading, just not shouting. The
+     * hover works on all of them either way.
+     */
+    const dense = pts.length > 400;
+    const dots = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    for (const point of pts) {
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', x(point.t).toFixed(1));
+      c.setAttribute('cy', y(point[key]).toFixed(1));
+      c.setAttribute('r', dense ? 1 : 2.4);
+      c.setAttribute('fill', meta.colour || 'var(--green)');
+      c.setAttribute('opacity', dense ? 0.45 : 0.9);
+      dots.appendChild(c);
+    }
+    svg.appendChild(dots);
+
+    // The reading under the pointer, spelled out. A crosshair rather than
+    // a hit target per point: at one-pixel spacing you cannot aim at a
+    // dot, but you can always aim at a moment in time.
+    const marker = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    marker.setAttribute('visibility', 'hidden');
+    const vline = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    vline.setAttribute('class', 'graph-grid');
+    vline.setAttribute('y1', T); vline.setAttribute('y2', H - B);
+    marker.appendChild(vline);
+    const ring = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    // Small enough to point at the reading rather than cover it.
+    ring.setAttribute('r', 2.8);
+    ring.setAttribute('fill', 'var(--bg)');
+    ring.setAttribute('stroke', meta.colour || 'var(--green)');
+    ring.setAttribute('stroke-width', 1.4);
+    marker.appendChild(ring);
+    svg.appendChild(marker);
+
+    const readout = el('div', 'graph-readout');
+    readout.style.visibility = 'hidden';
+    host.appendChild(readout);
+
+    const nearest = (time) => {
+      // Binary search: at 25,000 points a linear scan on every mouse move
+      // is enough to make the pointer feel sticky.
+      let lo = 0, hi = pts.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (pts[mid].t < time) lo = mid + 1; else hi = mid;
+      }
+      const before = pts[Math.max(0, lo - 1)];
+      return Math.abs(before.t - time) < Math.abs(pts[lo].t - time) ? before : pts[lo];
+    };
+
+    svg.addEventListener('mousemove', (e) => {
+      const box = svg.getBoundingClientRect();
+      const px = ((e.clientX - box.left) / box.width) * W;
+      if (px < L || px > W - R) { marker.setAttribute('visibility', 'hidden'); readout.style.visibility = 'hidden'; return; }
+      const t = t0 + ((px - L) / (W - L - R)) * tspan;
+      const point = nearest(t);
+      const cx = x(point.t), cy = y(point[key]);
+      vline.setAttribute('x1', cx); vline.setAttribute('x2', cx);
+      ring.setAttribute('cx', cx); ring.setAttribute('cy', cy);
+      marker.setAttribute('visibility', 'visible');
+      readout.textContent = groupNum(point[key]) + ' ' + (meta.unit || '') + '   \u00b7   ' +
+        new Date(point.t).toLocaleString();
+      readout.style.visibility = 'visible';
+      // Beside the cursor rather than parked at the bottom: a reading you
+      // have to go and look for is a reading you read less often.
+      const hostBox = host.getBoundingClientRect();
+      let lx = e.clientX - hostBox.left + 14;
+      let ly = e.clientY - hostBox.top + 16;
+      if (lx + readout.offsetWidth > hostBox.width - 6) {
+        lx = e.clientX - hostBox.left - readout.offsetWidth - 14;
+      }
+      if (ly + readout.offsetHeight > hostBox.height - 6) {
+        ly = e.clientY - hostBox.top - readout.offsetHeight - 14;
+      }
+      readout.style.left = Math.max(0, lx) + 'px';
+      readout.style.top = Math.max(0, ly) + 'px';
+    });
+    svg.addEventListener('mouseleave', () => {
+      marker.setAttribute('visibility', 'hidden');
+      readout.style.visibility = 'hidden';
+    });
+
+    host.appendChild(svg);
+    s.graphStatus.textContent = pts.length.toLocaleString() + ' reading(s) \u00b7 ' +
+      new Date(t0).toLocaleString() + ' to ' + new Date(t1).toLocaleString();
+  }
+
+  /** Open the terminal, or the credentials that it needs first. */
+  /**
+   * Which transports this switch can offer, and which one is live. Kept
+   * on the terminal itself so the answer is where the question is asked.
+   */
+  function paintTransport(s) {
+    if (!s.trConsole) return;
+    // An open socket is not the same as a working session: the far end can
+    // report the console gone while the socket is still up. Both have to
+    // be true.
+    const live = s.ws && s.ws.readyState === WebSocket.OPEN && s.sessionLive !== false;
+    const onConsole = live && s.lastTransport === 'serial';
+    const onSsh = live && s.lastTransport !== 'serial';
+
+    s.trConsole.disabled = !hasConsole(s);
+    s.trSsh.disabled = !hasSsh(s);
+    s.trConsole.classList.toggle('active', !!onConsole);
+    s.trSsh.classList.toggle('active', !!onSsh);
+    s.trConsole.title = hasConsole(s)
+      ? (onConsole ? 'Connected on ' + s.consoleTarget.path
+        : 'Switch to the console on ' + s.consoleTarget.path)
+      : 'No serial port chosen for this switch';
+    s.trSsh.title = hasSsh(s)
+      ? (onSsh ? 'Connected over SSH' : 'Switch to SSH')
+      : 'No SSH credentials for this switch';
+  }
+
+  function openTerminal(s) {
+    s.wantTerminal = true;
+    paintTransport(s);
+    if (s.ws && s.ws.readyState === WebSocket.OPEN) { openOverlay(s, 'termOverlay'); return; }
+    if (s.subMode !== 'ready') selectCredCard(s, 'ssh');
+    showView(s, 'creds');
+    if (!s.sshHost.value) s.sshHost.value = s.host || '';
+    (s.sshUser.value ? s.sshPass : s.sshUser).focus();
+  }
+
+  /** What the switch itself says about whether it has been saved. */
+  function switchSaysUnsaved(s) {
+    const cell = s.health && s.health.scalars && s.health.scalars.rlRunningCDBequalToStartupCDB;
+    if (!cell) return false;
+    // TruthValue: true(1) = equal = saved. Prefer the raw value (robust to any
+    // display format), fall back to the display text.
+    if (cell.value !== undefined && cell.value !== null) {
+      return !(Number(cell.value) === 1 || /true|yes|equal/i.test(String(cell.value)));
+    }
+    return !/true|yes|equal/i.test(String(cell.display));
+  }
+
+  function repaintConfig(s) {
+    if (!s.cfgBody) return;
+    clear(s.cfgBody);
+    s.cfgStatus.textContent = s.target ? s.host : '';
+    /**
+     * While the switch is being written to, the way out is removed rather
+     * than merely discouraged. Closing mid-save looks to the operator like
+     * the save was abandoned -- and they cannot tell that it was not,
+     * which is the worst possible thing to be unsure about after pressing
+     * a button that overwrites a configuration.
+     */
+    const saving = !!s.cfgSaving;
+    s.cfgClose.style.display = saving ? 'none' : '';
+    s.cfgOverlay.classList.toggle('busy', saving);
+    paintConfigPanel(s, s.cfgBody);
+  }
+
+  /**
+   * Line diff via a longest-common-subsequence table. Configurations are a
+   * few hundred lines, so the quadratic table is comfortably affordable and
+   * gives a genuine minimal diff rather than a naive line-by-line compare
+   * that reports everything after an insertion as changed.
+   */
+  /**
+   * Line diff, by longest common subsequence.
+   *
+   * The LCS table is quadratic -- two 16,000-line configurations would ask
+   * for a gigabyte and take about five seconds -- so the parts that
+   * obviously match are removed first. Two configurations from the same
+   * switch share almost everything; trimming the common head and tail
+   * leaves the handful of lines that actually differ, and the expensive
+   * algorithm only ever sees those.
+   */
+  function diffLines(aText, bText) {
+    const aAll = String(aText || '').replace(/\r/g, '').split('\n');
+    const bAll = String(bText || '').replace(/\r/g, '').split('\n');
+
+    let head = 0;
+    while (head < aAll.length && head < bAll.length && aAll[head] === bAll[head]) head++;
+    let tail = 0;
+    while (tail < aAll.length - head && tail < bAll.length - head &&
+      aAll[aAll.length - 1 - tail] === bAll[bAll.length - 1 - tail]) tail++;
+
+    const a = aAll.slice(head, aAll.length - tail);
+    const b = bAll.slice(head, bAll.length - tail);
+    const n = a.length, m = b.length;
+    const lcs = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) {
+        lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+      }
+    }
+    const out = [];
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+      if (a[i] === b[j]) { out.push({ t: ' ', text: a[i] }); i++; j++; }
+      else if (lcs[i + 1][j] >= lcs[i][j + 1]) { out.push({ t: '-', text: a[i] }); i++; }
+      else { out.push({ t: '+', text: b[j] }); j++; }
+    }
+    while (i < n) out.push({ t: '-', text: a[i++] });
+    while (j < m) out.push({ t: '+', text: b[j++] });
+
+    // Put the trimmed parts back, so callers still see whole documents and
+    // the block-aware context has the headers it needs.
+    const result = [];
+    for (let k = 0; k < head; k++) result.push({ t: ' ', text: aAll[k] });
+    for (const row of out) result.push(row);
+    for (let k = aAll.length - tail; k < aAll.length; k++) result.push({ t: ' ', text: aAll[k] });
+    return result;
+  }
+
+  function renderDiff(host, diff, s) {
+    const changed = diff.filter((d) => d.t !== ' ').length;
+    const unsaved = switchSaysUnsaved(s);
+    host.appendChild(el('div', 'card-sub', changed
+      // Said in terms of the running configuration, because that is the
+      // one being changed: a "+" is something you added and have not
+      // saved, a "-" is something you removed that a reload would bring
+      // back.
+      ? changed + ' differing line(s). "+" was added to the running configuration; ' +
+        '"\u2212" was removed from it and is still in startup.'
+      : 'running-config and startup-config are identical.'));
+
+    /**
+     * The switch's "unsaved" flag and the file contents answer different
+     * questions. The flag means something has been written since the last
+     * save; the files can still match if a setting was changed and changed
+     * back. Power-cycling a PoE port does exactly that -- it writes the
+     * port's admin state twice -- so the pair can disagree without either
+     * being wrong, and the disagreement is worth explaining rather than
+     * leaving as a dead end.
+     */
+    if (!changed && unsaved) {
+      host.appendChild(el('div', 'panel-note',
+        'The switch still reports unsaved changes even though the two files match. ' +
+        'That happens when a setting was changed and changed back \u2014 power-cycling ' +
+        'a PoE port does it, since the port\u2019s admin state is written twice. ' +
+        'Saving clears the flag; nothing in the configuration will change.'));
+    }
+
+    // Offer the save whenever the switch considers itself unsaved, whether
+    // or not that shows up as differing lines.
+    if ((changed || unsaved) && s) {
+      const bar = el('div', 'cfg-sync');
+      bar.appendChild(el('div', 'card-sub', changed
+        ? 'The running configuration has not been saved. A reload would revert these ' +
+          changed + ' line(s) to the startup configuration.'
+        : 'The switch reports unsaved changes. Saving clears that.'));
+      const go = el('button', 'btn btn-amber', 'Save running to startup');
+      go.type = 'button'; go.style.width = 'auto';
+      go.title = 'Copies running-config over startup-config on the switch';
+      const confirmRow = el('div', 'cfg-confirm');
+      confirmRow.style.display = 'none';
+      confirmRow.appendChild(el('span', 'card-sub',
+        'Overwrite the startup configuration on ' + s.host + ' with the running configuration?'));
+      const yes = el('button', 'btn btn-danger', 'Yes, overwrite startup');
+      yes.type = 'button'; yes.style.width = 'auto';
+      const no = el('button', 'btn', 'Cancel');
+      no.type = 'button'; no.style.width = 'auto';
+      confirmRow.appendChild(yes); confirmRow.appendChild(no);
+
+      go.addEventListener('click', () => { go.style.display = 'none'; confirmRow.style.display = 'flex'; });
+      no.addEventListener('click', () => { confirmRow.style.display = 'none'; go.style.display = ''; });
+      yes.addEventListener('click', () => syncConfigs(s));
+
+      bar.appendChild(go);
+      bar.appendChild(confirmRow);
+      host.appendChild(bar);
+    }
+    const pre = document.createElement('pre');
+    pre.className = 'diff';
+    const show = visibleDiffLines(diff);
+    let run = 0;
+    for (let k = 0; k < diff.length; k++) {
+      const d = diff[k];
+      if (!show.has(k)) { run++; continue; }
+      if (run) { pre.appendChild(el('span', 'diff-skip', '  \u22ef ' + run + ' unchanged line(s)\n')); run = 0; }
+      pre.appendChild(el('span', d.t === '+' ? 'diff-add' : (d.t === '-' ? 'diff-del' : 'diff-same'),
+        (d.t === ' ' ? '  ' : d.t + ' ') + d.text + '\n'));
+    }
+    if (run) pre.appendChild(el('span', 'diff-skip', '  \u22ef ' + run + ' unchanged line(s)\n'));
+    host.appendChild(pre);
+  }
+
+  /**
+   * Which lines to print around each change.
+   *
+   * A few lines of context is the wrong unit for a switch configuration.
+   * "snmp trap link-status" added to two ports shows up as two identical
+   * one-line changes, and three lines either side often does not reach the
+   * `interface` header -- so the diff tells you *what* changed and leaves
+   * you to work out *where*, which is the part you actually needed.
+   *
+   * A configuration is made of blocks: an unindented header with indented
+   * lines under it. So a change inside a block shows the whole block, and
+   * the header names the interface, the VLAN, the line. Changes outside
+   * any block keep the usual few lines of context.
+   */
+  function visibleDiffLines(diff, contextLines) {
+    const context = contextLines === undefined ? 3 : contextLines;
+    const show = new Set();
+    const isHeader = (text) => /^\S/.test(text) && !/^!/.test(text);
+    const isBlank = (text) => !String(text).trim();
+
+    for (let k = 0; k < diff.length; k++) {
+      if (diff[k].t === ' ') continue;
+
+      // Walk back to the header of the block this line sits in.
+      let start = k;
+      let inBlock = false;
+      for (let i = k; i >= 0; i--) {
+        const text = diff[i].text;
+        if (isBlank(text)) break;
+        if (isHeader(text)) {
+          // A header only opens a block if the changed line is indented
+          // under it; otherwise the change *is* a top-level line.
+          if (i < k && /^\s/.test(diff[k].text)) { start = i; inBlock = true; }
+          else if (i === k) { start = i; }
+          break;
+        }
+        start = i;
+      }
+
+      if (!inBlock) {
+        for (let i = Math.max(0, k - context); i <= Math.min(diff.length - 1, k + context); i++) {
+          show.add(i);
+        }
+        continue;
+      }
+
+      // Forward to the end of the block: the next unindented line, or a
+      // blank, whichever comes first.
+      let end = k;
+      for (let i = start + 1; i < diff.length; i++) {
+        const text = diff[i].text;
+        if (isBlank(text) || isHeader(text)) break;
+        end = i;
+      }
+      for (let i = start; i <= end; i++) show.add(i);
+    }
+    return show;
+  }
+
+  // ---------- OID panel body ----------
+  function paintOidPanel(s, p, body) {
+    if (p.loading && !p.results) { body.appendChild(el('div', 'card-sub', 'Querying\u2026')); return; }
+    if (p.error) { body.appendChild(el('div', 'panel-err', p.error)); return; }
+    if (!p.results) {
+      const b = el('button', 'btn', 'Run ' + p.op.toUpperCase());
+      b.type = 'button';
+      b.style.width = 'auto';
+      b.addEventListener('click', () => loadPanelData(s, p));
+      body.appendChild(b);
+      return;
+    }
+    renderResultsInto(body, p.results);
+    body.appendChild(el('div', 'panel-note',
+      p.op.toUpperCase() + ' ' + p.oid + (p.at ? '  \u00b7  ' + p.at.toLocaleTimeString() : '') +
+      '  \u00b7  ' + p.results.length + ' value' + (p.results.length === 1 ? '' : 's')));
+  }
+
+  /**
+   * Shared result rendering: scalars as key/value, tables pivoted to one
+   * row per instance, single-column walks as index/value.
+   */
+  function renderResultsInto(host, results) {
+    const usable = results.filter((r) => !r.error && r.column);
+    const errors = results.filter((r) => r.error);
+    const columns = [], indexes = [];
+    for (const r of usable) {
+      if (!columns.includes(r.column)) columns.push(r.column);
+      const i = r.index === undefined ? '' : r.index;
+      if (!indexes.includes(i)) indexes.push(i);
+    }
+
+    if (usable.length && indexes.length === 1 && (indexes[0] === '0' || indexes[0] === '')) {
+      const t = el('table', 'data-table');
+      for (const r of usable) {
+        const tr = document.createElement('tr');
+        tr.appendChild(el('td', 'col-name', r.column, r.description || ''));
+        tr.appendChild(el('td', 'col-value', r.display !== undefined ? r.display : r.value));
+        t.appendChild(tr);
+      }
+      host.appendChild(t);
+    } else if (usable.length && columns.length >= 2 && indexes.length >= 2) {
+      const byIndex = new Map();
+      for (const r of usable) {
+        const i = r.index === undefined ? '' : r.index;
+        if (!byIndex.has(i)) byIndex.set(i, {});
+        byIndex.get(i)[r.column] = { d: r.display !== undefined ? r.display : r.value, v: r.value };
+      }
+      const idx = Array.from(byIndex.keys()).sort((a, x) => {
+        const na = Number(a), nb = Number(x);
+        if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+        return String(a).localeCompare(String(x));
+      });
+      // A column that merely repeats the row key adds nothing.
+      const shown = columns.filter((c) => !idx.every((i) => {
+        const cell = byIndex.get(i)[c];
+        return cell === undefined || String(cell.v) === String(i);
+      }));
+      const cols = shown.length ? shown : columns;
+      const wrap = el('div', 'table-scroll');
+      const t = el('table', 'data-table wide');
+      const hr = document.createElement('tr');
+      hr.appendChild(el('th', 'sticky-col', 'index'));
+      for (const c of cols) hr.appendChild(el('th', '', shortenColumn(c, cols), c));
+      t.appendChild(hr);
+      for (const i of idx) {
+        const rd = byIndex.get(i); const tr = document.createElement('tr');
+        tr.appendChild(el('td', 'col-index sticky-col', i));
+        for (const c of cols) tr.appendChild(el('td', 'col-value', rd[c] === undefined ? '' : rd[c].d));
+        t.appendChild(tr);
+      }
+      wrap.appendChild(t); host.appendChild(wrap);
+    } else if (usable.length) {
+      const t = el('table', 'data-table');
+      const hr = document.createElement('tr');
+      hr.appendChild(el('th', '', 'index')); hr.appendChild(el('th', '', columns[0] || 'value'));
+      t.appendChild(hr);
+      for (const r of usable) {
+        const tr = document.createElement('tr');
+        tr.appendChild(el('td', 'col-index', r.index));
+        tr.appendChild(el('td', 'col-value', r.display !== undefined ? r.display : r.value));
+        t.appendChild(tr);
+      }
+      host.appendChild(t);
+    }
+
+    if (errors.length) {
+      const t = el('table', 'data-table');
+      for (const r of errors) {
+        const tr = document.createElement('tr');
+        tr.appendChild(el('td', 'col-name', r.name || r.oid));
+        tr.appendChild(el('td', 'col-value is-error', r.error));
+        t.appendChild(tr);
+      }
+      host.appendChild(t);
+    }
+  }
+
+  function shortenColumn(col, all) {
+    if (all.length < 2) return col;
+    let prefix = all[0];
+    for (const c of all) {
+      let i = 0;
+      while (i < prefix.length && i < c.length && prefix[i] === c[i]) i++;
+      prefix = prefix.slice(0, i);
+      if (!prefix) break;
+    }
+    while (prefix && !/[a-z]$/.test(prefix)) prefix = prefix.slice(0, -1);
+    if (prefix.length < 3) return col;
+    const short = col.slice(prefix.length);
+    return short && /^[A-Z]/.test(short) ? short : col;
+  }
+
+  function groupNum(n) {
+    const v = Number(n);
+    return Number.isFinite(v) ? v.toLocaleString() : String(n);
+  }
+
+  // ---------- add / edit panel dialog ----------
+  const dlg = document.getElementById('panel-dialog');
+  const dlgKind = dlg.querySelector('.f-dlg-kind');
+  const dlgOidFields = dlg.querySelector('.f-dlg-oid-fields');
+  const dlgOid = dlg.querySelector('.f-dlg-oid');
+  const dlgSuggest = dlg.querySelector('.f-dlg-suggest');
+  const dlgOp = dlg.querySelector('.f-dlg-op');
+  const dlgName = dlg.querySelector('.f-dlg-name');
+  const dlgErr = dlg.querySelector('.f-dlg-error');
+  const dlgTitle = dlg.querySelector('.f-dlg-title');
+  let dlgState = null;
+
+  dlg.querySelector('.f-dlg-cancel').addEventListener('click', () => dlg.classList.remove('open'));
+  dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.classList.remove('open'); });
+  dlgKind.addEventListener('change', () => {
+    dlgOidFields.style.display = dlgKind.value === 'oid' ? '' : 'none';
+  });
+
+  function openPanelDialog(s, editing) {
+    loadMib().then(() => { for (const sw of switches.values()) updateMibStatus(sw); });
+    dlgState = { s, editing: editing || null };
+    showErr(dlgErr, '');
+    dlgTitle.textContent = editing ? 'Edit panel' : 'Add panel';
+
+    // Offer any built-in that is not already on the page, plus a custom OID.
+    clear(dlgKind);
+    const custom = document.createElement('option');
+    custom.value = 'oid'; custom.textContent = 'Custom OID';
+    dlgKind.appendChild(custom);
+    if (!editing) {
+      for (const b of BUILTIN) {
+        if (s.panels.some((p) => p.kind === 'builtin' && p.key === b.key)) continue;
+        const o = document.createElement('option');
+        o.value = 'builtin:' + b.key;
+        o.textContent = 'Built-in \u2014 ' + b.title;
+        dlgKind.appendChild(o);
+      }
+    }
+
+    dlgKind.value = 'oid';
+    dlgKind.disabled = !!editing;
+    dlgOidFields.style.display = '';
+    dlgOid.value = editing ? editing.oid : '';
+    dlgOp.value = editing ? editing.op : 'get';
+    dlgName.value = editing ? editing.title : '';
+    dlg.classList.add('open');
+    setTimeout(() => dlgOid.focus(), 30);
+  }
+
+  dlg.querySelector('.f-dlg-ok').addEventListener('click', () => {
+    if (!dlgState) return;
+    const s = dlgState.s;
+
+    if (dlgKind.value.indexOf('builtin:') === 0) {
+      const key = dlgKind.value.slice(8);
+      const def = builtinDef(key);
+      s.panels.push({
+        id: 'b:' + key, kind: 'builtin', key, title: def.title,
+        span: def.span, h: def.h
+      });
+      s.renderedIds = null;
+      dlg.classList.remove('open');
+      saveLayout(s); renderSwitch(s);
+      return;
+    }
+
+    const oid = dlgOid.value.trim();
+    if (!oid) { showErr(dlgErr, 'An OID or MIB name is required.'); return; }
+    // Resolve the name locally so a typo is caught before it reaches the
+    // switch, and so the panel can be titled sensibly by default.
+    const bare = oid.replace(/^\./, '').replace(/(\.\d+)+$/, '');
+    const known = MIB.loaded && MIB.entries.find((e) => e.name.toLowerCase() === bare.toLowerCase());
+    if (!/^\.?\d+(\.\d+)*$/.test(oid) && !known) {
+      showErr(dlgErr, 'No MIB object called "' + oid + '". Pick one from the suggestions, or use a numeric OID.');
+      return;
+    }
+    const title = dlgName.value.trim() || (known ? known.name : oid);
+
+    if (dlgState.editing) {
+      Object.assign(dlgState.editing, {
+        oid, op: dlgOp.value, title, results: null, error: null
+      });
+      s.renderedIds = null;
+      dlg.classList.remove('open');
+      saveLayout(s); renderSwitch(s);
+      loadPanelData(s, dlgState.editing);
+      return;
+    }
+
+    const panel = {
+      id: 'o:' + Date.now() + ':' + Math.random().toString(36).slice(2, 7),
+      kind: 'oid', oid, op: dlgOp.value, title,
+      span: dlgOp.value === 'walk' ? 6 : 4, h: dlgOp.value === 'walk' ? 300 : 0
+    };
+    s.panels.push(panel);
+    s.renderedIds = null;
+    dlg.classList.remove('open');
+    saveLayout(s); renderSwitch(s);
+    loadPanelData(s, panel);
+    appLog('info', 'Panel added', { host: s.host, oid, op: panel.op });
+  });
+
+  // OID autocomplete inside the dialog
+  (function wireDialogSuggest() {
+    let items = [], index = -1, deb = null;
+    const hide = () => { dlgSuggest.classList.remove('open'); items = []; index = -1; };
+    const paint = () => dlgSuggest.querySelectorAll('.suggest-item')
+      .forEach((k, i) => k.classList.toggle('active', i === index));
+    const apply = (e) => {
+      const columnar = isColumnar(e);
+      // A scalar is read at instance .0; a table or a column of one is
+      // walked from its base.
+      dlgOid.value = columnar ? e.name : e.name + '.0';
+      dlgOp.value = columnar ? 'walk' : 'get';
+      if (!dlgName.value) dlgName.value = e.name;
+      hide(); dlgOid.focus();
+    };
+    const render = () => {
+      const q = dlgOid.value.trim();
+      if (!q || !MIB.loaded) { hide(); return; }
+      items = searchMib(q, 30);
+      index = -1;
+      clear(dlgSuggest);
+      if (!items.length) {
+        dlgSuggest.appendChild(el('div', 'suggest-empty', 'No MIB name matches. Numeric OIDs still work.'));
+        dlgSuggest.classList.add('open');
+        return;
+      }
+      items.forEach((m, i) => {
+        const it = el('div', 'suggest-item');
+        const nm = el('div', 'sug-name');
+        const at = m.name.toLowerCase().indexOf(q.toLowerCase());
+        if (at >= 0) {
+          nm.appendChild(document.createTextNode(m.name.slice(0, at)));
+          nm.appendChild(el('span', 'hl', m.name.slice(at, at + q.length)));
+          nm.appendChild(document.createTextNode(m.name.slice(at + q.length)));
+        } else nm.textContent = m.name;
+        it.appendChild(nm);
+        const meta = el('div', 'sug-meta');
+        meta.appendChild(el('span', 'sug-oid', m.oid));
+        if (m.access) meta.appendChild(el('span', 'sug-acc',
+          ({ r: 'read-only', rw: 'read-write', rc: 'read-create', n: 'not-accessible', w: 'write-only', afn: 'notify' })[m.access] || m.access));
+        if (m.syntax) meta.appendChild(el('span', '', m.syntax));
+        it.appendChild(meta);
+        it.addEventListener('mousedown', (ev) => { ev.preventDefault(); apply(m); });
+        it.addEventListener('mouseenter', () => { index = i; paint(); });
+        dlgSuggest.appendChild(it);
+      });
+      dlgSuggest.classList.add('open');
+    };
+    dlgOid.addEventListener('input', () => { clearTimeout(deb); deb = setTimeout(render, 90); });
+    dlgOid.addEventListener('keydown', (e) => {
+      if (!dlgSuggest.classList.contains('open')) return;
+      if (e.key === 'ArrowDown') { e.preventDefault(); index = (index + 1) % items.length; paint(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); index = (index - 1 + items.length) % items.length; paint(); }
+      else if (e.key === 'Enter' && index >= 0) { e.preventDefault(); apply(items[index]); }
+      else if (e.key === 'Escape') hide();
+    });
+  })();
+
+  // =================================================================
+  // SSH
+  // =================================================================
+  /**
+   * Populate the console form from what the machine can actually see. A
+   * dropdown of ports the operator has to guess at is worse than none, so
+   * when serial support is missing the form says why instead.
+   */
+  function initConsole(s) {
+    for (const rate of [115200, 9600, 19200, 38400, 57600, 230400]) {
+      const o = document.createElement('option');
+      o.value = String(rate); o.textContent = String(rate);
+      s.baud.appendChild(o);
+    }
+    s.baud.value = '115200';
+
+    const loadPorts = () => {
+      fetch('/api/serial/ports').then((r) => r.json()).then((info) => {
+        clear(s.comPort);
+        if (!info.available) {
+          s.serialStatus.textContent = 'Serial support is not installed on this machine' +
+            (info.error ? ': ' + info.error : '') + '.';
+          s.comPort.appendChild(new Option('unavailable', ''));
+          s.consoleForm.querySelector('button').disabled = true;
+          return;
+        }
+        if (info.error) {
+          s.serialStatus.textContent = 'Could not list ports: ' + info.error;
+        } else if (!info.ports.length) {
+          s.serialStatus.textContent = 'No serial ports found. Plug in the console cable and reload.';
+        } else {
+          s.serialStatus.textContent = info.ports.length + ' port(s) found.';
+        }
+        s.comPort.appendChild(new Option(info.ports.length ? 'select a port\u2026' : 'none found', ''));
+        for (const port of info.ports) {
+          s.comPort.appendChild(new Option(
+            port.path + (port.label && port.label !== port.path ? '  \u2014  ' + port.label : ''),
+            port.path));
+        }
+        applyConsoleChoice(s);
+      }).catch((e) => { s.serialStatus.textContent = 'Could not read the port list: ' + e.message; });
+    };
+    loadPorts();
+
+    // Ports come and go with the cable, so refresh the list on each visit.
+    s.consoleCard.addEventListener('mouseenter', () => {
+      if (!s.serialLoadedAt || Date.now() - s.serialLoadedAt > 5000) {
+        s.serialLoadedAt = Date.now();
+        loadPorts();
+      }
+    });
+
+    s.consoleForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const path = s.comPort.value;
+      if (!path) { s.consoleError.textContent = 'Choose a serial port first.'; return; }
+      s.consoleError.textContent = '';
+      /**
+       * Connecting from the credentials form is usually setting the switch
+       * up, so what happens next is decided once the session is live. But
+       * if the operator got here by asking for the CLI, that is still what
+       * they asked for -- sending them back to the dashboard to click CLI
+       * a second time makes the first click a waste of their time.
+       */
+      const wanted = s.cliPending === true;
+      s.cliPending = false;
+      openConsole(s, path, Number(s.baud.value), wanted);
+    });
+  }
+
+  /**
+   * Put this switch's remembered port back on the form. The port list and
+   * the saved layout arrive independently, so whichever lands second has
+   * to do this -- and a port that is not currently present is still shown,
+   * labelled, rather than silently reverting to nothing.
+   */
+  function applyConsoleChoice(s) {
+    const want = s.consoleTarget;
+    if (!want || !want.path || !s.comPort) return;
+    if (![...s.comPort.options].some((o) => o.value === want.path)) {
+      s.comPort.appendChild(new Option(want.path + '  (not connected)', want.path));
+    }
+    s.comPort.value = want.path;
+    if (want.baudRate) s.baud.value = String(want.baudRate);
+  }
+
+  /**
+   * Open a console session. `showTerminal` is false when something else
+   * asked for the session -- a tech-support collection, say -- which
+   * should not take over the screen.
+   */
+  function openConsole(s, path, baudRate, showTerminal) {
+    /**
+     * A session may already be open. Doing nothing in that case -- which
+     * is what this used to do when the caller did not want the terminal --
+     * looks exactly like a broken button: no terminal, no reconnection, no
+     * message. So the two cases are handled separately.
+     *
+     * Already on this port: show it, because asking to open a console you
+     * already have can only mean "let me see it".
+     *
+     * On something else: close that first and open this. A serial port is
+     * exclusive, and two sessions from one tab is not a thing anyone wants.
+     */
+    const live = s.ws && s.ws.readyState === WebSocket.OPEN && s.sessionLive !== false;
+    const samePort = live && s.lastTransport === 'serial' && s.consoleTarget &&
+      s.consoleTarget.path === path && Number(s.consoleTarget.baudRate) === Number(baudRate);
+
+    if (samePort) {
+      appLog('info', 'Console already open; showing it', { host: s.host, port: path });
+      paintTransport(s);
+      openOverlay(s, 'termOverlay');
+      return;
+    }
+
+    if (live) {
+      appLog('info', 'Closing the current session before opening the console', {
+        host: s.host, port: path
+      });
+      const previous = s.ws;
+      let opened = false;
+      const openWhenClosed = () => {
+        if (opened) return;
+        opened = true;
+        // Give the port a moment to be released before claiming it.
+        setTimeout(() => openConsole(s, path, baudRate, showTerminal), 400);
+      };
+      previous.addEventListener('close', openWhenClosed, { once: true });
+      try { previous.send(JSON.stringify({ type: 'disconnect' })); } catch (e) { /* already gone */ }
+      // A socket that will not close must not strand the request.
+      setTimeout(() => { try { previous.close(); } catch (e) {} openWhenClosed(); }, 2000);
+      return;
+    }
+
+    s.wantTerminal = showTerminal !== false;
+    s.consoleTarget = { path, baudRate };
+    saveLayout(s);
+    saveState();
+    // Quick Actions gains a Console button the moment there is a port to
+    // reopen; without this it only appeared at the next unrelated repaint,
+    // which is why a second switch looked like it had none.
+    repaintPanel(s, 'summary');
+    sshConnect(s, { path, baudRate });
+  }
+
+  function initSsh(s) {
+    s.sshForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      // Same as the console form: a CLI request made before the
+      // credentials existed is still a CLI request.
+      if (s.cliPending) { s.wantTerminal = true; s.cliPending = false; }
+      /**
+       * Filling in SSH credentials while a session is already open is a
+       * request to move to SSH, not to set something up for later -- so it
+       * lands in the terminal rather than back on the dashboard, which is
+       * what the transport switch would have done from the same intent.
+       */
+      if (s.ws && s.ws.readyState === WebSocket.OPEN && s.sessionLive !== false) {
+        s.wantTerminal = true;
+      }
+      sshConnect(s);
+    });
+    s.disconnectBtn.addEventListener('click', () => {
+      if (s.ws) { try { s.ws.send(JSON.stringify({ type: 'disconnect' })); s.ws.close(); } catch (err) {} }
+      s.disconnectBtn.style.display = 'none';
+      s.reconnectBtn.style.display = 'inline-block';
+      paintTransport(s);
+    });
+    /**
+     * Come back on the transport you were using. Sending a console
+     * session to the SSH credentials form is how "reconnect" turned into
+     * "the console is broken": nothing was wrong with it, the button just
+     * went somewhere else.
+     */
+    s.reconnectBtn.addEventListener('click', () => {
+      if (s.lastTransport === 'serial' && hasConsole(s)) {
+        openConsole(s, s.consoleTarget.path, s.consoleTarget.baudRate);
+        return;
+      }
+      if (hasSsh(s)) {
+        s.wantTerminal = true;
+        sshConnect(s);
+        return;
+      }
+      if (hasConsole(s)) {
+        openConsole(s, s.consoleTarget.path, s.consoleTarget.baudRate);
+        return;
+      }
+      closeOverlays(s);
+      if (s.subMode !== 'ready') selectCredCard(s, 'ssh');
+      showView(s, 'creds');
+      s.sshUser.focus();
+    });
+
+    /**
+     * Move the CLI between the console and SSH without leaving it. The
+     * two are different routes to the same switch, and which one is
+     * usable changes -- a switch being rebooted answers on the console
+     * long before it answers on the network.
+     */
+    const switchTransport = (want) => {
+      if (want === 'serial') {
+        if (!hasConsole(s)) return;
+        s.wantTerminal = true;
+        openConsole(s, s.consoleTarget.path, s.consoleTarget.baudRate);
+      } else {
+        if (!hasSsh(s)) return;
+        s.wantTerminal = true;
+        // sshConnect replaces whatever is open, so a console session is
+        // closed and its port released before the SSH one starts.
+        sshConnect(s);
+      }
+      paintTransport(s);
+    };
+    s.trConsole.addEventListener('click', () => switchTransport('serial'));
+    s.trSsh.addEventListener('click', () => switchTransport('ssh'));
+    s.sshSave.addEventListener('click', () => download('ssh-' + safeHost(s.host) + '-' + stamp() + '.log', s.sshBuffer));
+    // Any long output leaves the screen unusable, whether it came from
+    // Quick Actions or was typed by hand. The saved log keeps everything,
+    // so clearing costs nothing.
+    s.termClear.addEventListener('click', () => clearTerminal(s, true));
+    // Paint once at the start, so the switch reads correctly before
+    // anything has been connected rather than defaulting to both enabled.
+    paintTransport(s);
+  }
+
+  // xterm sizes itself from its container, so fitting while the pane is
+  // hidden yields a tiny terminal. Fit after two frames and tell the
+  // switch the real size, or it wraps output to the wrong width.
+  function fitTerm(s) {
+    if (!s.fit || !s.term) return;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      try {
+        s.fit.fit();
+        if (s.ws && s.ws.readyState === WebSocket.OPEN) {
+          s.ws.send(JSON.stringify({ type: 'resize', cols: s.term.cols, rows: s.term.rows }));
+        }
+      } catch (e) { /* not measurable yet */ }
+    }));
+  }
+
+  /** Wipe the screen and ask the switch to redraw its prompt. */
+  function clearTerminal(s, prompt) {
+    if (!s.term) return;
+    s.term.reset();
+    if (prompt && s.ws && s.ws.readyState === WebSocket.OPEN) {
+      s.ws.send(JSON.stringify({ type: 'input', data: '\r' }));
+    }
+  }
+
+  function initTerm(s) {
+    if (s.term) return true;
+    if (!librariesLoaded()) { showErr(s.sshError, 'Terminal library did not load.'); return false; }
+    try {
+      s.term = new Terminal({
+        // 500,000 lines was chosen when the terminal was where captures
+        // landed. They go to the viewer now, and are saved from there, so
+        // this only has to hold a session's worth of scrollback: a full
+        // show tech-support is under 8,000 lines and still fits five times
+        // over, for a fraction of the memory.
+        cursorBlink: true, scrollback: 40000,
+        fontFamily: '"IBM Plex Mono", Consolas, monospace', fontSize: 13,
+        theme: { background: '#0a0f0d', foreground: '#d7e5dd', cursor: '#e8a33d' }
+      });
+      s.fit = new FitAddon.FitAddon();
+      s.term.loadAddon(s.fit);
+      s.term.open(s.termEl);
+      s.fit.fit();
+      s.term.onData((d) => {
+        if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(JSON.stringify({ type: 'input', data: d }));
+      });
+      return true;
+    } catch (e) {
+      appLog('error', 'Failed to init terminal', { message: e.message });
+      showErr(s.sshError, 'Failed to initialise the terminal: ' + e.message);
+      return false;
+    }
+  }
+
+  /**
+   * One session path for both transports. A console session differs only
+   * in the opening message and in there being no credentials to send, so
+   * the terminal, the capture machinery and the teardown are shared rather
+   * than duplicated.
+   */
+  /**
+   * Close whatever session this switch has and run `then` once it is gone.
+   * A tab holds one session: opening a second leaves the first running,
+   * holding a serial port or a VTY line that nobody can see any more.
+   */
+  /** Whichever form was used, both buttons become usable again. */
+  function enableConnectButtons(s) {
+    if (s.sshConnect) s.sshConnect.disabled = false;
+    if (s.consoleConnect) s.consoleConnect.disabled = false;
+  }
+
+  function replaceSession(s, then) {
+    if (!s.ws || s.ws.readyState !== WebSocket.OPEN) { then(); return; }
+    const previous = s.ws;
+    let done = false;
+    const go = () => { if (!done) { done = true; setTimeout(then, 400); } };
+    previous.addEventListener('close', go, { once: true });
+    try { previous.send(JSON.stringify({ type: 'disconnect' })); } catch (e) { /* gone */ }
+    setTimeout(() => { try { previous.close(); } catch (e) {} go(); }, 2000);
+  }
+
+  function sshConnect(s, serialOpts) {
+    const host = serialOpts ? serialOpts.path : (s.sshHost.value.trim() || s.host);
+    const port = serialOpts ? serialOpts.baudRate : (parseInt(s.sshPort.value, 10) || 22);
+    const username = serialOpts ? '' : s.sshUser.value;
+    const password = serialOpts ? '' : s.sshPass.value;
+    const errBox = serialOpts ? s.consoleError : s.sshError;
+    const button = serialOpts ? s.consoleConnect : s.sshConnect;
+    if (!host) { showErr(errBox, serialOpts ? 'Choose a serial port.' : 'Host is required.'); return; }
+    showErr(errBox, '');
+
+    // Connecting while something is already open replaces it rather than
+    // stacking a second session behind the first.
+    if (s.ws && s.ws.readyState === WebSocket.OPEN && s.sessionLive !== false && !s.replacing) {
+      s.replacing = true;
+      appLog('info', 'Replacing the open session', { host: s.host });
+      replaceSession(s, () => { s.replacing = false; sshConnect(s, serialOpts); });
+      return;
+    }
+    if (button) button.disabled = true;
+    s.lastTransport = serialOpts ? 'serial' : 'ssh';
+    s.sessionLive = true;
+    paintTransport(s);
+    appLog('info', serialOpts ? 'Opening console' : 'Connecting (SSH)',
+      serialOpts ? { port: host, baudRate: port } : { host, port, username });
+
+    let sock;
+    try {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      sock = new WebSocket(proto + '//' + window.location.host);
+      s.ws = sock;
+    } catch (e) {
+      showErr(errBox, 'Could not open a connection to the local backend: ' + e.message);
+      if (button) button.disabled = false;
+      return;
+    }
+
+    sock.onopen = () => {
+      if (!initTerm(s)) { sock.close(); enableConnectButtons(s); return; }
+      // Only take over the screen when the user asked for a terminal; a
+      // collection triggered from Quick Actions runs in the background,
+      // and either way the credentials form has served its purpose.
+      /**
+       * What to show now the session is up.
+       *
+       * A terminal is opened when somebody asked for one -- the CLI
+       * button, or reconnecting an existing session. Otherwise the useful
+       * question is whether this switch can be polled: if not, offer to
+       * set it up, because that is usually why the session was opened at
+       * all. This is decided from intent rather than from transport; the
+       * console form used to imply "terminal" and so skipped the offer
+       * that the SSH form gave.
+       */
+      paintTransport(s);
+      // Either an explicit request now, or one made before the
+      // credentials it needed existed.
+      if (s.wantTerminal || s.pendingCli) {
+        s.pendingCli = false;
+        openOverlay(s, 'termOverlay');
+      } else if (!s.target) offerSetup(s);
+      else if (s.subMode === 'ready') showView(s, 'overview');
+      s.wantTerminal = false;
+      fitTerm(s);
+      s.sshStatus.textContent = serialOpts
+        ? 'opening ' + host + ' at ' + port + ' baud'
+        : 'connecting to ' + host;
+      sock.send(JSON.stringify(serialOpts
+        ? { type: 'serial-connect', path: host, baudRate: port }
+        : { type: 'connect', host, port, username, password, cols: s.term.cols, rows: s.term.rows }));
+    };
+
+    sock.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      switch (msg.type) {
+        case 'status': s.sshStatus.textContent = msg.message; break;
+        case 'ready':
+          appLog('info', 'SSH ready', { host });
+          subDot(s, 'ssh', 'on');
+          s.sshStatus.textContent = 'connected \u2014 ' + host;
+          s.disconnectBtn.style.display = 'inline-block';
+          s.reconnectBtn.style.display = 'none';
+          enableConnectButtons(s);
+          s.canCapture = true;
+          if (s.lastTransport !== 'serial') { s.sshEverConnected = true; saveState(); }
+          // xterm outlives the session it belonged to, so without this a
+          // reconnect opens onto the last session's output -- including a
+          // tech-support capture, which fills the screen entirely.
+          s.term.reset();
+          fitTerm(s);
+          s.sshBuffer += '\n===== SSH session ' + new Date().toISOString() + ' \u2014 ' + host + ' =====\n';
+          if (s.techPending) {
+            // Credentials were the only thing missing; run it now.
+            s.techPending = false;
+            appLog('info', 'SSH ready \u2014 running the queued tech-support collection', { host });
+            runTechCommand(s);
+          }
+          break;
+        case 'data':
+          s.term.write(msg.data);
+          s.sshBuffer += stripAnsi(msg.data);
+          s.sshSave.disabled = false;
+          break;
+        case 'ended':
+          appLog('info', msg.message, { host });
+          // The far end is gone whatever the socket thinks.
+          s.sessionLive = false;
+          paintTransport(s);
+          cancelTechPending(s);
+          s.term.write('\r\n\x1b[33m*** ' + msg.message + ' ***\x1b[0m\r\n');
+          subDot(s, 'ssh', '');
+          s.sshStatus.textContent = 'disconnected \u2014 ' + msg.message;
+          s.canCapture = false; s.capturing = false;
+          s.disconnectBtn.style.display = 'none';
+          s.reconnectBtn.style.display = 'inline-block';
+          enableConnectButtons(s);
+          break;
+        case 'error':
+          appLog('error', msg.message, { host });
+          cancelTechPending(s);
+          subDot(s, 'ssh', 'err');
+          s.sshStatus.textContent = 'error: ' + msg.message;
+          showErr(s.sshError, msg.message);
+          enableConnectButtons(s);
+          s.disconnectBtn.style.display = 'none';
+          s.reconnectBtn.style.display = 'inline-block';
+          break;
+        case 'exec-started':
+          s.capturing = true;
+          s.sshStatus.textContent = 'collecting ' + msg.command + '\u2026';
+          setTechCollecting(s, 'Collecting show tech-support over SSH\u2026');
+          appLog('info', 'tech-support collection started', { host });
+          break;
+        case 'exec-progress':
+          s.sshStatus.textContent = 'collecting\u2026 ' + msg.bytes.toLocaleString() + ' bytes, ' + msg.seconds + 's';
+          setTechCollecting(s, 'Collecting\u2026 ' + msg.bytes.toLocaleString() + ' bytes, ' + msg.seconds + 's');
+          break;
+        case 'exec-error':
+          s.capturing = false;
+          setTechCollecting(s, null);
+          s.techStatus.textContent = 'collection failed: ' + msg.message;
+          appLog('error', 'tech-support failed', { host, message: msg.message });
+          s.sshStatus.textContent = 'collection failed: ' + msg.message;
+          break;
+        case 'exec-done':
+          s.capturing = false;
+          s.sshStatus.textContent = 'connected \u2014 ' + host;
+          setTechCollecting(s, null);
+          // A tech-support capture leaves several hundred kilobytes on the
+          // screen and the cursor somewhere in the middle of it. The
+          // output is safe in the viewer, so the terminal is cleared and
+          // the switch nudged for a fresh prompt -- otherwise the session
+          // is technically usable and practically not.
+          if (s.term && s.ws && s.ws.readyState === WebSocket.OPEN) {
+            clearTerminal(s, true);
+            s.term.write('\u2014 capture finished, ' + msg.bytes.toLocaleString() +
+              ' bytes; screen cleared \u2014\r\n');
+          }
+          appLog('info', 'tech-support collected', { host, bytes: msg.bytes, seconds: msg.seconds, reason: msg.reason });
+          if (!msg.text || msg.bytes < 200) {
+            s.techStatus.textContent = 'the switch returned almost no output';
+            appLog('warn', 'tech-support output looked empty', { host, bytes: msg.bytes });
+            break;
+          }
+          loadTech(s, msg.text, 'collected ' + msg.seconds + 's ago from ' + host);
+          break;
+      }
+    };
+
+    sock.onclose = () => {
+      s.sessionLive = false;
+      // The request does not outlive the attempt: a session that ends must
+      // not reopen a terminal the next time one is made for another reason.
+      s.pendingCli = false;
+      enableConnectButtons(s);
+      s.disconnectBtn.style.display = 'none';
+      s.reconnectBtn.style.display = 'inline-block';
+      // The switch of transports has to stop claiming something is live
+      // when it is not, or the next click looks like it did nothing.
+      paintTransport(s);
+      loadSessions(s);
+    };
+    sock.onerror = () => {
+      appLog('error', 'WebSocket error reaching the backend', { host });
+      cancelTechPending(s);
+      subDot(s, 'ssh', 'err');
+      showErr(s.sshError, 'Could not reach the local backend server.');
+      enableConnectButtons(s);
+    };
+  }
+
+  // =================================================================
+  // Tech-support
+  // =================================================================
+  // Collection is triggered from the Configuration panel, alongside the
+  // running and startup configs -- one place to pull files off the switch.
+  // The capture then gets its own tab for section-by-section browsing.
+
+  function initTech(s) {
+    s.techSave.addEventListener('click', () =>
+      download('tech-' + safeHost(s.host) + '-' + stamp() + '.log', s.techRaw));
+    let deb = null;
+    s.techSearch.addEventListener('input', () => {
+      clearTimeout(deb);
+      deb = setTimeout(() => { renderTechNav(s); renderTechPane(s); }, 180);
+    });
+  }
+
+  /**
+   * Collect a capture. If a shell is already open the command runs
+   * immediately; otherwise the request is remembered, the user is sent to
+   * the SSH tab to enter credentials, and the command fires by itself as
+   * soon as the shell is ready. Asking for credentials should be the only
+   * manual step -- having to come back and press the button again is just
+   * a second thing to remember.
+   */
+  function startTechCollect(s) {
+    if (s.capturing) return;
+    if (s.ws && s.ws.readyState === WebSocket.OPEN && s.canCapture) {
+      runTechCommand(s);
+      setTechCollecting(s, 'Collecting show tech-support over SSH\u2026');
+      return;
+    }
+    // No session yet. The command runs the same over either transport, so
+    // take whichever route is set up -- console first, for the same reason
+    // the CLI button prefers it.
+    s.techPending = true;
+    if (hasConsole(s)) {
+      setTechCollecting(s, 'Opening the console\u2026');
+      appLog('info', 'tech-support queued; opening the console first', { host: s.host });
+      openConsole(s, s.consoleTarget.path, s.consoleTarget.baudRate, false);
+      return;
+    }
+    setTechCollecting(s, 'Waiting for SSH credentials\u2026');
+    appLog('info', 'tech-support queued; SSH credentials needed first', { host: s.host });
+    if (s.subMode !== 'ready') selectCredCard(s, 'ssh');
+    showView(s, 'creds');
+    if (!s.sshHost.value) s.sshHost.value = s.host || '';
+    (s.sshUser.value ? s.sshPass : s.sshUser).focus();
+  }
+
+  function runTechCommand(s) {
+    s.ws.send(JSON.stringify({
+      type: 'exec', command: 'show tech-support', idleMs: 8000, maxMs: 900000,
+      // Keep the session only if the terminal is on screen; a collection
+      // from Quick Actions has no other use for it.
+      keepOpen: s.termOverlay.classList.contains('open')
+    }));
+  }
+
+  function cancelTechPending(s) {
+    if (!s.techPending) return;
+    s.techPending = false;
+    setTechCollecting(s, null);
+  }
+
+  /** Drive the Tech-Support page's own busy state. */
+  function setTechCollecting(s, message) {
+    s.techBusy = message || null;
+    if (s.techStatus) s.techStatus.textContent = message || (s.tech ? s.techStatus.textContent : 'no capture');
+    // The button lives in Quick Actions, which is part of the Overview
+    // panel, so the panel is what needs repainting.
+    repaintPanel(s, 'summary');
+  }
+
+  /** Repaint one built-in panel in place. */
+  // The dashboard does NOT scroll the window - the panel grid lives inside a
+  // .scroll-body element with overflow-y:auto, so that element is what scrolls.
+  // window.scrollY/scrollTo therefore do nothing here. scrollKeeper captures the
+  // real container's scrollTop and returns a restore fn to call after a rebuild,
+  // so clearing a panel (which momentarily collapses the page) never jumps the
+  // view. Returns a no-op restore if the container can't be found.
+  function scrollKeeper(s) {
+    const box = (s && s.grid && (s.grid.closest ? s.grid.closest('.scroll-body') : null)) ||
+      document.querySelector('.subview.active .scroll-body') || null;
+    if (!box) return function () {};
+    const top = box.scrollTop, left = box.scrollLeft;
+    return function () { if (box.scrollTop !== top) box.scrollTop = top; if (box.scrollLeft !== left) box.scrollLeft = left; };
+  }
+
+  function repaintPanel(s, key) {
+    const panel = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === key);
+    if (panel && panel._body) {
+      // Preserve the panel's own inner scroll AND the dashboard scroll container,
+      // so a single-panel repaint (e.g. the config badge flip) never jumps the
+      // whole view - clearing a panel briefly collapses the page height.
+      const keep = panel._body.scrollTop;
+      const restore = scrollKeeper(s);
+      paintPanelBody(s, panel);
+      panel._body.scrollTop = keep;
+      restore();
+    }
+  }
+
+  function loadTech(s, text, note) {
+    s.techRaw = text;
+    s.techNote = note || '';
+    try {
+      s.tech = TechParse.parse(text);
+    } catch (e) {
+      appLog('error', 'Could not parse tech-support capture', { message: e.message });
+      return;
+    }
+    // Open on the whole capture, not on whichever section happens to be
+    // first -- that is the command echo, which tells you nothing.
+    s.techSection = FULL_OUTPUT;
+    s.techSave.disabled = false;
+    subDot(s, 'tech', 'on');
+    enableSubtab(s, 'tech', true);
+    s.techStatus.textContent = (s.techNote ? s.techNote + '  \u00b7  ' : '') +
+      s.tech.order.length + ' sections  \u00b7  ' + text.split('\n').length.toLocaleString() + ' lines';
+
+    // The capture feeds the viewer and the Configuration panel's document
+    // list. The dashboard stays a live SNMP view, so collecting one must
+    // not change what it shows.
+    renderTechNav(s);
+    renderTechPane(s);
+    // Show the capture the moment it lands: it is what was asked for.
+    // Quick Actions gains a "view" button now that there is one to view.
+    repaintPanel(s, 'summary');
+    openOverlay(s, 'techOverlay');
+    appLog('info', 'tech-support parsed', {
+      sections: s.tech.order.length, host: s.host, note: s.techNote
+    });
+  }
+
+  function techTable(parsed, opts) {
+    opts = opts || {};
+    const wrap = el('div', 'table-scroll');
+    const t = el('table', 'data-table wide');
+    const hr = document.createElement('tr');
+    for (const h of parsed.headers) hr.appendChild(el('th', '', h));
+    t.appendChild(hr);
+    for (const r of parsed.rows) {
+      const tr = document.createElement('tr');
+      parsed.headers.forEach((h, i) => {
+        const v = r[h] !== undefined ? r[h] : (r._cells ? r._cells[i] : '');
+        if (opts.stateCols && opts.stateCols.test(h) && v) {
+          const td = document.createElement('td');
+          td.appendChild(el('span', 'pill ' + stateClass(String(v)), v));
+          tr.appendChild(td);
+        } else tr.appendChild(el('td', 'col-value', v));
+      });
+      t.appendChild(tr);
+    }
+    wrap.appendChild(t);
+    return wrap;
+  }
+
+  function logTable(logging) {
+    const wrap = el('div', 'table-scroll');
+    const t = el('table', 'data-table');
+    const hr = document.createElement('tr');
+    for (const h of ['Severity', 'When', 'Facility', 'Message']) hr.appendChild(el('th', '', h));
+    t.appendChild(hr);
+    for (const e of logging.entries.slice().sort((a, b) => a.rank - b.rank)) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.appendChild(el('span', 'sev-tag sev-' + e.sevName, e.sevName));
+      tr.appendChild(td);
+      tr.appendChild(el('td', 'col-value', e.when));
+      tr.appendChild(el('td', 'col-name', e.facility + '-' + e.mnemonic));
+      tr.appendChild(el('td', 'col-value', e.message));
+      t.appendChild(tr);
+    }
+    wrap.appendChild(t);
+    return wrap;
+  }
+
+  // ---------- section rail ----------
+  function renderTechNav(s) {
+    if (!s.tech) { clear(s.techNav); return; }
+    const q = s.techSearch.value.trim().toLowerCase();
+    clear(s.techNav);
+
+    const addItem = (name, label, count) => {
+      const item = el('div', 'tech-item' + (name === s.techSection ? ' active' : ''));
+      if (count != null) item.appendChild(el('span', 'lines', count));
+      item.appendChild(document.createTextNode(label));
+      item.title = label;
+      item.addEventListener('click', () => {
+        s.techSection = name;
+        renderTechNav(s);
+        renderTechPane(s);
+      });
+      s.techNav.appendChild(item);
+      return item;
+    };
+
+    // Whole capture first, and selected by default.
+    let wholeHits = 0;
+    if (q) for (const ln of s.techRaw.split('\n')) if (ln.toLowerCase().includes(q)) wholeHits++;
+    s.techNav.appendChild(el('div', 'tech-nav-group', 'Everything'));
+    const whole = addItem(FULL_OUTPUT, 'Full output', s.techRaw.split('\n').length);
+    if (wholeHits) whole.appendChild(el('span', 'hits', wholeHits + ' hit' + (wholeHits === 1 ? '' : 's')));
+
+    const key = s.tech.order.filter((n) => KEY_SECTIONS.some((k) => n.toLowerCase() === k));
+    const rest = s.tech.order.filter((n) => key.indexOf(n) < 0);
+
+    const group = (title, names) => {
+      if (!names.length) return;
+      const g = el('div', 'tech-nav-group', title);
+      s.techNav.appendChild(g);
+      let any = false;
+      for (const n of names) {
+        const lines = s.tech.secs[n] || [];
+        let hits = 0;
+        if (q) {
+          for (const ln of lines) if (ln.toLowerCase().includes(q)) hits++;
+          if (!hits && n.toLowerCase().indexOf(q) < 0) continue;
+        }
+        const it = addItem(n, n, lines.length);
+        if (hits) it.appendChild(el('span', 'hits', hits + ' hit' + (hits === 1 ? '' : 's')));
+        any = true;
+      }
+      if (!any) g.remove();
+    };
+    group('Key sections', key);
+    group('All output', rest);
+  }
+
+  // Sections worth promoting: an operator looks at these first.
+  const KEY_SECTIONS = [
+    'show system', 'show version', 'show inventory', 'show stack',
+    'show interfaces status', 'show interfaces counters', 'show power inline',
+    'show power inline all interfaces', 'show vlan', 'show cdp neighbors',
+    'show lldp neighbors', 'spanning tree info', 'show mac address-table',
+    'show errdisable interfaces', 'show logging', 'show logging file',
+    'show running-config'
+  ];
+
+  function highlightInto(pre, lines, q) {
+    if (!q) { pre.textContent = lines.join('\n'); return; }
+    const rx = new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'ig');
+    for (const ln of lines) {
+      let last = 0, m; rx.lastIndex = 0;
+      while ((m = rx.exec(ln)) !== null) {
+        pre.appendChild(document.createTextNode(ln.slice(last, m.index)));
+        pre.appendChild(el('mark', '', m[0]));
+        last = m.index + m[0].length;
+      }
+      pre.appendChild(document.createTextNode(ln.slice(last) + '\n'));
+    }
+  }
+
+  function renderTechPane(s) {
+    if (!s.tech) {
+      clear(s.techPane);
+      s.techPane.appendChild(el('div', 'empty-state',
+        'No capture yet. Use Collect tech-support above \u2014 it runs the command over SSH, ' +
+        'asking for credentials first if no session is open.'));
+      return;
+    }
+    const pane = s.techPane;
+    const q = s.techSearch.value.trim();
+    clear(pane);
+
+    if (s.techSection === FULL_OUTPUT) {
+      const st = el('div', 'section-title', 'Full output');
+      st.appendChild(el('span', 'st-note',
+        s.tech.order.length + ' sections \u00b7 ' + s.techRaw.split('\n').length.toLocaleString() + ' lines'));
+      pane.appendChild(st);
+      const pre = document.createElement('pre');
+      highlightInto(pre, s.techRaw.replace(/\r/g, '').split('\n'), q);
+      pane.appendChild(pre);
+      pane.scrollTop = 0;
+      return;
+    }
+
+    const lines = s.tech.secs[s.techSection] || [];
+    pane.appendChild(el('div', 'section-title', s.techSection));
+
+    // Render every table the section contains, then the raw text: the
+    // fixed-width parsing is a heuristic and the original is the truth.
+    for (const t of TechParse.parseAllTables(lines)) {
+      pane.appendChild(techTable({ headers: t.headers, rows: t.rows },
+        { stateCols: /state|status|oper|admin/i }));
+      pane.appendChild(el('div', 'card-sub', t.rows.length + ' rows parsed'));
+    }
+    pane.appendChild(el('div', 'section-title', 'Raw output'));
+    const pre = document.createElement('pre');
+    highlightInto(pre, lines, q);
+    pane.appendChild(pre);
+    pane.scrollTop = 0;
+  }
+
+  // =================================================================
+  // MIB Explorer
+  // =================================================================
+  // Finding the right object in 11k of them is the hard part of using SNMP
+  // on this platform, so search covers descriptions as well as names, the
+  // results say what shape each object is, and common tasks are one click.
+  // Anything found can be dropped straight onto the active switch's
+  // dashboard, which is the reason you were looking it up.
+
+  const mibPanel = document.getElementById('mib-panel');
+  const mibQ = document.getElementById('mib-q');
+  const mibAccess = document.getElementById('mib-access');
+  const mibShape = document.getElementById('mib-shape');
+  const mibTree = document.getElementById('mib-tree');
+  const mibResults = document.getElementById('mib-results');
+  const mibDetail = document.getElementById('mib-detail');
+  const mibNote = document.querySelector('.mib-note');
+  const mibProduct = document.getElementById('mib-product');
+  const VENDOR_ROOT = '1.3.6.1.4.1.9.6.1.101';
+  let mibSelected = null;
+
+
+  // ---------- Topology ----------
+  /**
+   * Every switch open in a tab is a device on the picture; the neighbours
+   * they report become nodes too. Nothing here asks the switches for
+   * anything new -- it is the health data already on the dashboard, read
+   * the other way round.
+   */
+  const topoPanel = document.getElementById('topo-panel');
+
+  const topoSvg = document.getElementById('topo-svg');
+  const topoViewport = document.getElementById('topo-viewport');
+  const topoTip = document.getElementById('topo-tip');
+  const TV = window.TopologyView;
+  const topoState = { graph: null, sel: null, zoom: 1, tx: 0, ty: 0, vlan: '' };
+
+  /**
+   * The topology button appears once there is a switch to draw. An empty
+   * diagram is not a feature, and a button that leads to "nothing here"
+   * teaches people not to press it.
+   */
+  /**
+   * The button appears once a switch has been collected from, and stays
+   * once a picture exists. Offering it on an empty app is offering a
+   * blank canvas.
+   */
+  /**
+   * The tab exists once there is a switch to draw, and stays while any
+   * switch exists at all -- including ones whose tab has been closed,
+   * because the topology is where those are found again.
+   */
+  function paintTopoButton() {
+    const any = allSwitches().some((s) => s.health && s.target);
+    topoTab.style.display = (any || topoState.graph || topoTabActive) ? '' : 'none';
+  }
+
+  /**
+   * Which VLANs are actually carrying traffic, and what the spanning tree
+   * says about them.
+   *
+   * A VLAN counts as live when its switch interface is not administratively
+   * down and at least one port is a member. Everything else -- a shut
+   * VLAN, a VLAN defined but unused -- is ignored, because a spanning tree
+   * with nothing in it is not a spanning tree anybody cares about.
+   */
+  function liveVlanRoots(h) {
+    const result = {
+      decided: false, isRoot: false, rootMac: null,
+      rootVlans: [], idleRootVlans: [], count: 0
+    };
+    const perVlan = h.pvstVlans || [];
+    if (!perVlan.length) return result;
+
+    // VLAN interfaces are listed among the ports, named after the VLAN id.
+    const shut = new Set();
+    for (const r of h.interfaces || []) {
+      const name = dvOf(r.rlifPresentName);
+      if (!/^\d+$/.test(String(name))) continue;
+      if (/down|disabled/i.test(String(dvOf(r.rlifPresentAdminStatus)))) shut.add(String(name));
+    }
+
+    const hasMembers = new Set();
+    for (const v of h.vlans || []) {
+      const un = String((v.untagged && v.untagged.value) || '');
+      const tg = String((v.tagged && v.tagged.value) || '');
+      if (un.trim() || tg.trim()) hasMembers.add(String(v.index));
+    }
+
+    const votes = new Map();
+    const isRootRow = (row) => Number(dvOf(row.isRoot)) === 1 || /yes/i.test(String(dvOf(row.isRoot)));
+    for (const row of perVlan) {
+      const vlan = String(dvOf(row.vlan, row.index));
+      const idle = shut.has(vlan) || (hasMembers.size && !hasMembers.has(vlan));
+      if (idle) {
+        // Worth remembering: "root for VLAN 1, which is shut down" is the
+        // explanation somebody will be looking for when the diagram does
+        // not match what the switch told them.
+        if (isRootRow(row)) result.idleRootVlans.push(vlan);
+        continue;
+      }
+      result.count++;
+      const root = dvOf(row.rlBrgPvstOperVlanDesignatedRoot);
+      if (!root) continue;
+      const mac = window.Topology.normMac(root);
+      if (!mac) continue;
+      votes.set(mac, (votes.get(mac) || 0) + 1);
+      if (isRootRow(row)) result.rootVlans.push(vlan);
+      // The port this VLAN uses to reach the root. With only CDP for
+      // neighbours there is no MAC to match the root bridge against, but
+      // the port still says which way it is -- and which way is up.
+      const rp = dvOf(row.rootPort);
+      if (rp && !/^[\u2014-]$/.test(String(rp).trim())) result.rootPort = String(rp).trim();
+    }
+    if (!result.count) return result;
+
+    result.decided = true;
+    // The root of the most live VLANs is the one the diagram should show.
+    const ranked = Array.from(votes.entries()).sort((a, b) => b[1] - a[1])[0];
+    result.rootMac = ranked ? ranked[0] : null;
+    result.isRoot = result.rootVlans.length > 0;
+    return result;
+  }
+
+  const dvOf = (cell, fallback) => {
+    if (cell === undefined || cell === null) return fallback === undefined ? '' : fallback;
+    if (typeof cell === 'object') {
+      const v = cell.display !== undefined && cell.display !== null ? cell.display : cell.value;
+      return v === undefined || v === null ? (fallback === undefined ? '' : fallback) : v;
+    }
+    return cell;
+  };
+
+  function topoSwitchInputs() {
+    const out = [];
+    // Closed tabs included: putting a switch away should not remove it
+    // from the picture of the network, and the topology is where you go
+    // to find it again.
+    for (const s of allSwitches()) {
+      if (!s.health || !s.target) continue;
+      const h = s.health;
+      const scalar = (name) => {
+        const c = h.scalars && h.scalars[name];
+        return c ? (c.display !== undefined && c.display !== null ? c.display : c.value) : null;
+      };
+      /**
+       * Being root only matters for VLANs that carry something. A switch
+       * can be root for a VLAN that is shut down, or that no port is in --
+       * true, and useless. Drawing it at the top of the diagram on that
+       * basis says the network is shaped a way it is not.
+       */
+      const live = liveVlanRoots(h);
+
+      out.push({
+        id: s.id,
+        open: switches.has(s.id),
+        host: s.host,
+        name: scalar('sysName') || s.host,
+        model: h.model || '',
+        health: h,
+        bridgeMac: scalar('dot1dBaseBridgeAddress'),
+        rootMac: live.decided ? live.rootMac : scalar('dot1dStpDesignatedRoot'),
+        isRoot: live.decided ? live.isRoot : (h.summary && h.summary.stpIsRoot === true),
+        rootVlans: live.rootVlans,
+        liveVlans: live.count,
+        idleRootVlans: live.idleRootVlans,
+        rootPort: live.rootPort || null,
+        stackUnits: (h.stack && h.stack.length) || 1,
+        addresses: [s.host]
+      });
+    }
+    return out;
+  }
+
+  function topoRebuild(relayout) {
+    const inputs = topoSwitchInputs();
+    // Any rebuild with real switches behind it is current by definition.
+    if (inputs.length) topoState.stale = false;
+    if (!inputs.length) {
+      /**
+       * Nothing polled. The last picture is kept rather than cleared --
+       * closing the switches you were looking at should not delete the
+       * diagram you were looking at, and a blank canvas is no use to
+       * anybody. It is labelled as a snapshot so it is not mistaken for
+       * something still being watched.
+       */
+      topoState.stale = !!topoState.graph;
+      topoPaint();
+      return;
+    }
+    topoState.stale = false;
+    // Hosts known only by a learned MAC are endpoints like any other, so
+    // they follow the endpoints switch rather than having one of their
+    // own. They are always built; showing them is the filter's business.
+    topoState.graph = window.Topology.build(inputs, { macEndpoints: true });
+    if (relayout !== false) {
+      TV.layout(topoState.graph, topoSvg.clientWidth || 900, topoSvg.clientHeight || 600,
+        topoState.vlan, { hideEndpoints: !document.getElementById('topo-f-endpoints').checked });
+    }
+    topoVlanOptions();
+    topoPaint();
+    if (relayout !== false) topoFit();
+  }
+
+  /** Which nodes and links the filters allow on screen. */
+  function topoVisible() {
+    const g = topoState.graph;
+    if (!g) return { nodes: [], links: [] };
+    const showEp = document.getElementById('topo-f-endpoints').checked;
+    const showExt = document.getElementById('topo-f-external').checked;
+    const vlan = topoState.vlan;
+
+    const keep = new Set();
+    for (const n of g.nodes.values()) {
+      if (n.endpoint && (!showEp || n._hidden)) continue;
+      if (n.kind === 'switch' && !n.polled && !showExt) continue;
+      if (vlan && n.kind === 'switch' && !topoSwitchInVlan(g, n, vlan)) continue;
+      keep.add(n.id);
+    }
+    const links = g.links.filter((l) => {
+      if (!keep.has(l.source) || !keep.has(l.target)) return false;
+      // A link to a neighbour the switch still remembers on a port that is
+      // not up is always drawn. It is a failed or unplugged uplink, which
+      // is exactly the thing worth seeing -- hiding it behind a switch
+      // meant the one diagram that would have shown the fault did not.
+      if (vlan) {
+        const inVlan = String(l.accessVlan) === String(vlan) ||
+          (l.untagged || []).map(String).indexOf(String(vlan)) >= 0 ||
+          (l.tagged || []).map(String).indexOf(String(vlan)) >= 0;
+        if (!inVlan) return false;
+      }
+      return true;
+    });
+    return { nodes: Array.from(keep).map((id) => g.nodes.get(id)), links };
+  }
+
+  function topoSwitchInVlan(g, n, vlan) {
+    for (const l of g.links) {
+      if (l.source !== n.id && l.target !== n.id) continue;
+      if (String(l.accessVlan) === String(vlan)) return true;
+      if ((l.untagged || []).map(String).indexOf(String(vlan)) >= 0) return true;
+      if ((l.tagged || []).map(String).indexOf(String(vlan)) >= 0) return true;
+    }
+    return false;
+  }
+
+  function topoVlanOptions() {
+    const sel = document.getElementById('topo-vlan');
+    const seen = new Set();
+    for (const l of (topoState.graph ? topoState.graph.links : [])) {
+      for (const v of (l.untagged || []).concat(l.tagged || [])) seen.add(String(v));
+      if (l.accessVlan) seen.add(String(l.accessVlan));
+    }
+    const current = sel.value;
+    clear(sel);
+    sel.appendChild(new Option('All VLANs', ''));
+    for (const v of Array.from(seen).sort((a, b) => Number(a) - Number(b))) {
+      sel.appendChild(new Option('VLAN ' + v, v));
+    }
+    sel.value = current && seen.has(current) ? current : '';
+    topoState.vlan = sel.value;
+  }
+
+  // ---------- drawing ----------
+  function topoPaint() {
+    const edges = document.getElementById('topo-edges');
+    const labels = document.getElementById('topo-edgelabels');
+    const nodesG = document.getElementById('topo-nodes');
+    clear(edges); clear(labels); clear(nodesG);
+
+    const g = topoState.graph;
+    const stat = (id, v) => { document.getElementById(id).textContent = v; };
+    document.getElementById('topo-stale').style.display = topoState.stale ? '' : 'none';
+    // Painted here rather than only at the call sites: whatever reason the
+    // panel had for repainting, the header should agree with what is on
+    // screen, and ordering bugs between the two stop being possible.
+    paintTopoButton();
+    if (!g) {
+      stat('topo-n-sw', 0); stat('topo-n-link', 0); stat('topo-n-ep', 0); stat('topo-n-warn', 0);
+      topoWarnings([{ sev: 'inf', title: 'Nothing to draw yet',
+        det: 'The picture is built from what a switch reports, so it needs one first.' }]);
+      // A view you can be sent to needs a way out of it.
+      const host = document.getElementById('topo-warnings');
+      const add = el('button', 'btn', 'Add a switch');
+      add.type = 'button';
+      add.style.marginTop = '10px';
+      add.addEventListener('click', () => {
+        const ids = Array.from(switches.keys());
+        if (ids.length) selectSwitch(ids[ids.length - 1]);
+        else createSwitch();
+      });
+      host.appendChild(add);
+      return;
+    }
+
+    const vis = topoVisible();
+    const byId = new Map(vis.nodes.map((n) => [n.id, n]));
+    stat('topo-n-sw', vis.nodes.filter((n) => n.kind === 'switch').length);
+    stat('topo-n-link', vis.links.filter((l) => l.kind === 'switch').length);
+    stat('topo-n-ep', vis.nodes.filter((n) => n.endpoint).length);
+    // The stale notice is a note like any other, so it counts as one.
+    stat('topo-n-warn', g.warnings.length + (topoState.stale ? 1 : 0));
+    topoWarnings(topoState.stale
+      ? [{ sev: 'wrn', title: 'No switches open',
+        det: 'This is the last picture that was drawn. Nothing is being polled now, so it ' +
+          'will not change until a switch is added again.' }].concat(g.warnings)
+      : g.warnings);
+    topoLegend();
+
+    for (const l of vis.links) {
+      const a = byId.get(l.source), b = byId.get(l.target);
+      if (!a || !b || a.x === undefined || b.x === undefined) continue;
+      const line = TV.el('line', {
+        x1: a.x, y1: a.y, x2: b.x, y2: b.y, 'class': 'topo-edge',
+        stroke: topoEdgeColour(l),
+        'stroke-width': l.kind === 'endpoint' ? 1 : (l.speed >= 10000 ? 3 : 2),
+        'stroke-opacity': l.blocked ? 0.75 : (l.kind === 'endpoint' ? 0.4 : 0.85)
+      });
+      // A blocked link is drawn, because pretending it is absent hides a
+      // loop; dashed, because no traffic takes it.
+      if (l.blocked) line.setAttribute('stroke-dasharray', '7 5');
+      else if (!l.confirmed && l.kind === 'switch') line.setAttribute('stroke-dasharray', '2 4');
+      line.addEventListener('mouseenter', (e) => topoShowTip(e, topoLinkTip(l, a, b)));
+      line.addEventListener('mousemove', (e) => topoShowTip(e, topoLinkTip(l, a, b)));
+      line.addEventListener('mouseleave', topoHideTip);
+      line.addEventListener('click', () => topoSelect({ link: l, a, b }));
+      edges.appendChild(line);
+
+      if (l.kind === 'switch') {
+        // Two thirds of the way down and pushed off the line: the middle
+        // of a vertical uplink is exactly where the endpoint fan is.
+        const mx = a.x + (b.x - a.x) * 0.62, my = a.y + (b.y - a.y) * 0.62;
+        const bits = [];
+        if (l.speed) bits.push(topoSpeed(l.speed));
+        if (l.mode === 'trunk') bits.push('trunk');
+        else if (l.accessVlan) bits.push('v' + l.accessVlan);
+        if (l.blocked) bits.push('blocked');
+        // Always drawn now, so it has to be obvious which one it is.
+        if (l.down) bits.push('down');
+        if (bits.length) {
+          const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+          const offX = (-(b.y - a.y) / len) * 12, offY = ((b.x - a.x) / len) * 12;
+          const t = TV.el('text', {
+            x: mx + offX, y: my + offY, 'text-anchor': 'middle', 'class': 'nodesub',
+            'font-size': 9, fill: l.blocked ? 'var(--t-red)' : 'var(--t-faint)'
+          });
+          t.textContent = bits.join(' \u00b7 ');
+          labels.appendChild(t);
+        }
+      }
+    }
+
+    for (const n of vis.nodes) {
+      if (n.x === undefined) continue;
+      const grp = TV.el('g', {
+        'class': 'topo-node', transform: 'translate(' + n.x + ',' + n.y + ')'
+      });
+      if (n.kind === 'switch') topoDrawSwitch(grp, n, topoState.sel && topoState.sel.node === n.id);
+      else topoDrawEndpoint(grp, n, topoState.sel && topoState.sel.node === n.id);
+      grp.addEventListener('mouseenter', (e) => topoShowTip(e, topoNodeTip(n)));
+      grp.addEventListener('mousemove', (e) => topoShowTip(e, topoNodeTip(n)));
+      grp.addEventListener('mouseleave', topoHideTip);
+      grp.addEventListener('mousedown', (e) => topoDragNode(e, n, grp));
+      grp.addEventListener('click', (e) => { e.stopPropagation(); topoSelect({ node: n.id }); });
+      // Double-click goes straight there, without the inspector step.
+      grp.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        if (!n.polled) return;
+        if (n.tabId && closedSwitches.has(n.tabId)) { reopenSwitch(n.tabId); return; }
+        for (const [id, sw] of switches) if (sw.host === n.host) selectSwitch(id);
+      });
+      nodesG.appendChild(grp);
+    }
+    topoApplyTransform();
+  }
+
+  function topoEdgeColour(l) {
+    if (l.blocked) return 'var(--t-red)';
+    if (l.down) return 'var(--t-faint)';
+    if (l.kind === 'endpoint') return TV.KIND_COLOR[(topoState.graph.nodes.get(l.target) || {}).kind]
+      || 'var(--t-dim)';
+    if (l.speed >= 10000) return 'var(--t-cyan)';
+    return 'var(--t-blue)';
+  }
+
+  const topoSpeed = (mbps) => mbps >= 1000 ? (mbps / 1000) + 'G' : mbps + 'M';
+
+  function topoDrawSwitch(g, n, selected) {
+    const w = n.polled ? 172 : 150, h = n.polled ? 64 : 54;
+    if (n.isRoot) {
+      g.appendChild(TV.el('rect', {
+        x: -w / 2 - 6, y: -h / 2 - 6, width: w + 12, height: h + 12, rx: 14,
+        fill: 'none', stroke: 'var(--t-cyan)', 'stroke-width': 1.5,
+        'stroke-opacity': 0.55, 'stroke-dasharray': '3 4'
+      }));
+    }
+    const box = TV.el('rect', {
+      x: -w / 2, y: -h / 2, width: w, height: h, rx: 11,
+      fill: n.polled ? 'var(--t-node)' : 'var(--t-node2)',
+      stroke: selected ? 'var(--t-cyan)' : (n.isRoot ? 'var(--t-cyan)' : 'var(--t-line2)'),
+      'stroke-width': selected ? 2.2 : 1.4
+    });
+    box.style.filter = selected ? 'drop-shadow(0 0 14px rgba(56,224,207,.5))'
+      : (n.polled ? 'drop-shadow(0 6px 14px rgba(0,0,0,.45))' : '');
+    g.appendChild(box);
+
+    g.appendChild(TV.el('rect', {
+      x: -w / 2, y: -h / 2, width: 5, height: h, rx: 2,
+      fill: n.isRoot ? 'var(--t-cyan)'
+        : (n.role === 'Distribution' ? 'var(--t-blue)'
+          : (n.polled ? 'var(--t-green)' : 'var(--t-faint)'))
+    }));
+
+    // One pip per stack unit, up to four: a stack is a different thing to
+    // reason about and it should be visible without opening anything.
+    for (let i = 0; i < Math.min(n.stack || 1, 4); i++) {
+      g.appendChild(TV.el('rect', {
+        x: w / 2 - 12 - i * 7, y: -h / 2 + 7, width: 5, height: 5, rx: 1,
+        fill: i === 0 ? 'var(--t-green)' : 'var(--t-cyan)'
+      }));
+    }
+
+    const t1 = TV.el('text', {
+      x: -w / 2 + 15, y: n.polled ? -9 : -6, 'class': 'nodelabel',
+      fill: '#eaf2f7', 'font-size': n.polled ? 13 : 12
+    });
+    t1.textContent = TV.trunc(n.label, n.polled ? 17 : 16);
+    g.appendChild(t1);
+
+    const t2 = TV.el('text', {
+      x: -w / 2 + 15, y: n.polled ? 9 : 10, 'class': 'nodesub',
+      fill: 'var(--t-dim)', 'font-size': 9.5
+    });
+    t2.textContent = TV.trunc((n.polled ? (n.role || '') + ' \u00b7 ' : '') + (n.sub || ''),
+      n.polled ? 28 : 20);
+    g.appendChild(t2);
+
+    if (n.isRoot) {
+      const c = TV.el('text', {
+        x: w / 2 - 14, y: h / 2 - 9, 'text-anchor': 'end', 'font-size': 9,
+        fill: 'var(--t-cyan)', 'class': 'nodesub'
+      });
+      c.textContent = '\u25c6 ROOT';
+      g.appendChild(c);
+    }
+    /**
+     * Only "not polled" is worth saying on the diagram. Whether a switch's
+     * tab happens to be open is a fact about this browser, not about the
+     * network, and the topology is a picture of the network.
+     */
+    if (!n.polled) {
+      const c = TV.el('text', {
+        x: -w / 2 + 15, y: 21, 'font-size': 8.5, fill: 'var(--t-faint)', 'class': 'nodesub'
+      });
+      c.textContent = 'not polled';
+      g.appendChild(c);
+    }
+  }
+
+  function topoDrawEndpoint(g, n, selected) {
+    const colour = TV.KIND_COLOR[n.kind] || 'var(--t-dim)';
+    const ring = TV.el('circle', {
+      r: selected ? 17 : 14, fill: '#11161f',
+      stroke: selected ? 'var(--t-cyan)' : colour, 'stroke-width': selected ? 2.4 : 1.6
+    });
+    ring.style.filter = selected ? 'drop-shadow(0 0 10px rgba(56,224,207,.5))' : '';
+    g.appendChild(ring);
+    const glyph = TV.el('text', {
+      x: 0, y: 5, 'text-anchor': 'middle', 'font-size': 14, fill: colour
+    });
+    glyph.textContent = TV.KIND_GLYPH[n.kind] || '?';
+    g.appendChild(glyph);
+    const label = TV.el('text', {
+      x: 0, y: 30, 'text-anchor': 'middle', 'class': 'nodesub',
+      fill: 'var(--t-dim)', 'font-size': 9
+    });
+    label.textContent = TV.trunc(n.label, 14);
+    g.appendChild(label);
+  }
+
+
+  // ---------- tooltips, selection, inspector ----------
+  function topoShowTip(e, html) {
+    topoTip.innerHTML = html;
+    topoTip.style.opacity = 1;
+    let x = e.clientX + 14, y = e.clientY + 14;
+    if (x > window.innerWidth - 320) x = e.clientX - 300;
+    if (y > window.innerHeight - 140) y = e.clientY - 120;
+    topoTip.style.left = x + 'px';
+    topoTip.style.top = y + 'px';
+  }
+  const topoHideTip = () => { topoTip.style.opacity = 0; };
+
+  function topoNodeTip(n) {
+    const esc = TV.esc;
+    if (n.kind === 'switch') {
+      return '<div class="h">' + esc(n.label) + '</div><div class="l">' +
+        esc(n.sub || '') + (n.polled ? ' \u00b7 ' + esc(n.role || '') : ' \u00b7 not polled') +
+        '</div>';
+    }
+    return '<div class="h">' + esc(n.label) + '</div><div class="l">' +
+      esc(n.kind) + (n.sub ? ' \u00b7 ' + esc(n.sub) : '') + '</div>';
+  }
+
+  function topoLinkTip(l, a, b) {
+    const esc = TV.esc;
+    // Whichever end is higher on screen is named first, so the tooltip
+    // reads the same way round as the line it describes.
+    const top = b.y < a.y ? { n: b, port: l.bPort } : { n: a, port: l.aPort };
+    const bottom = b.y < a.y ? { n: a, port: l.aPort } : { n: b, port: l.bPort };
+    const bits = [];
+    if (l.speed) bits.push(topoSpeed(l.speed));
+    if (l.mode === 'trunk') bits.push('trunk' + (l.nativeVlan ? ' native ' + l.nativeVlan : ''));
+    else if (l.accessVlan) bits.push('access v' + l.accessVlan);
+    if (l.stpRole || l.stpState) bits.push('STP ' + [l.stpRole, l.stpState].filter(Boolean).join('/'));
+    if (l.poe) bits.push('PoE');
+    if (l.down) bits.push('down');
+    if (l.kind === 'switch' && !l.confirmed) bits.push('one side only');
+    if (l.protos && l.protos.length) bits.push(l.protos.join(' + '));
+    return '<div class="h">' + esc(top.n.label) + ' ' + esc(top.port || '?') +
+      ' \u2194 ' + esc(bottom.n.label) + ' ' + esc(bottom.port || '?') + '</div>' +
+      '<div class="l">' + esc(bits.join(' \u00b7 ')) + '</div>';
+  }
+
+  function topoSelect(sel) {
+    topoState.sel = sel;
+    document.querySelector('.topo-body').classList.add('insp');
+    topoPaint();
+    topoInspector();
+  }
+
+  function topoInspector() {
+    const host = document.getElementById('topo-inspector');
+    clear(host);
+    const sel = topoState.sel;
+    const g = topoState.graph;
+    if (!sel || !g) return;
+
+    const row = (table, k, v) => {
+      if (v === undefined || v === null || v === '') return;
+      const tr = document.createElement('tr');
+      const a = document.createElement('td'); a.textContent = k;
+      const b = document.createElement('td'); b.textContent = v;
+      tr.appendChild(a); tr.appendChild(b); table.appendChild(tr);
+    };
+    const group = (title) => {
+      const box = el('div', 'insp-group');
+      box.appendChild(el('div', 'eyebrow', title));
+      const t = document.createElement('table');
+      t.className = 'data-table';
+      box.appendChild(t);
+      host.appendChild(box);
+      return t;
+    };
+
+    if (sel.link) {
+      const l = sel.link;
+      const h = document.createElement('h4');
+      h.textContent = (sel.a.label || '') + ' \u2194 ' + (sel.b.label || '');
+      host.appendChild(h);
+      host.appendChild(el('div', 'insp-sub',
+        (l.protos || []).join(' + ') + (l.confirmed ? ' \u00b7 seen from both ends'
+          : ' \u00b7 reported by one end')));
+      const t = group('Link');
+      row(t, sel.a.label + ' port', l.aPort);
+      row(t, sel.b.label + ' port', l.bPort || 'not reported');
+      row(t, 'Speed', l.speed ? topoSpeed(l.speed) : null);
+      row(t, 'State', [l.admin, l.oper].filter(Boolean).join(' / '));
+      row(t, 'Mode', l.mode);
+      row(t, 'Access VLAN', l.accessVlan);
+      row(t, 'Native VLAN', l.nativeVlan);
+      row(t, 'Untagged', (l.untagged || []).join(', '));
+      row(t, 'Tagged', rangeOf((l.tagged || []).map(Number)));
+      row(t, 'Spanning tree', [l.stpRole, l.stpState].filter(Boolean).join(' / '));
+      row(t, 'PoE', l.poe ? l.poe.detection + (l.poe.cls ? ' \u00b7 class ' + l.poe.cls : '') : null);
+      row(t, 'Errors', l.errors || null);
+      return;
+    }
+
+    const n = g.nodes.get(sel.node);
+    if (!n) return;
+    const h = document.createElement('h4');
+    h.textContent = n.label;
+    host.appendChild(h);
+    host.appendChild(el('div', 'insp-sub',
+      n.kind === 'switch'
+        ? (n.polled ? (n.role || '') + ' \u00b7 ' + (n.sub || '') : 'seen by a neighbour, not polled')
+        : n.kind + (n.sub ? ' \u00b7 ' + n.sub : '')));
+
+    if (n.kind === 'switch' && n.polled && n.health) {
+      const s = n.health.summary || {};
+      const t = group('Switch');
+      row(t, 'Model', n.sub);
+      row(t, 'Address', n.host);
+      row(t, 'Stack units', n.stack > 1 ? n.stack : null);
+      row(t, 'Interfaces up', s.interfacesUp != null ? s.interfacesUp + ' / ' + s.interfacesTotal : null);
+      row(t, 'VLANs', s.vlanCount);
+      row(t, 'Spanning tree', s.stpMode);
+      row(t, 'Root bridge', n.isRoot ? 'this switch' : null);
+      row(t, 'MAC entries', s.macCount);
+      row(t, 'Neighbours', s.neighbourCount);
+    }
+
+    const links = g.links.filter((l) => l.source === n.id || l.target === n.id);
+    const sw = links.filter((l) => l.kind === 'switch');
+    if (sw.length) {
+      const t = group('Links to switches');
+      for (const l of sw) {
+        const other = g.nodes.get(l.source === n.id ? l.target : l.source);
+        const port = l.source === n.id ? l.aPort : l.bPort;
+        row(t, port || '?', (other ? other.label : '?') +
+          (l.blocked ? ' \u00b7 blocked' : '') + (l.speed ? ' \u00b7 ' + topoSpeed(l.speed) : ''));
+      }
+    }
+    const eps = links.filter((l) => l.kind === 'endpoint');
+    if (eps.length) {
+      const t = group('Attached');
+      for (const l of eps) {
+        const other = g.nodes.get(l.source === n.id ? l.target : l.source);
+        row(t, l.aPort, (other ? other.label : '?') +
+          (other && other.kind ? ' \u00b7 ' + other.kind : ''));
+      }
+    }
+    if (n.macs && n.macs.length) {
+      const t = group('Learned MACs');
+      for (const m of n.macs.slice(0, 12)) row(t, m.mac, 'VLAN ' + m.vlan);
+    }
+    if (n.kind === 'switch' && n.polled) {
+      // "Open this switch" only when there is no tab for it. When one is
+      // already open the action is navigation, not opening, and saying
+      // "open" for something already open reads as a mistake.
+      const btn = el('button', 'btn', n.open ? 'Go to this switch' : 'Open this switch');
+      btn.type = 'button';
+      btn.addEventListener('click', () => {
+        // Its tab may be on screen or merely put away; either way this is
+        // the way back to it, and selecting it leaves the topology tab.
+        if (n.tabId && closedSwitches.has(n.tabId)) { reopenSwitch(n.tabId); return; }
+        for (const [id, sw] of switches) if (sw.host === n.host) selectSwitch(id);
+      });
+      host.appendChild(btn);
+    }
+  }
+
+  function topoWarnings(list) {
+    const host = document.getElementById('topo-warnings');
+    clear(host);
+    if (!list || !list.length) {
+      host.appendChild(el('div', 'topo-warn', 'Nothing to flag.'));
+      return;
+    }
+    for (const w of list) {
+      const box = el('div', 'topo-warn ' + (w.sev || 'inf'));
+      box.appendChild(el('b', '', w.title));
+      box.appendChild(document.createTextNode(w.det));
+      host.appendChild(box);
+    }
+  }
+
+  function topoLegend() {
+    const host = document.getElementById('topo-legend');
+    clear(host);
+    const add = (glyph, text, colour) => {
+      const s = el('span', '');
+      const i = el('i', '', glyph);
+      i.style.color = colour;
+      s.appendChild(i);
+      s.appendChild(document.createTextNode(text));
+      host.appendChild(s);
+    };
+    add('\u25c6', 'Spanning-tree root', 'var(--t-cyan)');
+    add('\u2500', '10G link', 'var(--t-cyan)');
+    add('\u2500', '1G link', 'var(--t-blue)');
+    add('\u254c', 'Blocked by spanning tree', 'var(--t-red)');
+    add('\u2500', 'Port down \u2014 neighbour still remembered', 'var(--t-faint)');
+    add('\u254c', 'Reported by one end only', 'var(--t-faint)');
+    add(TV.KIND_GLYPH.phone, 'Phone', TV.KIND_COLOR.phone);
+    add(TV.KIND_GLYPH.ap, 'Access point', TV.KIND_COLOR.ap);
+    add(TV.KIND_GLYPH.host, 'Host', TV.KIND_COLOR.host);
+    add(TV.KIND_GLYPH.segment, 'Several MACs on a port', TV.KIND_COLOR.segment);
+  }
+
+  // ---------- pan, zoom, drag ----------
+  function topoApplyTransform() {
+    topoViewport.setAttribute('transform',
+      'translate(' + topoState.tx + ',' + topoState.ty + ') scale(' + topoState.zoom + ')');
+  }
+
+  function topoFit() {
+    const vis = topoVisible();
+    const pts = vis.nodes.filter((n) => n.x !== undefined);
+    if (!pts.length) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of pts) {
+      minX = Math.min(minX, n.x - 110); maxX = Math.max(maxX, n.x + 110);
+      minY = Math.min(minY, n.y - 60); maxY = Math.max(maxY, n.y + 60);
+    }
+    const w = topoSvg.clientWidth || 900, h = topoSvg.clientHeight || 600;
+    /**
+     * Half the size that would fill the pane. A diagram fitted edge to
+     * edge leaves no room to see that anything is beyond it, and the first
+     * thing anyone does with a topology is drag it about -- starting
+     * zoomed out means there is somewhere to drag it to.
+     */
+    // Exactly half what fitting edge to edge would give, cap included: a
+    // diagram filling the pane leaves no sign that anything is beyond it,
+    // and the first thing anyone does with a topology is drag it around.
+    // Never magnified past natural size either -- a two-node network blown
+    // up to fill a screen looks like a mistake.
+    const zoom = Math.min(1, Math.max(0.08,
+      Math.min(w / (maxX - minX), h / (maxY - minY)) * 0.46));
+    topoState.zoom = zoom;
+    topoState.tx = (w - (maxX + minX) * zoom) / 2;
+    topoState.ty = (h - (maxY + minY) * zoom) / 2;
+    topoApplyTransform();
+  }
+
+  function topoZoomBy(factor) {
+    const w = topoSvg.clientWidth / 2, h = topoSvg.clientHeight / 2;
+    const next = Math.min(3, Math.max(0.1, topoState.zoom * factor));
+    // Zoom about the middle of the view rather than the origin, so the
+    // thing being looked at stays where it is.
+    topoState.tx = w - (w - topoState.tx) * (next / topoState.zoom);
+    topoState.ty = h - (h - topoState.ty) * (next / topoState.zoom);
+    topoState.zoom = next;
+    topoApplyTransform();
+  }
+
+  function topoDragNode(e, n, grp) {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    const start = { x: e.clientX, y: e.clientY, nx: n.x, ny: n.y };
+    let moved = false;
+    const move = (ev) => {
+      const dx = (ev.clientX - start.x) / topoState.zoom;
+      const dy = (ev.clientY - start.y) / topoState.zoom;
+      if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
+      n.x = start.nx + dx;
+      n.y = start.ny + dy;
+      grp.setAttribute('transform', 'translate(' + n.x + ',' + n.y + ')');
+      topoPaintEdgesOnly();
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      if (moved) topoPaint();
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  }
+
+  /** Redraw just the lines while a node is being dragged. */
+  function topoPaintEdgesOnly() {
+    const vis = topoVisible();
+    const byId = new Map(vis.nodes.map((n) => [n.id, n]));
+    const lines = document.getElementById('topo-edges').children;
+    let i = 0;
+    for (const l of vis.links) {
+      const a = byId.get(l.source), b = byId.get(l.target);
+      const line = lines[i++];
+      if (!line || !a || !b) continue;
+      line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
+      line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
+    }
+  }
+
+  topoSvg.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    const start = { x: e.clientX, y: e.clientY, tx: topoState.tx, ty: topoState.ty };
+    topoSvg.classList.add('panning');
+    const move = (ev) => {
+      topoState.tx = start.tx + (ev.clientX - start.x);
+      topoState.ty = start.ty + (ev.clientY - start.y);
+      topoApplyTransform();
+    };
+    const up = () => {
+      topoSvg.classList.remove('panning');
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+  topoSvg.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    topoZoomBy(e.deltaY < 0 ? 1.12 : 1 / 1.12);
+  }, { passive: false });
+  topoSvg.addEventListener('click', () => {
+    if (!topoState.sel) return;
+    topoState.sel = null;
+    document.querySelector('.topo-body').classList.remove('insp');
+    topoPaint();
+  });
+
+  document.getElementById('topo-zin').addEventListener('click', () => topoZoomBy(1.2));
+  document.getElementById('topo-zout').addEventListener('click', () => topoZoomBy(1 / 1.2));
+  document.getElementById('topo-fit').addEventListener('click', topoFit);
+  document.getElementById('topo-relayout').addEventListener('click', () => topoRebuild(true));
+  document.getElementById('topo-f-endpoints').addEventListener('change', () => {
+    // Showing or hiding them changes how much room the diagram needs.
+    topoRebuild(true);
+  });
+  document.getElementById('topo-f-external').addEventListener('change', topoPaint);
+
+  document.getElementById('topo-vlan').addEventListener('change', (e) => {
+    topoState.vlan = e.target.value;
+    // A VLAN focus changes which switches are on the picture, so the
+    // layers are worked out again rather than leaving gaps behind.
+    TV.layout(topoState.graph, topoSvg.clientWidth || 900, topoSvg.clientHeight || 600,
+      topoState.vlan, { hideEndpoints: !document.getElementById('topo-f-endpoints').checked });
+    topoPaint();
+    topoFit();
+  });
+
+  /** Save the diagram as a PNG, at twice the size so it stays readable. */
+  document.getElementById('topo-png').addEventListener('click', () => {
+    const w = topoSvg.clientWidth, h = topoSvg.clientHeight;
+    const clone = topoSvg.cloneNode(true);
+    clone.setAttribute('width', w);
+    clone.setAttribute('height', h);
+    // The SVG is styled from the page, which a detached copy cannot see,
+    // so the variables it uses are written in explicitly.
+    const styles = getComputedStyle(topoPanel);
+    let vars = '';
+    for (const name of ['--t-cyan', '--t-blue', '--t-violet', '--t-amber', '--t-green',
+      '--t-red', '--t-line', '--t-line2', '--t-ink', '--t-dim', '--t-faint',
+      '--t-node', '--t-node2']) {
+      vars += name + ':' + styles.getPropertyValue(name) + ';';
+    }
+    const style = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+    style.textContent = 'svg{' + vars + 'background:' +
+      getComputedStyle(document.body).backgroundColor + ';}' +
+      '.nodelabel,.nodesub{font-family:ui-monospace,Menlo,Consolas,monospace;}';
+    clone.insertBefore(style, clone.firstChild);
+
+    const svgText = new XMLSerializer().serializeToString(clone);
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = w * 2; canvas.height = h * 2;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = getComputedStyle(document.body).backgroundColor;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const a = document.createElement('a');
+      a.download = 'topology.png';
+      a.href = canvas.toDataURL('image/png');
+      a.click();
+      appLog('info', 'Topology saved as PNG', {});
+    };
+    img.onerror = () => appLog('warn', 'Could not render the topology to PNG', {});
+    img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgText)));
+  });
+
+  paintTopoButton();
+
+  document.getElementById('mib-toggle').addEventListener('click', () => {
+    // The MIB explorer covers whatever tab is showing, the topology
+    // included; leaving both open would stack two full-screen panels.
+    leaveTopology();
+    openMib();
+  });
+  document.getElementById('mib-close').addEventListener('click', () => mibPanel.classList.remove('open'));
+  let mibDeb = null;
+  mibQ.addEventListener('input', () => {
+    clearTimeout(mibDeb);
+    mibDeb = setTimeout(runMibSearch, 160);
+  });
+  for (const sel of [mibAccess, mibShape, mibTree]) sel.addEventListener('change', runMibSearch);
+  // Switching product reloads that product's MIB set and re-runs the search.
+  if (mibProduct) {
+    mibProduct.addEventListener('change', () => {
+      loadMib(mibProduct.value).then(() => { updateMibNote(); runMibSearch(); });
+    });
+  }
+
+  function updateMibNote() {
+    const prod = productByLine(MIB.product);
+    const label = prod ? prod.label : 'Catalyst 1200/1300';
+    mibNote.textContent = MIB.loaded
+      ? MIB.entries.length.toLocaleString() + ' objects from the ' + label + ' MIB set'
+      : 'MIB database unavailable';
+  }
+
+  function openMib() {
+    mibPanel.classList.add('open');
+    loadProducts().then(() => {
+      // Populate the product picker once, from the registry.
+      if (mibProduct && !mibProduct.options.length) {
+        for (const p of PRODUCTS.products) {
+          const o = document.createElement('option');
+          o.value = p.line; o.textContent = p.label;
+          mibProduct.appendChild(o);
+        }
+      }
+      // Default to the product of the switch whose tab is showing (override-aware).
+      const active = activeId && switches.get(activeId);
+      const line = (active && effectiveProductLine(active)) || PRODUCTS.default;
+      if (mibProduct) mibProduct.value = line;
+      return loadMib(line);
+    }).then(() => { updateMibNote(); runMibSearch(); });
+  }
+
+  /** scalar | column | table, decided from the MIB tree rather than the name. */
+  function mibShapeOf(e) {
+    if (/Table$/.test(e.name)) return 'table';
+    if (/Entry$/.test(e.name)) return 'table';
+    return isColumnar(e) ? 'column' : 'scalar';
+  }
+
+  function runMibSearch() {
+    if (!MIB.loaded) return;
+    const q = mibQ.value.trim().toLowerCase();
+    const terms = q.split(/\s+/).filter(Boolean);
+    const acc = mibAccess.value, shape = mibShape.value, tree = mibTree.value;
+
+    const scored = [];
+    for (const e of MIB.entries) {
+      if (tree === 'vendor' && e.oid.indexOf(VENDOR_ROOT) !== 0) continue;
+      if (tree === 'standard' && e.oid.indexOf('1.3.6.1.2.1') !== 0) continue;
+      if (acc === 'readable' && !(e.access === 'r' || e.access === 'rw' || e.access === 'rc')) continue;
+      if (acc === 'writable' && !(e.access === 'rw' || e.access === 'rc' || e.access === 'w')) continue;
+      const sh = mibShapeOf(e);
+      if (shape && sh !== shape) continue;
+
+      let score = 0;
+      if (!terms.length) score = 1;
+      for (const t of terms) {
+        const n = e.name.toLowerCase();
+        // Name matches outrank description matches: searching "fan" should
+        // put rlEnvMonFanState above every object that merely mentions fans.
+        if (n === t) score += 100;
+        else if (n.indexOf(t) === 0) score += 50;
+        else if (n.indexOf(t) >= 0) score += 25;
+        else if (e.oid.indexOf(t) === 0) score += 20;
+        else if ((e.description || '').toLowerCase().indexOf(t) >= 0) score += 6;
+        else if ((e.mib || '').toLowerCase().indexOf(t) >= 0) score += 3;
+        else { score = 0; break; }          // every term must match somewhere
+      }
+      if (score <= 0) continue;
+      // Prefer things you can actually read.
+      if (e.access === 'r' || e.access === 'rw') score += 4;
+      scored.push({ e, score, shape: sh });
+    }
+
+    scored.sort((a, b) => b.score - a.score || a.e.name.localeCompare(b.e.name));
+    const top = scored.slice(0, 300);
+
+    clear(mibResults);
+    mibNote.textContent = scored.length.toLocaleString() + ' of ' +
+      MIB.entries.length.toLocaleString() + ' objects match' +
+      (scored.length > top.length ? ' (showing first ' + top.length + ')' : '');
+
+    if (!top.length) {
+      mibResults.appendChild(el('div', 'empty-state',
+        'Nothing matches. Try a single keyword \u2014 search covers names, OIDs and descriptions.'));
+      return;
+    }
+
+    for (const r of top) {
+      const row = el('div', 'mib-row');
+      const nm = el('div', 'r-name');
+      const first = terms[0];
+      const at = first ? r.e.name.toLowerCase().indexOf(first) : -1;
+      if (at >= 0) {
+        nm.appendChild(document.createTextNode(r.e.name.slice(0, at)));
+        nm.appendChild(el('span', 'hl', r.e.name.slice(at, at + first.length)));
+        nm.appendChild(document.createTextNode(r.e.name.slice(at + first.length)));
+      } else nm.textContent = r.e.name;
+      row.appendChild(nm);
+
+      const meta = el('div', 'r-meta');
+      meta.appendChild(el('span', 'r-oid', r.e.oid));
+      meta.appendChild(el('span', 'r-tag', r.shape));
+      if (r.e.access) meta.appendChild(el('span', 'r-tag', ACCESS_LABEL[r.e.access] || r.e.access));
+      if (r.e.syntax) meta.appendChild(el('span', '', r.e.syntax));
+      row.appendChild(meta);
+      if (r.e.description) row.appendChild(el('div', 'r-desc', r.e.description));
+
+      row.addEventListener('click', () => {
+        mibSelected = r.e;
+        Array.from(mibResults.children).forEach((c) => c.classList.remove('active'));
+        row.classList.add('active');
+        showMibDetail(r.e);
+      });
+      mibResults.appendChild(row);
+    }
+    if (!mibSelected || !top.some((r) => r.e === mibSelected)) {
+      mibResults.firstChild.click();
+    }
+  }
+
+  const ACCESS_LABEL = {
+    r: 'read-only', rw: 'read-write', rc: 'read-create',
+    n: 'not-accessible', w: 'write-only', afn: 'notify'
+  };
+
+  function showMibDetail(e) {
+    clear(mibDetail);
+    mibDetail.appendChild(el('h3', '', e.name));
+    mibDetail.appendChild(el('div', 'd-oid', e.oid));
+
+    const shape = mibShapeOf(e);
+    const kv = (k, v) => {
+      if (!v) return;
+      const row = el('div', 'kv-row');
+      row.appendChild(el('div', 'k', k));
+      row.appendChild(el('div', 'v', v));
+      mibDetail.appendChild(row);
+    };
+    kv('Shape', shape);
+    kv('Access', ACCESS_LABEL[e.access] || e.access || 'unknown');
+    kv('Syntax', e.syntax);
+    kv('Units', e.units);
+    kv('Defined in', e.mib);
+    if (e.description) mibDetail.appendChild(el('div', 'd-desc', e.description));
+
+    if (e.enum) {
+      mibDetail.appendChild(el('div', 'section-title', 'Values'));
+      const list = el('div', 'enum-list');
+      for (const k of Object.keys(e.enum)) list.appendChild(el('span', '', e.enum[k] + ' (' + k + ')'));
+      mibDetail.appendChild(list);
+    }
+
+    // What to do with it, on the switch you are actually looking at.
+    const active = activeId && switches.get(activeId);
+    const acts = el('div', 'mib-actions');
+    const op = shape === 'scalar' ? 'get' : 'walk';
+    const oid = shape === 'scalar' ? e.name + '.0' : e.name;
+
+    const add = el('button', 'btn', 'Add as panel' + (active && active.host ? ' to ' + active.host : ''));
+    add.type = 'button';
+    add.disabled = !(active && active.target);
+    add.title = add.disabled ? 'Set a switch target on the Health tab first' : '';
+    add.addEventListener('click', () => {
+      const panel = {
+        id: 'o:' + Date.now() + ':' + Math.random().toString(36).slice(2, 7),
+        kind: 'oid', oid, op, title: e.name,
+        span: op === 'walk' ? 6 : 4, h: op === 'walk' ? 300 : 0
+      };
+      active.panels.push(panel);
+      active.renderedIds = null;
+      saveLayout(active);
+      renderSwitch(active);
+      loadPanelData(active, panel);
+      mibPanel.classList.remove('open');
+      showView(active, 'health');
+      appLog('info', 'Panel added from MIB Explorer', { host: active.host, oid, op });
+    });
+    acts.appendChild(add);
+
+    const copy = el('button', 'btn btn-amber', 'Copy OID');
+    copy.type = 'button';
+    copy.addEventListener('click', () => {
+      const text = e.oid;
+      if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+      copy.textContent = 'Copied';
+      setTimeout(() => { copy.textContent = 'Copy OID'; }, 1200);
+    });
+    acts.appendChild(copy);
+    mibDetail.appendChild(acts);
+    if (add.disabled) {
+      mibDetail.appendChild(el('div', 'card-sub',
+        'Set a switch target on the Health tab to add this as a panel.'));
+    }
+
+    // Walking the tree is often how you find the object you actually
+    // wanted: siblings of a column are the rest of that table.
+    const parentOid = e.oid.split('.').slice(0, -1).join('.');
+    const parentName = MIB.byOid.get(parentOid);
+    const children = MIB.entries
+      .filter((x) => x.oid.indexOf(e.oid + '.') === 0 &&
+        x.oid.split('.').length === e.oid.split('.').length + 1)
+      .slice(0, 60);
+    const siblings = MIB.entries
+      .filter((x) => x !== e && x.oid.indexOf(parentOid + '.') === 0 &&
+        x.oid.split('.').length === e.oid.split('.').length)
+      .slice(0, 60);
+
+    const treeRow = (label, entry) => {
+      const r = el('div', 'mib-tree-row', label);
+      r.appendChild(el('span', 't-oid', entry.oid));
+      r.addEventListener('click', () => { mibSelected = entry; showMibDetail(entry); });
+      return r;
+    };
+    if (parentName) {
+      mibDetail.appendChild(el('div', 'section-title', 'Parent'));
+      const pe = MIB.entries.find((x) => x.oid === parentOid);
+      if (pe) mibDetail.appendChild(treeRow(parentName, pe));
+    }
+    if (children.length) {
+      mibDetail.appendChild(el('div', 'section-title', 'Children (' + children.length + ')'));
+      for (const c of children) mibDetail.appendChild(treeRow(c.name, c));
+    }
+    if (siblings.length) {
+      mibDetail.appendChild(el('div', 'section-title', 'Siblings (' + siblings.length + ')'));
+      for (const c of siblings) mibDetail.appendChild(treeRow(c.name, c));
+    }
+  }
+
+  // =================================================================
+  // Load the product registry up front so product detection, feature gating
+  // and the Explorer default work from the first render (it is tiny).
+  loadProducts();
+
+  // Put back what was open last time; an empty first tab if there was
+  // nothing, or nothing readable.
+  restoreState().then((restored) => {
+    if (!restored) createSwitch();
+    appLog('info', 'Page loaded', {
+      librariesLoaded: librariesLoaded(), restored: !!restored
+    });
+  });
+})();

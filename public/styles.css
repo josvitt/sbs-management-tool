@@ -1,0 +1,1493 @@
+:root {
+  /* Without this, the browser renders form controls, scrollbars and
+     autofill in its light-mode palette -- neutral greys with no green in
+     them, against a page that is entirely green-black. That mismatch is
+     where the odd patches of flat grey come from. */
+  color-scheme: dark;
+  --bg: #0c1210;
+  --panel: #111a17;
+  /* Depth reads in one direction: the page is darkest, a panel sits a
+     step above it, and anything nested inside a panel a step above that.
+     This used to run page -> panel -> *back past the page*, so a card
+     looked further away than the page it was printed on. */
+  --panel-2: #16211c;
+  --panel-border: #22332c;
+  --text: #d7e5dd;
+  --muted: #7c9488;
+  --amber: #e8a33d;
+  --green: #4fd88a;
+  --red: #e2604f;
+  --blue: #5fb3e8;
+  --violet: #b08bf0;
+  --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  --header-h: 46px;
+  --tabbar-h: 42px;
+}
+
+* { box-sizing: border-box; }
+
+/*
+ * Layout contract, to keep exactly one scrollbar on screen at a time:
+ *   - html/body are locked to the viewport and never scroll
+ *   - every flex ancestor of a scrolling area carries min-height:0
+ *   - only the innermost content region sets overflow:auto
+ * The terminal is the one exception: xterm renders its own scrollbar.
+ */
+html, body {
+  margin: 0; height: 100%; overflow: hidden;
+  background: var(--bg); color: var(--text);
+  font-family: var(--mono); font-size: 14px;
+}
+body { display: flex; flex-direction: column; }
+
+/* ---------- header ---------- */
+/* The two app-level buttons now live at the right of the switch tab bar. */
+#tab-bar-actions {
+  flex-shrink: 0; display: flex; align-items: center; gap: 6px;
+  padding: 0 10px 0 8px;
+}
+
+.icon-btn {
+  flex-shrink: 0; font-size: 10.5px; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--muted); background: transparent;
+  border: 1px solid var(--panel-border); border-radius: 3px;
+  padding: 6px 9px; cursor: pointer; font-family: var(--mono); white-space: nowrap;
+}
+.icon-btn:hover { border-color: var(--amber); color: var(--amber); }
+.icon-btn .badge {
+  display: none; background: var(--red); color: #1a0805;
+  border-radius: 10px; padding: 0 5px; margin-left: 5px; font-weight: 700;
+}
+.icon-btn.has-errors .badge { display: inline; }
+
+/* ---------- switch tab bar ---------- */
+#tab-bar {
+  height: var(--tabbar-h); flex-shrink: 0; display: flex; align-items: stretch;
+  background: var(--panel); border-bottom: 1px solid var(--panel-border); min-width: 0;
+}
+#tab-strip {
+  flex: 1; min-width: 0; display: flex; align-items: stretch; gap: 2px;
+  padding: 6px 6px 0 8px; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin;
+}
+#tab-strip::-webkit-scrollbar { height: 6px; }
+#tab-strip::-webkit-scrollbar-thumb { background: var(--panel-border); border-radius: 3px; }
+
+.tab {
+  display: flex; align-items: center; gap: 7px; padding: 0 8px 0 10px;
+  background: var(--panel-2); border: 1px solid var(--panel-border);
+  border-bottom: none; border-radius: 4px 4px 0 0; font-size: 11.5px;
+  color: var(--muted); cursor: pointer; white-space: nowrap;
+  flex-shrink: 0; max-width: 230px;
+}
+.tab.active { color: var(--text); background: var(--bg); }
+.tab-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+.tab-dot.connecting { background: var(--amber); }
+.tab-dot.ok { background: var(--green); box-shadow: 0 0 5px var(--green); }
+.tab-dot.warning { background: var(--amber); box-shadow: 0 0 5px var(--amber); }
+.tab-dot.critical { background: var(--red); box-shadow: 0 0 5px var(--red); }
+.tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab-close {
+  color: var(--muted); font-size: 14px; line-height: 1;
+  padding: 1px 3px; border-radius: 2px; flex-shrink: 0;
+}
+.tab-close:hover { color: var(--red); background: rgba(226,96,79,0.15); }
+
+
+/* Sits immediately after the last tab: a target, not a label. */
+.new-btn {
+  font-family: var(--mono); font-size: 15px; line-height: 1;
+  width: 24px; height: 24px; padding: 0; border-radius: 3px; background: transparent;
+  border: 1px solid var(--panel-border); color: var(--muted); cursor: pointer;
+  flex-shrink: 0; align-self: center; margin-left: 4px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.new-btn:hover { border-color: var(--violet); color: var(--violet); }
+
+/* Tab reordering */
+.tab { cursor: grab; }
+.tab.dragging { opacity: 0.45; cursor: grabbing; }
+.tab.drop-before { box-shadow: inset 2px 0 0 var(--amber); }
+.tab.drop-after { box-shadow: inset -2px 0 0 var(--amber); }
+.new-btn:hover { background: var(--violet); color: #140b24; }
+
+/* ---------- main ---------- */
+main { flex: 1; min-height: 0; position: relative; display: flex; }
+#switches { flex: 1; min-width: 0; min-height: 0; position: relative; }
+
+.switch-pane {
+  position: absolute; inset: 0; display: none;
+  flex-direction: column; min-height: 0; min-width: 0;
+  background: var(--bg);   /* opaque layer: prevents reflow repaint artifacts */
+}
+.switch-pane.active { display: flex; }
+
+/* ---------- per-switch sub tabs ---------- */
+.subtabs {
+  flex-shrink: 0; display: flex; align-items: stretch; gap: 2px;
+  padding: 0 10px; background: var(--panel);
+  border-bottom: 1px solid var(--panel-border); min-width: 0; overflow-x: auto;
+}
+.subtab {
+  padding: 9px 14px; font-size: 11.5px; color: var(--muted);
+  cursor: pointer; border-bottom: 2px solid transparent; white-space: nowrap;
+  display: flex; align-items: center; gap: 6px;
+}
+.subtab:hover { color: var(--text); }
+.subtab.active { color: var(--amber); border-bottom-color: var(--amber); }
+.subtab[disabled], .subtab.disabled { opacity: 0.4; cursor: not-allowed; }
+.subtab .sdot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+.subtab .sub-label { pointer-events: none; }
+.subtab .sdot.on { background: var(--green); }
+.subtab .sdot.busy { background: var(--amber); }
+.subtab .sdot.err { background: var(--red); }
+
+/* The Health sub-tab carries the same verdict colour as the Overview
+   badge, so the state of the switch is legible without opening it. */
+.subtab.sev-ok { color: var(--green); border-color: rgba(126,200,143,0.45); }
+.subtab.sev-warning { color: var(--amber); border-color: rgba(232,163,61,0.5); }
+.subtab.sev-critical { color: var(--red); border-color: rgba(226,96,79,0.55); }
+.subtab.sev-ok.active { border-color: var(--green); }
+.subtab.sev-warning.active { border-color: var(--amber); }
+.subtab.sev-critical.active { border-color: var(--red); }
+
+.subview { flex: 1; min-height: 0; min-width: 0; display: none; flex-direction: column; position: relative; }
+.subview.active { display: flex; }
+
+/* ---------- forms ---------- */
+.form-view {
+  flex: 1; min-height: 0; overflow-y: auto;
+  display: flex; align-items: flex-start; justify-content: center; padding: 20px 14px;
+}
+.card-form {
+  width: 100%; max-width: 400px; padding: 20px;
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 6px;
+}
+.eyebrow {
+  font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--amber); margin-bottom: 14px;
+}
+.field { margin-bottom: 12px; min-width: 0; }
+.field label {
+  display: block; font-size: 10.5px; color: var(--muted);
+  letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 5px;
+}
+.field input, .field select {
+  width: 100%; min-width: 0; background: var(--panel-2);
+  border: 1px solid var(--panel-border); color: var(--text);
+  font-family: var(--mono); font-size: 12.5px; padding: 8px 9px;
+  border-radius: 3px; outline: none;
+}
+.field input:focus, .field select:focus { border-color: var(--amber); }
+.row-split { display: flex; gap: 8px; min-width: 0; }
+.row-split .field { flex: 1; min-width: 0; }
+.row-split .field.port { flex: 0 0 84px; }
+
+.btn {
+  width: 100%; padding: 10px; font-family: var(--mono); font-size: 11.5px;
+  letter-spacing: 0.07em; text-transform: uppercase; border-radius: 3px;
+  border: 1px solid var(--green); background: transparent; color: var(--green);
+  cursor: pointer; white-space: nowrap;
+}
+.btn:hover { background: var(--green); color: #06110b; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; background: transparent; }
+.btn-danger { border-color: var(--red); color: var(--red); }
+.btn-danger:hover { background: var(--red); color: #1a0805; }
+.btn-amber { border-color: var(--amber); color: var(--amber); }
+.btn-amber:hover { background: var(--amber); color: #1a0f05; }
+.btn-blue { border-color: var(--blue); color: var(--blue); }
+.btn-blue:hover { background: var(--blue); color: #061a24; }
+.btn-violet { border-color: var(--violet); color: var(--violet); }
+.btn-violet:hover { background: var(--violet); color: #140b24; }
+
+.form-error {
+  margin-top: 12px; font-size: 11.5px; color: var(--red);
+  line-height: 1.5; display: none; white-space: pre-wrap; word-break: break-word;
+}
+.form-hint {
+  margin-top: 16px; font-size: 10px; color: var(--muted); line-height: 1.6;
+  border-top: 1px solid var(--panel-border); padding-top: 12px;
+}
+.v3-fields { display: none; }
+.v3-fields.visible { display: block; }
+.community-field.hidden { display: none; }
+
+/* ---------- toolbars ---------- */
+.toolbar {
+  flex-shrink: 0; display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; border-bottom: 1px solid var(--panel-border);
+  background: var(--panel); min-width: 0; flex-wrap: wrap;
+}
+.toolbar-status {
+  font-size: 11.5px; color: var(--muted); flex: 1; min-width: 90px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.toolbar .btn { width: auto; padding: 6px 11px; font-size: 10.5px; }
+.check-label {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 10px; color: var(--muted); cursor: pointer; white-space: nowrap;
+}
+.check-label input { accent-color: var(--amber); cursor: pointer; }
+.check-label:hover { color: var(--amber); }
+
+/* ---------- health ---------- */
+.scroll-body {
+  flex: 1; min-height: 0; overflow-y: auto; padding: 14px;
+  /* Opaque background so panel reflow repaints clear cleanly (no grey trails). */
+  background: var(--bg);
+  /* Reserve the scrollbar gutter at all times so content width does not shift
+     as the scrollbar appears/disappears - that shift is what made panels
+     different widths and left a mismatched strip down the right edge. */
+  scrollbar-gutter: stable;
+}
+
+/*
+ * The hero sits inside a panel that already supplies a frame and a
+ * background. Giving it a second tinted one made the Overview panel a
+ * visibly different shade from every other panel on the page. The
+ * severity now shows as a left accent and on the badge, so the panel
+ * background stays the same everywhere.
+ */
+.hero {
+  display: flex; align-items: flex-start; gap: 14px; flex-wrap: wrap;
+  padding: 2px 0 2px 12px; border-radius: 0; margin-bottom: 12px;
+  border: none; border-left: 3px solid var(--panel-border); background: transparent;
+}
+.hero.sev-critical { border-left-color: var(--red); }
+.hero.sev-warning { border-left-color: var(--amber); }
+.hero.sev-ok { border-left-color: var(--green); }
+.hero.sev-info { border-left-color: var(--blue); }
+.hero-main { flex: 1; min-width: 220px; }
+.hero-name { font-size: 17px; color: var(--text); margin-bottom: 3px; }
+.hero-sub { font-size: 11px; color: var(--muted); line-height: 1.6; white-space: pre-line; }
+.hero-badge {
+  padding: 5px 12px; border-radius: 4px; font-size: 11px; letter-spacing: 0.08em;
+  text-transform: uppercase; white-space: nowrap; border: 1px solid currentColor;
+}
+.hero-badge.sev-critical { color: var(--red); }
+.hero-badge.sev-warning { color: var(--amber); }
+.hero-badge.sev-ok { color: var(--green); }
+.hero-badge.sev-info { color: var(--blue); }
+
+.card-grid {
+  display: grid; gap: 10px; margin-bottom: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
+}
+.card {
+  background: var(--panel-2); border: 1px solid var(--panel-border);
+  border-radius: 5px; padding: 11px 12px; min-width: 0;
+}
+.card-label {
+  font-size: 9.5px; letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--muted); margin-bottom: 6px;
+}
+.card-value { font-size: 19px; color: var(--text); line-height: 1.15; word-break: break-word; }
+.card-value.warn { color: var(--amber); }
+.card-value.crit { color: var(--red); }
+.card-value.good { color: var(--green); }
+.card-sub { font-size: 10px; color: var(--muted); margin-top: 5px; line-height: 1.5; }
+.meter { height: 4px; border-radius: 2px; background: var(--panel-2); margin-top: 7px; overflow: hidden; }
+.meter > i { display: block; height: 100%; background: var(--green); }
+.meter > i.warn { background: var(--amber); }
+.meter > i.crit { background: var(--red); }
+
+.alert-row {
+  display: flex; gap: 9px; align-items: baseline; padding: 7px 10px;
+  margin-bottom: 5px; border-radius: 4px; border-left: 3px solid var(--muted);
+  background: var(--panel); font-size: 12px;
+}
+.alert-row.sev-critical { border-left-color: var(--red); }
+.alert-row.sev-warning { border-left-color: var(--amber); }
+.alert-row.sev-ok { border-left-color: var(--green); }
+.alert-row.sev-info { border-left-color: var(--blue); }
+.alert-area {
+  font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); flex: 0 0 88px;
+}
+.alert-msg { flex: 1; min-width: 0; color: var(--text); line-height: 1.5; }
+
+.section-title {
+  font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--amber); margin: 16px 0 7px;
+  border-bottom: 1px solid var(--panel-border); padding-bottom: 5px;
+  display: flex; align-items: center; gap: 10px;
+}
+.section-title .st-note { color: var(--muted); letter-spacing: 0; text-transform: none; font-size: 10px; }
+
+.pill { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; border: 1px solid currentColor; }
+.pill.good { color: var(--green); }
+.pill.warn { color: var(--amber); }
+.pill.crit { color: var(--red); }
+.pill.idle { color: var(--muted); }
+
+/* ---------- data tables ---------- */
+.data-table { width: 100%; border-collapse: collapse; }
+.data-table td, .data-table th {
+  padding: 4px 7px; border-bottom: 1px solid #17211c;
+  vertical-align: top; font-size: 11.5px; text-align: left;
+}
+.data-table th {
+  color: var(--amber); font-weight: 600; font-size: 10px; letter-spacing: 0.03em;
+  white-space: nowrap; border-bottom: 1px solid var(--panel-border);
+  position: sticky; top: 0; background: var(--bg); z-index: 2;
+}
+.data-table.wide { width: auto; min-width: 100%; }
+.data-table.wide td { white-space: nowrap; }
+.data-table tr:hover td { background: #131d18; }
+.col-name { color: var(--amber); white-space: nowrap; }
+.col-oid { color: var(--blue); white-space: nowrap; font-size: 10px; }
+.col-type { color: var(--muted); white-space: nowrap; font-size: 10px; }
+.col-value { color: var(--text); word-break: break-word; }
+.col-value.is-error { color: var(--red); }
+.col-index { color: var(--green); white-space: nowrap; }
+.sticky-col {
+  position: sticky; left: 0; background: var(--bg); z-index: 1;
+  border-right: 1px solid var(--panel-border);
+}
+th.sticky-col { z-index: 3; }
+.table-scroll { overflow-x: auto; max-width: 100%; }
+
+/* ---------- SNMP query ---------- */
+.query-bar {
+  flex-shrink: 0; padding: 10px 12px; border-bottom: 1px solid var(--panel-border);
+  background: var(--panel); position: relative; min-width: 0;
+}
+.preset-group { margin-bottom: 8px; }
+.preset-group-label {
+  font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--muted); margin-bottom: 5px;
+}
+.presets { display: flex; gap: 5px; flex-wrap: wrap; }
+.presets button {
+  background: transparent; border: 1px solid var(--panel-border); color: var(--muted);
+  font-family: var(--mono); font-size: 10px; padding: 4px 8px;
+  border-radius: 3px; cursor: pointer; white-space: nowrap;
+}
+.presets button:hover { border-color: var(--blue); color: var(--blue); }
+.presets button.vendor:hover { border-color: var(--amber); color: var(--amber); }
+
+.oid-row { display: flex; gap: 6px; align-items: stretch; min-width: 0; flex-wrap: wrap; }
+.oid-wrap { flex: 1; min-width: 160px; position: relative; }
+.oid-wrap input {
+  width: 100%; background: var(--panel-2); border: 1px solid var(--panel-border);
+  color: var(--text); font-family: var(--mono); font-size: 12.5px;
+  padding: 8px 9px; border-radius: 3px; outline: none;
+}
+.oid-wrap input:focus { border-color: var(--blue); }
+.oid-row .btn { width: auto; padding: 8px 13px; font-size: 10.5px; }
+
+.suggest {
+  display: none; position: absolute; top: calc(100% + 3px); left: 0; right: 0;
+  max-height: 260px; overflow-y: auto; background: #0d1512;
+  border: 1px solid var(--panel-border); border-radius: 4px; z-index: 60;
+  box-shadow: 0 8px 22px rgba(0,0,0,0.55);
+}
+.suggest.open { display: block; }
+.suggest-item { padding: 6px 9px; cursor: pointer; border-bottom: 1px solid #17211c; }
+.suggest-item:last-child { border-bottom: none; }
+.suggest-item.active, .suggest-item:hover { background: #16211c; }
+.suggest-item .sug-name { color: var(--text); font-size: 12px; }
+.suggest-item .sug-name .hl { color: var(--amber); }
+.suggest-item .sug-meta {
+  display: flex; gap: 8px; align-items: baseline;
+  font-size: 9.5px; color: var(--muted); margin-top: 2px;
+}
+.suggest-item .sug-oid { color: var(--blue); }
+.suggest-item .sug-acc { border: 1px solid var(--panel-border); border-radius: 2px; padding: 0 3px; flex-shrink: 0; }
+.suggest-empty { padding: 10px; color: var(--muted); font-size: 11px; }
+
+.set-toggle {
+  margin-top: 8px; font-size: 10px; color: var(--muted); cursor: pointer;
+  text-decoration: underline; text-underline-offset: 2px; display: inline-block;
+}
+.set-toggle:hover { color: var(--amber); }
+.set-row { display: none; gap: 6px; margin-top: 7px; flex-wrap: wrap; min-width: 0; }
+.set-row.visible { display: flex; }
+.set-row select, .set-row input {
+  background: var(--panel-2); border: 1px solid var(--panel-border); color: var(--text);
+  font-family: var(--mono); font-size: 11.5px; padding: 7px 8px;
+  border-radius: 3px; outline: none; min-width: 0;
+}
+.set-row select { flex: 0 0 120px; }
+.set-row input { flex: 1; min-width: 110px; }
+.set-row .btn { width: auto; padding: 7px 12px; font-size: 10.5px; }
+
+.results { flex: 1; min-height: 0; min-width: 0; overflow: auto; padding: 12px; }
+.result-block { margin-bottom: 15px; }
+.block-header {
+  font-size: 10px; color: var(--muted); letter-spacing: 0.05em; text-transform: uppercase;
+  margin-bottom: 6px; padding-bottom: 5px; border-bottom: 1px solid var(--panel-border);
+  display: flex; align-items: center; gap: 10px;
+}
+.block-header span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.raw-toggle {
+  background: transparent; border: 1px solid var(--panel-border); color: var(--muted);
+  font-family: var(--mono); font-size: 9.5px; padding: 2px 7px;
+  border-radius: 3px; cursor: pointer; text-transform: none; letter-spacing: 0; flex-shrink: 0;
+}
+.raw-toggle:hover { color: var(--amber); border-color: var(--amber); }
+.result-note {
+  font-size: 10.5px; color: var(--amber); padding: 5px 7px; margin-bottom: 6px;
+  border-left: 2px solid var(--amber); background: rgba(232,163,61,0.07); line-height: 1.5;
+}
+.empty-state { color: var(--muted); font-size: 12px; text-align: center; padding: 30px 16px; line-height: 1.7; }
+
+/* ---------- terminal ---------- */
+.term-body {
+  flex: 1; min-height: 0; min-width: 0;
+  padding: 8px 4px 8px 10px; overflow: hidden;
+}
+.term-body .xterm { height: 100%; }
+
+.src-tag {
+  font-size: 8.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  border: 1px solid currentColor; border-radius: 2px; padding: 0 4px;
+  margin-left: 6px; vertical-align: middle;
+}
+.src-tag.snmp { color: var(--blue); }
+.src-tag.tech { color: var(--amber); }
+
+/* ---------- tech-support ---------- */
+.tech-split { flex: 1; min-height: 0; display: flex; }
+.tech-nav {
+  width: 240px; flex-shrink: 0; min-height: 0; overflow-y: auto;
+  border-right: 1px solid var(--panel-border); background: var(--panel); padding: 6px 0;
+}
+.tech-nav-group {
+  font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--muted); padding: 10px 12px 4px;
+}
+.tech-item {
+  padding: 6px 12px; font-size: 11.5px; color: var(--muted); cursor: pointer;
+  border-left: 2px solid transparent; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tech-item:hover { background: var(--panel-2); color: var(--text); }
+.tech-item.active { color: var(--amber); border-left-color: var(--amber); background: var(--panel-2); }
+.tech-item .lines { color: var(--muted); font-size: 9.5px; float: right; }
+.tech-item .hits { color: var(--amber); font-size: 9.5px; margin-left: 6px; }
+.tech-pane { flex: 1; min-width: 0; min-height: 0; overflow: auto; padding: 14px; }
+.tech-pane pre {
+  margin: 0; font-family: var(--mono); font-size: 11.5px;
+  line-height: 1.5; color: var(--text); white-space: pre;
+}
+.tech-pane mark { background: rgba(232,163,61,0.35); color: var(--text); }
+.search-input {
+  background: var(--panel-2); border: 1px solid var(--panel-border); color: var(--text);
+  font-family: var(--mono); font-size: 12px; padding: 6px 9px;
+  border-radius: 3px; outline: none; min-width: 140px; flex: 0 1 230px;
+}
+.search-input:focus { border-color: var(--amber); }
+
+.sev-tag {
+  display: inline-block; min-width: 62px; text-align: center; padding: 0 5px;
+  border-radius: 3px; font-size: 9.5px; border: 1px solid currentColor;
+}
+.sev-Emergency, .sev-Alert, .sev-Critical { color: var(--red); }
+.sev-Error { color: var(--red); }
+.sev-Warning { color: var(--amber); }
+.sev-Notice, .sev-Info { color: var(--blue); }
+.sev-Debug { color: var(--muted); }
+
+/* ---------- log panel ---------- */
+#log-panel {
+  position: absolute; top: 0; right: 0; bottom: 0; width: min(420px, 100%);
+  background: var(--panel); border-left: 1px solid var(--panel-border);
+  display: none; flex-direction: column; min-height: 0; z-index: 80;
+  box-shadow: -10px 0 26px rgba(0,0,0,0.45);
+}
+#log-panel.open { display: flex; }
+.log-header {
+  flex-shrink: 0; padding: 11px 13px; border-bottom: 1px solid var(--panel-border);
+  display: flex; align-items: center; gap: 8px;
+}
+.log-header span {
+  font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--muted); flex: 1;
+}
+.log-header button {
+  background: transparent; border: 1px solid var(--panel-border); color: var(--muted);
+  font-family: var(--mono); font-size: 10px; padding: 4px 7px; border-radius: 3px; cursor: pointer;
+}
+.log-header button:hover { color: var(--amber); border-color: var(--amber); }
+#log-list { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 12px; font-size: 11px; line-height: 1.55; }
+.log-entry { padding: 5px 0; border-bottom: 1px solid #1a251f; }
+.log-entry .ts { color: var(--muted); margin-right: 7px; }
+.log-entry .lvl { font-weight: 700; margin-right: 5px; }
+.log-entry.info .lvl { color: var(--green); }
+.log-entry.warn .lvl { color: var(--amber); }
+.log-entry.error .lvl { color: var(--red); }
+.log-entry .msg { color: var(--text); word-break: break-word; }
+.log-entry .meta { color: var(--muted); display: block; margin-top: 2px; word-break: break-word; }
+
+@media (max-width: 620px) {
+  .tab { max-width: 150px; }
+  .tech-nav { width: 160px; }
+  .subtab { padding: 9px 9px; }
+}
+
+.overlay-head {
+  flex-shrink: 0; display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; border-bottom: 1px solid var(--panel-border); background: var(--panel);
+}
+.overlay-title { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--amber); }
+
+.kv-row { display: flex; gap: 8px; font-size: 11.5px; padding: 3px 0; border-bottom: 1px solid #17211c; }
+.kv-row .k { color: var(--muted); flex: 0 0 92px; }
+.kv-row .v { color: var(--text); flex: 1; min-width: 0; word-break: break-word; }
+
+/* ---------- editable dashboard ---------- */
+.interval-input {
+  width: 56px; background: var(--panel-2); border: 1px solid var(--panel-border);
+  color: var(--text); font-family: var(--mono); font-size: 11.5px;
+  padding: 5px 6px; border-radius: 3px; outline: none;
+}
+.interval-input:focus { border-color: var(--amber); }
+.unit-label { font-size: 10.5px; color: var(--muted); margin-left: -4px; }
+
+.panel-grid {
+  display: grid; grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 10px; align-content: start;
+}
+.panel {
+  grid-column: span 12; min-width: 0; position: relative;
+  background: var(--panel); border: 1px solid var(--panel-border);
+  border-radius: 5px; display: flex; flex-direction: column;
+  /* Clip content to the rounded box so nothing paints outside it, and isolate
+     the panel as its own stacking/paint context so wide-table content cannot
+     leave ghost artifacts on the page behind it when it reflows or collapses. */
+  overflow: hidden; isolation: isolate;
+}
+.panel.drag-over { outline: 2px dashed var(--amber); outline-offset: 2px; }
+.panel.dragging { opacity: 0.4; }
+.panel-head {
+  flex-shrink: 0; display: flex; align-items: center; gap: 7px;
+  padding: 7px 9px; border-bottom: 1px solid var(--panel-border);
+  font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--amber);
+  user-select: none;
+}
+/* Only the grip drags; the rest of the header is for clicking. */
+.panel-head .grip { cursor: grab; }
+.panel-head .grip:active { cursor: grabbing; }
+
+.panel-head .grip { color: var(--muted); letter-spacing: 0; font-size: 12px; }
+.panel-head { cursor: pointer; }
+.panel-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.panel-act {
+  background: transparent; border: 1px solid transparent; color: var(--muted);
+  font-family: var(--mono); font-size: 11px; line-height: 1; padding: 2px 5px;
+  border-radius: 3px; cursor: pointer; flex-shrink: 0;
+}
+.panel-act:hover { color: var(--amber); border-color: var(--panel-border); }
+.panel-act.on { color: var(--green); }
+.panel-body { flex: 1; min-height: 0; overflow: auto; padding: 10px; }
+/* Edge and corner grab areas. Wide enough to hit, and they announce
+   themselves on panel hover instead of hiding until discovered. */
+.panel-resize, .panel-resize-x, .panel-resize-y { position: absolute; z-index: 4; }
+.panel-resize-x { top: 24px; right: 0; bottom: 12px; width: 5px; cursor: ew-resize; }
+.panel-resize-y { left: 12px; right: 12px; bottom: 0; height: 5px; cursor: ns-resize; }
+.panel-resize {
+  right: 0; bottom: 0; width: 12px; height: 12px; cursor: nwse-resize;
+  background:
+    linear-gradient(135deg, transparent 0 42%, var(--muted) 42% 54%, transparent 54% 100%),
+    linear-gradient(135deg, transparent 0 68%, var(--muted) 68% 80%, transparent 80% 100%);
+  opacity: 0.35;
+}
+.panel:hover .panel-resize { opacity: 0.9; }
+.panel:hover .panel-resize-x { background: linear-gradient(to right, transparent, rgba(232,163,61,0.25)); }
+.panel:hover .panel-resize-y { background: linear-gradient(to bottom, transparent, rgba(232,163,61,0.25)); }
+.panel-resize-x:hover { background: var(--amber) !important; }
+.panel-resize-y:hover { background: var(--amber) !important; }
+.panel.resizing { outline: 1px solid var(--amber); outline-offset: -1px; }
+.resize-badge {
+  position: absolute; right: 8px; bottom: 8px; z-index: 6;
+  background: var(--panel-2); border: 1px solid var(--amber); color: var(--amber);
+  font-size: 10px; padding: 3px 7px; border-radius: 3px; pointer-events: none; white-space: nowrap;
+}
+.panel-note { font-size: 10px; color: var(--muted); padding: 4px 0 0; }
+.panel-err { font-size: 11px; color: var(--red); }
+
+#panel-dialog {
+  position: absolute; inset: 0; background: rgba(6,10,9,0.72);
+  display: none; align-items: flex-start; justify-content: center;
+  z-index: 95; padding: 60px 16px 16px; overflow-y: auto;
+}
+#panel-dialog.open { display: flex; }
+.dialog-card {
+  width: 100%; max-width: 430px; background: var(--panel);
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 18px;
+}
+.dialog-card .row-split .btn { width: 100%; }
+
+/* ---------- MIB explorer ---------- */
+#mib-panel {
+  position: absolute; inset: 0; background: var(--bg);
+  display: none; flex-direction: column; z-index: 92;
+}
+#mib-panel.open { display: flex; }
+.mib-note { font-size: 11px; color: var(--muted); }
+.mib-search-bar {
+  flex-shrink: 0; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  padding: 10px 14px; border-bottom: 1px solid var(--panel-border); background: var(--panel);
+}
+.mib-search-bar .search-input { flex: 1 1 260px; }
+.mib-search-bar select {
+  background: var(--panel-2); border: 1px solid var(--panel-border); color: var(--text);
+  font-family: var(--mono); font-size: 11.5px; padding: 6px 8px; border-radius: 3px; outline: none;
+}
+
+.mib-main { flex: 1; min-height: 0; display: flex; }
+.mib-results {
+  width: 46%; min-width: 260px; flex-shrink: 0; min-height: 0; overflow-y: auto;
+  border-right: 1px solid var(--panel-border);
+}
+.mib-row { padding: 7px 12px; border-bottom: 1px solid #17211c; cursor: pointer; }
+.mib-row:hover { background: var(--panel); }
+.mib-row.active { background: var(--panel); border-left: 2px solid var(--amber); }
+.mib-row .r-name { font-size: 12px; color: var(--text); }
+.mib-row .r-name .hl { color: var(--amber); }
+.mib-row .r-meta {
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+  font-size: 9.5px; color: var(--muted); margin-top: 2px;
+}
+.mib-row .r-oid { color: var(--blue); }
+.mib-row .r-tag { border: 1px solid var(--panel-border); border-radius: 2px; padding: 0 3px; }
+.mib-row .r-desc {
+  font-size: 10px; color: var(--muted); margin-top: 3px; line-height: 1.4;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.mib-detail { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding: 14px; }
+.mib-detail h3 { margin: 0 0 4px; font-size: 15px; color: var(--text); font-weight: 600; }
+.mib-detail .d-oid { font-size: 11.5px; color: var(--blue); margin-bottom: 10px; }
+.mib-detail .d-desc { font-size: 11.5px; color: var(--text); line-height: 1.6; margin: 8px 0; }
+.mib-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
+.mib-actions .btn { width: auto; padding: 7px 12px; font-size: 10.5px; }
+.mib-tree-row {
+  padding: 4px 7px; font-size: 11.5px; cursor: pointer;
+  border-bottom: 1px solid #17211c; color: var(--muted);
+}
+.mib-tree-row:hover { color: var(--amber); }
+.mib-tree-row .t-oid { color: var(--blue); font-size: 10px; margin-left: 6px; }
+.enum-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+.enum-list span {
+  font-size: 10px; color: var(--muted); border: 1px solid var(--panel-border);
+  border-radius: 3px; padding: 1px 5px;
+}
+@media (max-width: 900px) { .mib-results { width: 100%; } .mib-detail { display: none; } }
+
+/* ---------- configuration panel ---------- */
+.cfg-bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 9px; }
+/* On its own page the document has the whole viewport to use. */
+.f-cfg-body .cfg-out pre { max-height: none; }
+.f-cfg-body .cfg-chips { position: sticky; top: 0; background: var(--bg); z-index: 2; }
+.cfg-bar .btn { padding: 6px 11px; font-size: 10.5px; }
+.cfg-chips {
+  display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+  padding: 8px 0; border-top: 1px solid var(--panel-border); margin-bottom: 4px;
+}
+.cfg-chip {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  background: transparent; border: 1px solid var(--panel-border); color: var(--muted);
+  font-family: var(--mono); font-size: 11px; padding: 4px 10px;
+  border-radius: 12px; cursor: pointer; white-space: nowrap;
+}
+.cfg-chip:hover { border-color: var(--amber); color: var(--amber); }
+.cfg-chip.active { border-color: var(--amber); color: var(--amber); background: rgba(232,163,61,0.12); }
+.cfg-chip .chip-meta { font-size: 9px; opacity: 0.75; }
+.cfg-chip.save { margin-left: auto; border-color: var(--green); color: var(--green); }
+.cfg-chip.save:hover { background: var(--green); color: #06110b; }
+
+.cfg-out pre {
+  margin: 8px 0 0; font-family: var(--mono); font-size: 11px;
+  line-height: 1.5; color: var(--text); white-space: pre;
+}
+.cfg-out pre.diff { white-space: pre-wrap; word-break: break-word; }
+.diff-add { color: var(--green); display: block; }
+.diff-del { color: var(--red); display: block; }
+.diff-same { color: var(--muted); display: block; }
+.diff-skip { color: var(--panel-border); display: block; font-style: italic; }
+
+/* ---------- config sync ---------- */
+.cfg-sync {
+  margin: 10px 0; padding: 10px; border-radius: 5px;
+  border: 1px solid var(--amber); background: rgba(232,163,61,0.07);
+}
+.cfg-sync .btn { margin-top: 8px; padding: 7px 12px; font-size: 10.5px; }
+.cfg-confirm { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.cfg-confirm .card-sub { flex: 1 1 260px; margin: 0; color: var(--text); }
+
+.panel-act.spin { color: var(--amber); animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- PoE summary + STP headline ---------- */
+.poe-head { margin-bottom: 10px; }
+.poe-figure { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.poe-used { font-size: 22px; color: var(--green); }
+.poe-used.warn { color: var(--amber); }
+.poe-used.crit { color: var(--red); }
+.poe-of { font-size: 11.5px; color: var(--muted); }
+.poe-head .meter { margin: 8px 0 6px; height: 6px; }
+
+.stp-head { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-start; margin-bottom: 6px; }
+.stp-head .hero-badge { flex-shrink: 0; }
+.stp-facts { flex: 1; min-width: 260px; }
+.stp-facts .kv-row .k { flex: 0 0 130px; }
+
+/* ---------- per-VLAN / per-instance spanning tree ---------- */
+.stp-instance {
+  border: 1px solid var(--panel-border); border-radius: 5px;
+  padding: 10px; margin: 10px 0; background: var(--panel-2);
+}
+.stp-instance-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.stp-instance-name { font-size: 13px; color: var(--amber); letter-spacing: 0.04em; }
+.stp-instance-badge {
+  font-size: 9.5px; letter-spacing: 0.05em; text-transform: uppercase;
+  border: 1px solid var(--muted); color: var(--muted); border-radius: 3px; padding: 1px 6px;
+}
+.stp-instance-badge.root { border-color: var(--green); color: var(--green); }
+.stp-instance-facts { margin-bottom: 8px; }
+.stp-instance-facts .kv-row .k { flex: 0 0 120px; }
+
+/* ---------- syslog ---------- */
+.syslog-bar {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px;
+}
+.syslog-bar .btn { padding: 5px 10px; font-size: 10.5px; }
+.syslog-bar .card-sub { margin: 0; }
+.syslog-bar .search-input { flex: 1 1 200px; }
+
+/* A new line flashes briefly so an arrival is noticeable without
+   disturbing whatever is already on screen. */
+.syslog-new td { animation: syslog-flash 1.5s ease-out; }
+@keyframes syslog-flash {
+  from { background: rgba(232,163,61,0.28); }
+  to { background: transparent; }
+}
+
+.hero-findings { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+
+/* ---------- scrollbars ---------- */
+/* Left to the browser these render as a pale track on a dark page. */
+* { scrollbar-color: var(--panel-border) transparent; scrollbar-width: thin; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--panel-border); border-radius: 5px;
+  border: 2px solid transparent; background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--muted); background-clip: content-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* Form controls, for the same reason: a select left unstyled is grey. */
+select, input, textarea, button { color-scheme: dark; }
+select {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--panel-border);
+  font-family: var(--mono); border-radius: 3px;
+}
+input:-webkit-autofill, input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--text);
+  -webkit-box-shadow: 0 0 0 1000px var(--panel-2) inset;
+}
+
+/* ---------- per-switch overlays ---------- */
+.sw-overlay {
+  position: absolute; inset: 0; z-index: 30; display: none;
+  flex-direction: column; min-height: 0; background: var(--bg);
+}
+.sw-overlay.open { display: flex; }
+.sw-overlay .overlay-head { flex-shrink: 0; }
+/* .btn is full-width by design for forms; in a toolbar it must not be. */
+.sw-overlay .overlay-head .btn,
+.toolbar .btn { width: auto; padding: 5px 10px; font-size: 10.5px; }
+.sw-overlay .overlay-title { color: var(--amber); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; }
+
+/*
+ * Settings holds four cards of very different heights -- SNMP is a long
+ * form, the saved-session note is a paragraph. A flex row made them stretch
+ * to match the tallest and left ragged gaps; a column-based grid lets each
+ * take the height it needs and keeps the columns aligned.
+ */
+.v-creds {
+  display: grid; gap: 16px; align-content: start; justify-content: center;
+  grid-template-columns: repeat(auto-fit, minmax(330px, 400px));
+  padding: 18px; overflow: auto; min-height: 0;
+}
+.v-creds .card-form { margin: 0; width: auto; max-width: none; align-self: start; }
+.v-creds .card-form .btn { margin-top: 10px; }
+.v-creds .form-hint { margin-top: 10px; }
+
+.quick-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.quick-actions .btn { width: auto; padding: 6px 11px; font-size: 10.5px; }
+.card.clickable { cursor: pointer; }
+.card.clickable:hover { border-color: var(--amber); }
+.card-action { font-size: 9.5px; color: var(--amber); letter-spacing: 0.05em; margin-top: 4px; }
+
+/* A minimised panel keeps its header and nothing else. */
+.panel.collapsed { height: auto !important; }
+.panel.collapsed .panel-body,
+.panel.collapsed .panel-resize,
+.panel.collapsed .panel-resize-x,
+.panel.collapsed .panel-resize-y { display: none; }
+.panel.collapsed .panel-head { border-bottom: none; }
+
+/* ---------- spinner ---------- */
+.spinner {
+  width: 15px; height: 15px; border-radius: 50%;
+  border: 2px solid var(--panel-border); border-top-color: var(--amber);
+  animation: spin 0.7s linear infinite; display: inline-block;
+}
+.spinner.inline { width: 11px; height: 11px; border-width: 2px; vertical-align: -1px; margin-right: 5px; }
+/* Floats over the dashboard rather than replacing it, so a refresh does
+   not blank what you were reading. */
+.poll-spinner {
+  position: absolute; inset: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+}
+.poll-spinner .spinner { width: 34px; height: 34px; border-width: 3px; }
+
+/* A panel too tall for its box gets its full height instead of an inner
+   scrollbar; scrolling inside a scroll is the worst way to read a table. */
+.panel.auto-grow { height: auto !important; }
+.panel.auto-grow .panel-body { overflow: visible; }
+
+/* Both routes to a CLI, offered together when neither is set up. */
+.card-form.needs-setup {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 1px var(--amber) inset;
+  animation: setup-pulse 1.2s ease-out 2;
+}
+@keyframes setup-pulse {
+  0% { background: rgba(232,163,61,0.14); }
+  100% { background: transparent; }
+}
+
+/* A sparkline says whether the number is going anywhere. */
+.spark { width: 100%; height: 20px; margin-top: 6px; display: block; overflow: visible; }
+.spark path { fill: none; stroke: var(--muted); stroke-width: 1.4; vector-effect: non-scaling-stroke; }
+.spark.good path { stroke: var(--green); }
+.spark.warn path { stroke: var(--amber); }
+.spark.crit path { stroke: var(--red); }
+
+/* Port actions live in the row they act on. */
+.port-actions { white-space: nowrap; }
+.row-act {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.04em;
+  background: transparent; border: 1px solid var(--panel-border); color: var(--muted);
+  border-radius: 3px; padding: 2px 6px; margin-right: 4px; cursor: pointer;
+}
+.row-act:hover { border-color: var(--amber); color: var(--amber); }
+.row-act.danger:hover { border-color: var(--red); color: var(--red); }
+.port-confirm { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.port-confirm .btn { width: auto; padding: 2px 8px; font-size: 9.5px; }
+.port-confirm .card-sub { margin: 0; color: var(--text); }
+.port-warn { flex-basis: 100%; color: var(--amber); font-size: 9.5px; }
+
+.event-tools { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+.event-tools .search-input { flex: 1; }
+.pill.idle { border-color: var(--panel-border); color: var(--muted); }
+.pill.info { border-color: var(--blue); color: var(--blue); }
+
+/* While a write is in flight the overlay stays put: no close, and the
+   header says why rather than looking merely unresponsive. */
+.sw-overlay.busy .overlay-head { border-bottom-color: var(--amber); }
+.sw-overlay.busy .overlay-title::after {
+  content: " — writing to the switch, please wait";
+  color: var(--amber); text-transform: none; letter-spacing: 0;
+}
+
+.setup-wrap { flex: 1; min-height: 0; overflow: auto; display: flex; justify-content: center; padding: 24px; }
+.setup-card { max-width: 560px; width: 100%; align-self: flex-start; }
+.setup-choices { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+.setup-choices .btn { width: auto; flex: 1 1 200px; }
+.setup-output {
+  margin-top: 14px; max-height: 240px; overflow: auto; white-space: pre-wrap;
+  background: var(--panel-2); border: 1px solid var(--panel-border); border-radius: 4px;
+  padding: 10px; font-size: 11px; color: var(--muted);
+}
+.f-cfg-text {
+  width: 100%; margin-top: 10px; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--panel-border); border-radius: 4px; padding: 8px;
+  font-family: var(--mono); font-size: 11.5px;
+}
+.f-cfg-file { margin-top: 8px; color: var(--muted); font-size: 11px; }
+
+
+/* ---------- Topology ---------- */
+/* A palette of its own: the diagram needs more distinguishable colours
+   than a dashboard does, and they should read as one family. */
+#topo-panel {
+  --t-cyan: #38e0cf; --t-blue: #5aa9ff; --t-violet: #b08bf0;
+  --t-amber: #f5b14c; --t-green: #5fd97a; --t-red: #ff5d6c;
+  --t-line: #1d2937; --t-line2: #27384b; --t-ink: #cdd9e5;
+  --t-dim: #7d8ea0; --t-faint: #566373; --t-node: #10202b; --t-node2: #161b24;
+  position: absolute; inset: 0; background: var(--bg);
+  display: none; flex-direction: column; z-index: 92;
+}
+#topo-panel.open { display: flex; }
+.topo-stats { display: flex; gap: 16px; font-size: 10.5px; color: var(--muted); margin-left: 18px; }
+.topo-stats b { color: var(--text); font-weight: 600; }
+#topo-n-warn-wrap { cursor: default; }
+#topo-n-warn { color: var(--amber); }
+
+.topo-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 232px 1fr 0; }
+.topo-body.insp { grid-template-columns: 232px 1fr 320px; }
+.topo-side {
+  border-right: 1px solid var(--panel-border); overflow: auto;
+  padding: 14px; display: flex; flex-direction: column; gap: 18px;
+}
+.topo-sect { display: flex; flex-direction: column; gap: 7px; }
+.topo-sect select { width: 100%; }
+.topo-warnings { display: flex; flex-direction: column; gap: 8px; font-size: 10.5px; }
+.topo-warn { border-left: 2px solid var(--muted); padding-left: 7px; color: var(--muted); }
+.topo-warn.wrn { border-color: var(--amber); }
+.topo-warn.err { border-color: var(--red); }
+.topo-warn b { display: block; color: var(--text); font-weight: 600; margin-bottom: 2px; }
+.topo-legend { display: flex; flex-direction: column; gap: 5px; font-size: 10.5px; color: var(--muted); }
+.topo-legend span { display: flex; align-items: center; gap: 7px; }
+.topo-legend i { width: 16px; text-align: center; font-style: normal; }
+
+.topo-canvas { position: relative; min-width: 0; overflow: hidden; }
+#topo-svg { width: 100%; height: 100%; display: block; cursor: grab; }
+#topo-svg.panning { cursor: grabbing; }
+#topo-svg text { user-select: none; }
+.topo-hint {
+  position: absolute; left: 14px; bottom: 12px; font-size: 10px;
+  color: var(--t-faint); pointer-events: none;
+}
+.topo-tools { position: absolute; right: 12px; top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.topo-tools .ct {
+  width: 28px; height: 28px; border-radius: 5px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--panel-border);
+  color: var(--muted); font-size: 13px; line-height: 1;
+}
+.topo-tools .ct:hover { border-color: var(--t-cyan); color: var(--t-cyan); }
+
+.topo-inspector {
+  border-left: 1px solid var(--panel-border); overflow: auto; padding: 14px;
+  font-size: 11.5px; display: none;
+}
+.topo-body.insp .topo-inspector { display: block; }
+.topo-inspector h4 {
+  margin: 0 0 3px; font-size: 13px; color: var(--text); font-family: var(--mono);
+}
+.topo-inspector .insp-sub { color: var(--muted); font-size: 10.5px; margin-bottom: 14px; }
+.topo-inspector .insp-group { margin-bottom: 16px; }
+.topo-inspector .insp-group .eyebrow { margin-bottom: 6px; }
+.topo-inspector table { width: 100%; border-collapse: collapse; }
+.topo-inspector td { padding: 2px 0; vertical-align: top; }
+.topo-inspector td:first-child { color: var(--muted); width: 42%; padding-right: 8px; }
+.topo-inspector td:last-child { color: var(--text); font-family: var(--mono); font-size: 11px; }
+
+.topo-tip {
+  position: fixed; z-index: 120; pointer-events: none; opacity: 0;
+  background: var(--panel); border: 1px solid var(--t-line2); border-radius: 5px;
+  padding: 7px 9px; font-size: 11px; max-width: 300px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.5); transition: opacity .1s;
+}
+.topo-tip .h { color: var(--text); font-family: var(--mono); margin-bottom: 3px; }
+.topo-tip .l { color: var(--muted); font-size: 10.5px; }
+
+.topo-node { cursor: pointer; }
+.topo-node text { pointer-events: none; }
+.topo-edge { cursor: pointer; }
+.nodelabel { font-family: var(--mono); font-weight: 600; }
+.nodesub { font-family: var(--mono); }
+
+@media (max-width: 900px) {
+  .topo-body, .topo-body.insp { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  .topo-side { border-right: none; border-bottom: 1px solid var(--panel-border); }
+  .topo-body.insp .topo-inspector { display: none; }
+}
+
+/* Which cable the CLI is coming down, and a way to change it. */
+.transport-switch { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 4px; overflow: hidden; }
+.transport-switch .tr {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+  background: transparent; border: none; color: var(--muted);
+  padding: 4px 10px; cursor: pointer;
+}
+.transport-switch .tr + .tr { border-left: 1px solid var(--panel-border); }
+.transport-switch .tr:hover:not(:disabled) { color: var(--text); background: var(--panel-2); }
+.transport-switch .tr.active { background: var(--green-dim, rgba(79,216,138,.14)); color: var(--green); }
+.transport-switch .tr:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* The topology is a tab like the others, minus a close control: it is a
+   view of the estate, not of a switch, and there is nothing to close. */
+.tab.topo-tab { padding-right: 12px; }
+.tab.topo-tab .tab-dot { background: var(--violet, #a78bfa); box-shadow: none; }
+.tab.topo-tab .tab-label { letter-spacing: 0.04em; }
+/* Purple whether or not the tab is selected: the dot says what this tab
+   is, not whether it is in front. */
+.tab.topo-tab.active .tab-dot { background: var(--violet); }
+
+/* The full history of one metric, when the sparkline is not enough. */
+.graph-ranges { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 4px; overflow: hidden; }
+.graph-ranges .tr {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.05em;
+  background: transparent; border: none; color: var(--muted); padding: 4px 9px; cursor: pointer;
+}
+.graph-ranges .tr + .tr { border-left: 1px solid var(--panel-border); }
+.graph-ranges .tr:hover { color: var(--text); background: var(--panel-2); }
+.graph-ranges .tr.active { background: rgba(79,216,138,.14); color: var(--green); }
+.graph-body { flex: 1; min-height: 0; padding: 18px; display: flex; flex-direction: column; }
+.graph-body svg { width: 100%; flex: 1; min-height: 0; }
+.graph-axis { stroke: var(--panel-border); stroke-width: 1; }
+.graph-grid { stroke: var(--panel-border); stroke-width: 1; stroke-dasharray: 2 5; opacity: 0.6; }
+.graph-tick { font-family: var(--mono); font-size: 9.5px; fill: var(--muted); }
+.graph-line { fill: none; stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+.graph-area { opacity: 0.12; }
+.graph-stats { display: flex; gap: 22px; margin-bottom: 12px; font-size: 11px; }
+.graph-stats span { color: var(--muted); }
+.graph-stats b { color: var(--text); font-family: var(--mono); font-weight: 600; margin-left: 6px; }
+.card.clickable { cursor: pointer; }
+.card.clickable:hover { border-color: var(--green); }
+
+/* The exact reading under the pointer. */
+.graph-body { position: relative; }
+.graph-readout {
+  position: absolute; top: 0; left: 0;
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 4px;
+  padding: 5px 9px; font-family: var(--mono); font-size: 11px; color: var(--text);
+  pointer-events: none; white-space: nowrap; box-shadow: 0 6px 18px rgba(0,0,0,.5);
+}
+
+/* ---- SNMP configuration module ---- */
+.snmp-cfg { display: flex; flex-direction: column; gap: 14px; }
+.snmp-cfg-bar { display: flex; gap: 8px; }
+.btn-small { width: auto; display: inline-block; padding: 4px 12px; font-size: 11px; }
+.snmp-access-banner { display: flex; align-items: flex-start; gap: 8px; padding: 9px 12px;
+  border-radius: 7px; font-size: 13px; line-height: 1.4; }
+.snmp-access-banner.warn { background: rgba(232,163,61,0.12); border: 1px solid var(--amber); color: var(--text); }
+.snmp-access-banner.info { background: rgba(95,179,232,0.10); border: 1px solid var(--blue); color: var(--text); }
+.snmp-access-icon { font-size: 15px; line-height: 1.2; }
+.snmp-sections { display: flex; flex-direction: column; gap: 18px; }
+.snmp-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; }
+.snmp-section-title { margin: 0; font-size: 14px; color: var(--text); font-weight: 600; }
+.snmp-subnote { font-size: 12px; color: var(--muted); margin-bottom: 7px; }
+/* Unified with the preferred .data-table look: bottom-border rows, amber
+   headers, no full cell boxing. */
+.snmp-table { width: 100%; border-collapse: collapse; }
+.snmp-table th, .snmp-table td { padding: 4px 7px; border-bottom: 1px solid #17211c;
+  text-align: left; vertical-align: top; font-size: 11.5px; }
+.snmp-table th { color: var(--amber); font-weight: 600; font-size: 10px; letter-spacing: 0.03em; }
+.snmp-table td { color: var(--text); }
+.snmp-link { background: none; border: 0; padding: 0; color: var(--blue); cursor: pointer; font-size: 13px; }
+.snmp-link.danger { color: var(--red); margin-left: 8px; }
+.snmp-link:hover { text-decoration: underline; }
+
+/* ---- Details identity edit ---- */
+.hero-name-row { display: flex; align-items: center; gap: 8px; }
+.hero-edit-btn { background: none; border: 0; padding: 0; color: var(--blue); cursor: pointer;
+  font-size: 14px; line-height: 1; opacity: 0.75; }
+.hero-edit-btn:hover { opacity: 1; }
+
+/* ---- SNMP inline forms ---- */
+.snmp-form { border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px;
+  margin: 10px 0; background: var(--panel-2); display: flex; flex-direction: column; gap: 12px; }
+.snmp-form h5 { margin: 0; font-size: 13px; color: var(--text); font-weight: 600; }
+.snmp-form .intro { font-size: 12px; color: var(--muted); margin: 0; line-height: 1.5; }
+.snmp-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.snmp-field { display: flex; flex-direction: column; gap: 4px; }
+.snmp-field label { font-size: 12px; color: var(--muted); }
+.snmp-field input, .snmp-field select { padding: 6px 8px; background: var(--panel); color: var(--text);
+  border: 1px solid var(--panel-border); border-radius: 5px; font-size: 13px; font-family: inherit; }
+.snmp-form-actions { display: flex; gap: 8px; }
+.snmp-view-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.snmp-view-table th, .snmp-view-table td { padding: 4px 7px; text-align: left; border-bottom: 1px solid #17211c; }
+.snmp-view-table th { color: var(--amber); font-weight: 600; font-size: 10px; letter-spacing: 0.03em; }
+.snmp-view-table select { width: 100%; padding: 4px 6px; background: var(--panel); color: var(--text);
+  border: 1px solid var(--panel-border); border-radius: 4px; font-size: 12px; }
+.snmp-lvl-label { color: var(--text); }
+.snmp-lvl-sub { color: var(--muted); font-size: 11px; }
+.snmp-plan { border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; margin: 10px 0;
+  background: var(--panel-2); display: flex; flex-direction: column; gap: 10px; }
+.snmp-plan h5 { margin: 0; font-size: 13px; color: var(--text); }
+.snmp-plan ol { margin: 0; padding-left: 20px; font-size: 13px; color: var(--text); line-height: 1.6; }
+.snmp-plan .warn-line { font-size: 12px; color: var(--amber); }
+.snmp-msg { font-size: 13px; padding: 8px 11px; border-radius: 6px; }
+.snmp-msg.ok { background: rgba(102,187,106,0.12); border: 1px solid var(--green); color: var(--text); }
+.snmp-msg.bad { background: rgba(229,115,115,0.12); border: 1px solid var(--red); color: var(--text); }
+.snmp-field-check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
+
+/* ---- SNMP inline editors (row-level and section add hosts) ---- */
+.snmp-edit-row > td { padding: 0 !important; background: var(--panel-2); }
+.snmp-edit-host { padding: 12px; border-top: 2px solid var(--blue); }
+.snmp-edit-host .snmp-form, .snmp-edit-host .snmp-plan { margin: 0; border: 0; background: transparent; padding: 0; }
+.snmp-add-host:not(:empty) { margin-top: 10px; }
+
+/* ---- Details identity edit form ---- */
+#sysid-form { max-width: 520px; }
+#sysid-form .snmp-form-grid { grid-template-columns: 1fr; gap: 8px; }
+
+/* ---- Interface detail popout (click a port in the Interfaces table) ---- */
+.port-link {
+  background: none; border: none; padding: 0; margin: 0;
+  color: var(--blue); font: inherit;
+  text-decoration: underline; text-underline-offset: 2px;
+  text-decoration-color: rgba(95, 179, 232, 0.4);
+}
+.data-table tr.row-clickable { cursor: pointer; }
+.data-table tr.row-clickable:hover td { background: #16231c; }
+.data-table tr.row-clickable:hover .port-link { text-decoration-color: var(--blue); }
+
+.port-detail-back {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(6, 10, 9, 0.68);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 8vh 16px 16px; overflow-y: auto;
+}
+.port-detail {
+  background: var(--panel); border: 1px solid var(--panel-border);
+  border-radius: 10px; width: 100%; max-width: 440px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+  padding: 16px 18px 18px;
+}
+.port-detail-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px;
+}
+.port-detail-head h3 { margin: 0; font-size: 14px; color: var(--text); }
+.port-detail-x {
+  background: none; border: none; color: var(--muted);
+  font-size: 20px; line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.port-detail-x:hover { color: var(--text); }
+.port-detail-sub {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--muted); margin: 14px 0 6px; font-weight: 600;
+}
+.port-detail-sub:first-of-type { margin-top: 4px; }
+.port-detail-grid {
+  display: grid; grid-template-columns: auto 1fr; gap: 3px 14px;
+  margin: 0; font-size: 12px;
+}
+.port-detail-grid dt { color: var(--muted); white-space: nowrap; }
+.port-detail-grid dd {
+  margin: 0; color: var(--text); font-family: var(--mono);
+  word-break: break-all; text-align: right;
+}
+.port-detail-counters { min-height: 20px; }
+
+/* ---- Switchport editor inside the interface detail popout ---- */
+.sw-editor { font-size: 12px; }
+.sw-summary { margin-bottom: 8px; }
+.sw-form { margin: 8px 0; padding: 10px; background: var(--panel-2);
+  border: 1px solid var(--panel-border); border-radius: 8px; }
+.sw-msg { margin-top: 6px; }
+.sw-ok { color: var(--green); font-size: 12px; }
+.sw-err { color: var(--red); font-size: 12px; }
+.sw-err pre { margin-top: 6px; max-height: 160px; overflow: auto; }
+
+.sw-warn { color: var(--amber); font-size: 12px; margin: 8px 0; padding: 6px 8px;
+  background: rgba(214, 158, 46, 0.1); border: 1px solid rgba(214, 158, 46, 0.3); border-radius: 6px; }
+
+/* ---- Add-VLAN control above the VLAN table ---- */
+.vlan-create { margin: 6px 0 12px; padding: 10px; background: var(--panel-2);
+  border: 1px solid var(--panel-border); border-radius: 8px; }
+
+/* ---- Packet capture panel status ---- */
+.capture-status { font-size: 12px; }
+.capture-status .port-detail-grid { max-width: 320px; }
+
+/* Space out action buttons in table action cells (flash files, captures). */
+.port-actions .btn + .btn { margin-left: 6px; }
+
+/* Newly added flash file — green outline that fades after a few seconds. */
+.data-table tr.flash-new td {
+  background: rgba(72, 187, 120, 0.14);
+  box-shadow: inset 0 0 0 1px var(--green, #48bb78);
+  transition: background 0.8s ease, box-shadow 0.8s ease;
+}
+
+/* Event source checkboxes in the Events tools bar. */
+.event-sources { display: inline-flex; align-items: center; gap: 12px; margin-right: 6px; }
+.event-sources .check-label { font-size: 12px; white-space: nowrap; }
+
+/* ---- AAA server blocks (RADIUS / TACACS) in the Auth panel ---- */
+.aaa-server { margin: 4px 0; padding: 6px 8px; background: var(--panel-2);
+  border: 1px solid var(--panel-border); border-radius: 6px; font-size: 12px; }
+.aaa-server > summary { cursor: pointer; display: flex; align-items: center; gap: 10px; list-style: none; }
+.aaa-server > summary::-webkit-details-marker { display: none; }
+.aaa-server > summary::before { content: '\25B8'; color: var(--muted); font-size: 10px; }
+.aaa-server[open] > summary::before { content: '\25BE'; }
+.aaa-name { font-family: var(--mono); color: var(--text); }
+.aaa-sum { color: var(--muted); font-size: 11px; }
+.aaa-sub { margin: 8px 0 4px; font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+.aaa-server .port-detail-grid { margin-top: 6px; max-width: 420px; }
+
+/* ---- AAA server add/edit forms ---- */
+.aaa-add { margin: 4px 0 12px; }
+.aaa-form { margin: 6px 0 12px; padding: 10px; background: var(--panel-2);
+  border: 1px solid var(--panel-border); border-radius: 8px; }
+
+/* ---- AAA key show/hide + inline edit ---- */
+.key-row { display: flex; gap: 6px; align-items: center; width: 100%; min-width: 0; }
+.key-row input { flex: 1 1 auto; min-width: 0; }
+.key-row .btn { flex: 0 0 auto; white-space: nowrap; }
+.key-show { white-space: nowrap; }
+.aaa-inline-row > td { background: var(--panel-2); padding: 0; border-top: 1px solid var(--amber); }
+.aaa-inline-row .aaa-form { margin: 0; border-radius: 0; border: none; background: transparent; padding: 12px; }
+.inapp-confirm { margin: 6px 0; }
+
+/* More breathing room for the AAA form action buttons. */
+.aaa-form .snmp-form-actions { margin-top: 12px; gap: 10px; padding-top: 4px; }
+.aaa-form .snmp-form-grid { gap: 10px 14px; }
+.aaa-editor-host { margin-top: 4px; }
+
+/* ---- AAA in-place row editing ---- */
+tr.aaa-editing > td { background: var(--panel-2); vertical-align: middle; }
+.cell-input { width: 100%; max-width: 120px; padding: 3px 5px; font-size: 11px;
+  background: var(--panel); border: 1px solid var(--panel-border); color: var(--text); border-radius: 4px; }
+.cell-ports { display: flex; align-items: center; gap: 2px; }
+.cell-key { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cell-gk { display: inline-flex; align-items: center; gap: 3px; font-size: 10px; color: var(--muted); }
+
+/* ============================================================
+   Unified table row-action buttons (Edit / Delete, etc.)
+   Always right-aligned in their cell, consistent across the app.
+   ============================================================ */
+.data-table th.tbl-act-h, .data-table td.tbl-act { text-align: right; white-space: nowrap; width: 1%; }
+.tbl-acts { display: inline-flex; gap: 6px; justify-content: flex-end; }
+.tbl-act-btn {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.04em; line-height: 1;
+  padding: 4px 9px; border-radius: 4px; cursor: pointer;
+  background: transparent; border: 1px solid var(--panel-border); color: var(--muted);
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.tbl-act-btn:hover { border-color: var(--amber); color: var(--amber); background: rgba(232,163,61,0.08); }
+.tbl-act-btn.danger:hover { border-color: var(--red); color: var(--red); background: rgba(224,86,86,0.08); }
+.tbl-act-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.tbl-act-btn.primary { border-color: var(--blue); color: var(--blue); }
+.tbl-act-btn.primary:hover { background: var(--blue); color: #06110b; }
+
+/* ============================================================
+   Unified "+ Add ..." button — bottom-left, below the table it adds to.
+   ============================================================ */
+.tbl-add { margin: 8px 0 14px; }
+/* Compact inline-control row: a small amber-muted label beside a narrow input or
+   select, for scalar config rows (e.g. Voice VLAN mode/VLAN/CoS). Reusable. */
+.sw-mini-label { font-size: 10px; color: var(--muted); letter-spacing: 0.04em; margin: 0 4px 0 10px; }
+.sw-mini-label:first-child { margin-left: 0; }
+.sw-mini-select { font-family: var(--mono); font-size: 11px; padding: 3px 6px; border-radius: 4px;
+  background: var(--panel); color: var(--text); border: 1px solid var(--panel-border); }
+.tbl-add input[type="number"], .tbl-add input[type="text"] { font-family: var(--mono); font-size: 11px;
+  padding: 3px 6px; border-radius: 4px; background: var(--panel); color: var(--text); border: 1px solid var(--panel-border); }
+.tbl-add-btn {
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.04em;
+  padding: 6px 12px; border-radius: 4px; cursor: pointer;
+  background: transparent; border: 1px solid var(--green); color: var(--green);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.tbl-add-btn:hover { background: var(--green); color: #06110b; }
+.tbl-add-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Greyed (read-only) form inputs — used where a field is shown but not editable. */
+.snmp-form input:disabled, .snmp-form select:disabled,
+.aaa-form input:disabled, .aaa-form select:disabled {
+  opacity: 0.5; cursor: not-allowed; background: var(--panel);
+}
+
+/* 802.1X per-port editor in the interface detail popout. */
+.port-detail-dot1x { margin-top: 4px; }
+.port-detail-dot1x .snmp-form-grid { margin-top: 8px; }
+.port-detail-dot1x .snmp-form-actions { margin-top: 8px; }
+.port-detail-msg { margin-top: 6px; }
+
+/* Debug output block in the 802.1X editor. */
+.dbg-pre { font-family: var(--mono); font-size: 10px; background: var(--panel);
+  border: 1px solid var(--panel-border); border-radius: 4px; padding: 8px;
+  max-height: 200px; overflow: auto; white-space: pre-wrap; word-break: break-all; margin-top: 6px; }
+
+/* Port detail popout subtabs (Configuration / Counters). */
+.pd-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--panel-border); margin: 4px 0 12px; }
+.pd-tab { background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--muted);
+  padding: 7px 12px; font-size: 11px; letter-spacing: 0.04em; cursor: pointer; font-family: var(--mono); }
+.pd-tab:hover { color: var(--text); }
+.pd-tab.active { color: var(--amber); border-bottom-color: var(--amber); }
+.port-detail-settings .snmp-form-grid { margin-top: 2px; }
+.port-detail-settings select:disabled, .port-detail-settings input:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* Port-channel member editor. */
+.ch-editor { margin: 8px 0 14px; }
+.ch-members { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 4px 10px; margin: 6px 0; }
+.ch-member { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; white-space: nowrap; }
+.ch-member input:disabled + span { opacity: 0.4; }
+
+.ch-edit-host { margin-top: 4px; }
+.ch-edit-host .aaa-form { margin-top: 6px; }
+
+.ch-debug-row { margin: 6px 0 10px; }
+
+/* 802.1X global settings section. */
+.d1xg { margin: 4px 0 12px; }
+/* Fields sit in a row and wrap, each sized to a sensible fixed width rather
+   than stretching across the window. */
+.d1xg { max-width: 920px; }
+.d1xg-grid { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: flex-end; margin-bottom: 4px; }
+.d1xg-field { display: flex; flex-direction: column; gap: 4px; width: 220px; max-width: 100%; }
+.d1xg-field label { font-size: 10.5px; color: var(--muted); letter-spacing: 0.03em; text-transform: uppercase; }
+.d1xg-field select, .d1xg-field input {
+  padding: 6px 9px; background: var(--panel); color: var(--text);
+  border: 1px solid var(--panel-border); border-radius: 6px; font-size: 12px; width: 100%;
+}
+.d1xg-field select:hover, .d1xg-field input:hover { border-color: var(--amber); }
+.d1xg-field select:focus, .d1xg-field input:focus { outline: none; border-color: var(--amber); }
+/* A narrower field for small numeric values like the guest-VLAN timeout. */
+.d1xg-field.narrow { width: 150px; }
+/* More breathing room before each subsection heading inside this block, and a
+   subtle left accent so the groups read as distinct. */
+.d1xg .aaa-sub { margin: 18px 0 8px; padding-left: 8px; border-left: 2px solid var(--amber); }
+.d1xg .aaa-sub:first-of-type { margin-top: 14px; }
+.d1xg-traps { margin: 6px 0; }
+/* Give the Apply button clear separation from the fields above it. */
+.d1xg .snmp-form-actions { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--panel-border); }
+.d1xg-trap-extra { margin-top: 2px; }
+/* Auth-method trap matrix: Success/Failure rows x 802.1X/MAC/Web columns. */
+.d1xg-trap-matrix { border-collapse: collapse; font-size: 11.5px; margin-bottom: 10px; }
+.d1xg-trap-matrix th { font-weight: 600; color: var(--muted); text-align: center; padding: 3px 14px; font-size: 11px; letter-spacing: 0.02em; }
+.d1xg-trap-matrix td { text-align: center; padding: 4px 14px; }
+.d1xg-trap-matrix .d1xg-trap-rowhead { text-align: left; color: var(--text); padding-right: 18px; white-space: nowrap; }
+.d1xg-trap-matrix tr:not(:first-child) td { border-top: 1px solid var(--panel-border); }
+.d1xg-trap-cell input { cursor: pointer; }
+/* The extra single toggles below the matrix. */
+.d1xg-trap-extra { display: flex; flex-direction: column; gap: 5px; }
+.d1xg-trap-extra .check-label { font-size: 11.5px; display: inline-flex; align-items: center; gap: 6px; }
+
+/* ---- Action feedback (clean, non-obtrusive) ----
+   A button that completes an action briefly morphs to a check with a success
+   tint, then settles back; a value that changed gets a soft highlight that
+   fades, so the change is felt rather than announced in words. */
+.btn.is-ok, .tbl-act-btn.is-ok {
+  background: var(--ok-bg, rgba(56, 180, 120, 0.18)) !important;
+  border-color: var(--ok-border, rgba(56, 180, 120, 0.55)) !important;
+  color: var(--ok-fg, #2faa6b) !important;
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+.btn.is-ok .ok-check, .tbl-act-btn.is-ok .ok-check {
+  display: inline-block;
+  animation: ok-pop 0.28s cubic-bezier(0.2, 0.9, 0.3, 1.3);
+  margin-right: 4px;
+}
+@keyframes ok-pop {
+  0% { transform: scale(0) rotate(-20deg); opacity: 0; }
+  100% { transform: scale(1) rotate(0); opacity: 1; }
+}
+/* A value that just changed - briefly highlighted so the change is felt. Works
+   on a display cell (dd/span) and on a form control (input/select): the control
+   keeps its own background while an amber ring and tint fade out around it. */
+@keyframes value-settle {
+  0%   { background-color: rgba(232, 163, 61, 0.30); box-shadow: 0 0 0 2px rgba(232, 163, 61, 0.55); }
+  100% { background-color: transparent; box-shadow: 0 0 0 2px rgba(232, 163, 61, 0); }
+}
+.value-changed {
+  animation: value-settle 1.7s ease-out;
+  border-radius: 4px;
+}
+/* On a form control the box-shadow ring reads best; keep the control's own
+   surface and let the ring fade. */
+input.value-changed, select.value-changed, textarea.value-changed {
+  animation: value-settle 1.7s ease-out;
+}
+
+/* ---- Two-tap confirmation ----
+   An armed button shows "Confirm?" with a warning tint; a second click within
+   a few seconds commits, otherwise it reverts. */
+.btn.is-arming, .tbl-act-btn.is-arming {
+  background: rgba(232, 163, 61, 0.2) !important;
+  border-color: rgba(232, 163, 61, 0.6) !important;
+  color: var(--amber, #e8a33d) !important;
+}
+.btn.is-arming-danger, .tbl-act-btn.is-arming-danger {
+  background: rgba(214, 90, 90, 0.2) !important;
+  border-color: rgba(214, 90, 90, 0.65) !important;
+  color: #e06666 !important;
+}
+.btn.is-arming, .btn.is-arming-danger,
+.tbl-act-btn.is-arming, .tbl-act-btn.is-arming-danger {
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  font-weight: 600;
+}
+
+/* 802.1X per-port auth method checkboxes. */
+.dot1x-method-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.dot1x-method-row .check-label { font-size: 11.5px; display: inline-flex; align-items: center; gap: 5px; }
+
+/* ---- Transient toast (action feedback where the result isn't shown in place) ---- */
+.toast-host { position: fixed; bottom: 16px; right: 16px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; pointer-events: none; }
+.toast {
+  pointer-events: auto; cursor: pointer; display: flex; align-items: center; gap: 8px;
+  max-width: 360px; padding: 10px 14px; border-radius: 8px; font-size: 12.5px; line-height: 1.35;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.35); border: 1px solid transparent;
+  opacity: 0; transform: translateY(8px); transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.toast.toast-in { opacity: 1; transform: translateY(0); }
+.toast-error { background: #3a1f1f; border-color: rgba(214,90,90,0.6); color: #f0c0c0; }
+.toast-ok { background: #1f3a2a; border-color: rgba(56,180,120,0.55); color: #bfe9cf; }
+.toast-icon { font-size: 14px; flex-shrink: 0; }
+.toast-msg { word-break: break-word; }
+
+/* Config comparison stale prompt (changed since last fetch). */
+.cfg-stale { display: flex; align-items: center; gap: 12px; padding: 8px 12px; margin-bottom: 10px;
+  background: rgba(232, 163, 61, 0.12); border: 1px solid rgba(232, 163, 61, 0.4); border-radius: 6px;
+  font-size: 12px; color: var(--amber); }
+
+/* ---- IP access lists panel ---- */
+.acl-cfg { padding: 4px 2px; }
+.acl-cfg .intro { margin-bottom: 12px; }
+.acl-cfg .data-table { margin-bottom: 14px; }
+
+/* ---- ACL create/edit form: clean sectioned layout ---- */
+.acl-form { max-width: 560px; }
+.acl-form h5 { margin: 0 0 12px; font-size: 14px; }
+/* Each section: a labelled block with breathing room. */
+.acl-fsec { margin-bottom: 16px; }
+.acl-fsec-title {
+  font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--amber); font-weight: 600; margin-bottom: 8px;
+  padding-bottom: 5px; border-bottom: 1px solid var(--panel-border);
+}
+.acl-fsec-body { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+/* Fields inside a section: consistent compact label above the control. */
+.acl-fsec-body .snmp-field { display: flex; flex-direction: column; gap: 5px; margin: 0; }
+.acl-fsec-body .snmp-field > label {
+  font-size: 10.5px; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--muted); font-weight: 500;
+}
+.acl-fsec-body .snmp-field input[type="text"],
+.acl-fsec-body .snmp-field input[type="number"],
+.acl-fsec-body .snmp-field select {
+  padding: 7px 10px; background: var(--panel); color: var(--text);
+  border: 1px solid var(--panel-border); border-radius: 6px; font-size: 12.5px;
+  font-family: var(--mono); width: 100%; box-sizing: border-box;
+}
+.acl-fsec-body .card-sub { grid-column: 1 / -1; margin: 0 0 2px; }
+/* Address group: "Any" toggle, then an IP / prefix line that dims when Any is on. */
+.acl-addr { display: flex; flex-direction: column; gap: 7px; }
+.acl-any { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text); cursor: pointer; }
+.acl-any input { width: auto; }
+.acl-addr-detail { display: flex; align-items: center; gap: 7px; transition: opacity 0.15s; }
+.acl-addr-detail.is-off { opacity: 0.4; }
+.acl-addr-detail .acl-ip-in { flex: 1 1 auto; min-width: 0; width: auto; }
+.acl-addr-detail .acl-pref-in { width: 58px !important; flex: 0 0 auto; text-align: center; }
+.acl-slash { color: var(--muted); font-family: var(--mono); }
+/* Match section stacked: source then destination, each full width. */
+.acl-fsec-body.acl-stack { grid-template-columns: 1fr; gap: 14px; }
+.acl-stack .acl-addr-detail .acl-ip-in { max-width: 240px; }
+/* TCP flags: each flag is a small cell with Set / Unset / Don't-care radios. */
+.acl-flags-row { display: flex; flex-wrap: wrap; gap: 10px; grid-column: 1 / -1; }
+.acl-flag-cell {
+  display: flex; flex-direction: column; gap: 4px;
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 8px 10px; min-width: 92px;
+}
+.acl-flag-name { font-size: 11.5px; font-weight: 700; color: var(--text); font-family: var(--mono); letter-spacing: 0.04em; margin-bottom: 2px; }
+.acl-flag-opt { display: flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--muted); cursor: pointer; }
+.acl-flag-opt input { width: auto; margin: 0; }
+/* The per-ACL add button and the New ACL row. */
+.acl-new-row { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--panel-border); }
+.acl-cfg .tbl-add { margin: 6px 0 16px; }
+
+/* MAC table pagination controls. */
+.mac-paged { display: flex; flex-direction: column; }
+.tbl-pager { display: flex; align-items: center; gap: 12px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--panel-border); }
+.tbl-pager-lbl { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+.tbl-pager .btn:disabled { opacity: 0.4; cursor: not-allowed; }
