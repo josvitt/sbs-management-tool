@@ -354,7 +354,8 @@ async function nudge(target) {
 function flagConfigChange(host) {
   if (!host) return;
   for (const [key, st] of state) {
-    if (key.split(':')[0] === host) { st.configTripPending = true; return; }
+    // keyOf is host:port; split at the LAST colon so an IPv6 host survives.
+    if (key.slice(0, key.lastIndexOf(':')) === host) { st.configTripPending = true; return; }
   }
   pendingConfigHosts.add(host);
 }
