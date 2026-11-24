@@ -1445,21 +1445,49 @@ The **Log** button (top right) opens the same stream in the browser, and
 forwards any client-side JavaScript error to the server so both ends land
 in one file.
 
+## Security
+
+The dashboard is meant to be opened from any PC on the network, so the
+server listens on every interface. **It has no sign-in and no TLS.** Anyone
+who can reach port 3000 can use it, read the saved switch credentials
+(`/api/state`) and change switch configuration. Keep it on a trusted
+management network or behind a firewall or VPN.
+
+What it does protect against:
+
+- **Other websites.** A web page open in a browser on the LAN cannot call
+  the API or open the SSH/console WebSocket: a request whose `Origin` is a
+  different site is refused (`request-guard.js`).
+- **DNS rebinding.** Requests must be addressed to an IP address,
+  `localhost`, or this computer's own name. If you open the dashboard
+  through another DNS name (an alias), add it to `SBS_ALLOWED_HOSTS`,
+  comma-separated, e.g. `SBS_ALLOWED_HOSTS=sbs.example.lan`.
+- **Secrets in logs and responses.** Passwords, community strings, SNMPv3
+  keys and RADIUS/TACACS keys are redacted at any depth in `logs/app.log`,
+  SET values are not logged, and collector snapshots never return
+  credentials.
+- **Flooding the receivers.** TFTP uploads are capped in size
+  (`TFTP_MAX_BYTES`, default 256 MB) and number (`TFTP_MAX_TRANSFERS`, 16),
+  config uploads use unguessable names, and syslog/traps keep at most
+  `SBS_MAX_STREAM_SOURCES` (256) distinct senders.
+
+`npm test` runs the offline tests for these controls.
+
 ## Notes
 
-- Credentials are sent once to the local backend, used to open the
-  connection, then discarded. Never written to disk or stored in the
-  browser.
-- `server.js` enables legacy SSH key-exchange and cipher suites, since
-  Cisco small-business switches often don't support modern-only sets.
-  Trim `LEGACY_ALGORITHMS` if you only talk to newer firmware.
+- Saved switches and their credentials are kept encrypted in `state.enc`
+  (see `vault.js` and `docs/SERVER-STANDARD.md` §7). They are never stored
+  in the browser.
+- `server.js` offers modern SSH algorithms first and keeps legacy key
+  exchange and cipher suites as fallbacks, since Cisco small-business
+  switches may not support modern-only sets. See `LEGACY_ALGORITHMS`.
 - SNMP uses [net-snmp](https://www.npmjs.com/package/net-snmp). Each
   request opens a short-lived session and closes it — SNMP is
   connectionless, so there's no persistent state to manage.
 - xterm.js is vendored in `public/vendor/xterm/`, so the UI works offline
   and on locked-down networks.
-- Runs locally only. No auth on the web app itself and no TLS — put it
-  behind a VPN if you need remote access.
+- See **Security** below for who can reach the dashboard and what is
+  protected.
 - The MIB database describes what the *MIB files* define. Whether a
   given OID is implemented depends on your switch model and firmware;
   unimplemented objects will come back as `noSuchObject` /

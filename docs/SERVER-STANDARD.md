@@ -207,12 +207,28 @@ running→startup save by the copy index — a possible future enhancement.
 
 ## 6. Persistence helpers
 
+- **`rotate.writeFileAtomic(file, data, { mode })`** — the ONE way a
+  whole-file store reaches disk (`state.enc`, `history.json`,
+  `layouts.json`): temp file, fsync, rename, so a crash mid-write can never
+  leave a truncated file. Unlike `appendLine` it throws; callers report the
+  failure in their own words. A new whole-file store uses it, never a bare
+  `fs.writeFileSync`.
 - **`rotate.js`** — the ONE size-capped append-with-rotation helper. `<file>`
   rolls to `<file>.1` … `<file>.<keep>` at `maxBytes`. Every on-disk store uses
   it; nothing re-implements rotation (§0.3). Appends are synchronous and
   best-effort — a logging store must never crash the app.
+- **`logger.js`** — redacts credential fields (`SECRET_KEY`: passwords,
+  passphrases, `community`, `key`, `authKey`/`privKey`, secrets, tokens) at
+  **any depth** before a line is written, so a caller can log a whole target.
+  SET requests log OID and type only, never the value. A new credential field
+  name is added to `SECRET_KEY`, not redacted at the call site.
 - **`logger.js`** — `app.log` now rotates through `rotate` (`LOG_MAX_BYTES`,
   `LOG_KEEP`); it was previously unbounded.
+- **`source-limit.js`** — the ONE cap on how many distinct senders the
+  unsolicited receivers keep (`SBS_MAX_STREAM_SOURCES`, default 256). Both
+  `syslog.js` and `traps.js` admit through it; past the limit a NEW source is
+  dropped (logged once a minute) and known sources are untouched. It bounds
+  memory and the per-host files below against spoofed UDP.
 - **traps / syslog** — received notifications are persisted to rotating per-host
   stores under `logs/traps/<host>.log` and `logs/syslog/<host>.log` by an
   always-on subscriber in `server.js`, in addition to the in-memory ring buffers
@@ -232,6 +248,11 @@ who can read both vault files on the host can decrypt the stored switch
 credentials. Both files live in the install directory (`__dirname`-based), so
 they survive a reboot and a service launch. The KDF salt is a fixed constant and
 **must never change** (see `vault.js`) or existing state becomes unreadable.
+
+**An unreadable vault is never overwritten.** If `state.enc` cannot be
+decrypted (wrong or missing key file), the UI starts fresh; the next save
+first renames the old file to `state.enc.unreadable-<time>`, so it can be
+recovered once the right `.state-key` is back.
 
 Packaging: `.state-key` and `state.enc` are machine-local secrets and are
 **never** included in a distributed build (they regenerate on first run).
@@ -357,3 +378,21 @@ override is a control in the Details panel, persisted in saved state
 (`productOverride`), and it drives both the feature gate and the Explorer
 default. The Details panel also surfaces the line and its MIB-proven features,
 so "C1300X supports OSPF/PTP; C1200/C1300 do not" is visible, not just internal.
+
+## 11. Shared request and SNMP paths (the server's own helpers)
+
+The server-side counterparts of `MODULE-STANDARD §B8`. Each is the one place
+its concern lives; a new route or caller uses it rather than re-implementing it.
+
+| Concern | Helper | Why it exists |
+|---|---|---|
+| Who may call the server | `request-guard.js` (`middleware`, `verifyClient`) | Runs before every HTTP request and on the WebSocket upgrade. The dashboard is opened from any PC, so it does NOT restrict which machine connects; it refuses a browser request whose `Origin` is another site, and any `Host` that is not an IP, `localhost`, this computer's name, or a name in `SBS_ALLOWED_HOSTS` (DNS rebinding). |
+| JSON varbinds → net-snmp SET | `mapSetVarbinds(varbinds)` (server.js) | Every SET path (the `/api/snmp/set` route, snmp-config's bundle, the OPC/AAA/flash step runners) converts through it: numeric types, `valueHex` → Buffer with an even-length check, anything else unchanged. There were three copies, only some handling `valueHex`. |
+| Walking a subtree | `boundedWalk(session, base, opts, onDone)` (server.js) | The ONE walk: subtree boundary, advance check, pacing (§B5a), row/depth caps, and a per-request watchdog (`SNMP_STEP_WATCHDOG_MS`, 12 s) so a reply net-snmp never delivers ends the walk instead of hanging it. `raw: true` returns untouched varbinds for snmp-config (`boundedWalkRaw` is that, with its 4000-row / depth-64 limits). |
+| SNMPv3 security level | `v3SecurityOf(v3)` (server.js) | One derivation of auth/priv method and level, used to build the session and to judge whether a shared key would travel in cleartext, so the two cannot disagree. |
+| A snapshot leaving the server | `publicSnapshot(snap)` (server.js) | The collector keeps the full target to poll with; responses carry it through `redactTarget`. |
+
+Offline tests for these and the persistence helpers live in `test/` and run
+with `npm test` (node:test, no extra dependency). A new control gets a test
+that is red when the control is removed, paired with a test that the
+legitimate request still passes.
