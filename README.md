@@ -1447,17 +1447,25 @@ in one file.
 
 ## Security
 
-The dashboard is meant to be opened from any PC on the network, so the
-server listens on every interface. **It has no sign-in and no TLS.** Anyone
-who can reach port 3000 can use it, read the saved switch credentials
-(`/api/state`) and change switch configuration. Keep it on a trusted
-management network or behind a firewall or VPN.
+**The dashboard can only be opened on the PC the app runs on**
+(`http://localhost:3000`). The web server listens on the loopback address
+only; other machines on the network cannot connect to it. The receivers the
+switches send to (TFTP, syslog, traps) still listen on every interface, as
+they must.
+
+To open the dashboard to other PCs again, set `SBS_BIND=0.0.0.0` (or one of
+this PC's addresses). Be aware that **it has no sign-in and no TLS**: anyone
+who can reach port 3000 could then use it, read the saved switch credentials
+and change switch configuration.
 
 What it does protect against:
 
-- **Other websites.** A web page open in a browser on the LAN cannot call
+- **Other websites.** A web page open in a browser on this PC cannot call
   the API or open the SSH/console WebSocket: a request whose `Origin` is a
   different site is refused (`request-guard.js`).
+- **Browser hardening.** Every response carries a Content-Security-Policy
+  (scripts only from this server, nothing inline), refuses to be framed by
+  another page, and sends no referrer (`security-headers.js`).
 - **DNS rebinding.** Requests must be addressed to an IP address,
   `localhost`, or this computer's own name. If you open the dashboard
   through another DNS name (an alias), add it to `SBS_ALLOWED_HOSTS`,

@@ -107,8 +107,17 @@ function startCollector() {
   });
 }
 
-server.listen(PORT, () => {
-  log.info('server', `SBS Management Tool running at http://localhost:${PORT}`, { logFile: log.LOG_FILE, build: BUILD_MARKER });
+// Only this PC can open the dashboard: the web server listens on the
+// loopback address unless SBS_BIND says otherwise (SBS_BIND=0.0.0.0 opens it
+// to the LAN again; there is no sign-in, see README "Security"). The
+// receivers the switches send to (TFTP, syslog, traps) are UDP sockets of
+// their own and still listen on every interface.
+const BIND = process.env.SBS_BIND || '127.0.0.1';
+server.listen(PORT, BIND, () => {
+  log.info('server', `SBS Management Tool running at http://localhost:${PORT}`, { bind: BIND, logFile: log.LOG_FILE, build: BUILD_MARKER });
+  if (BIND !== '127.0.0.1' && BIND !== '::1' && BIND !== 'localhost') {
+    log.warn('server', 'The dashboard is reachable from the network, with no sign-in', { bind: BIND });
+  }
   // Also print plainly so it's obvious in the console which build is live.
   console.log('BUILD:', BUILD_MARKER);
   startCollector();
