@@ -1475,6 +1475,12 @@ What it does protect against:
   Settings shows those fields as *saved — leave blank to keep*, and the
   server fills them in when it talks to the switch. Typing a new value
   replaces the saved one.
+- **SSH host keys.** The first time the app connects to a switch over SSH it
+  remembers the switch's host key (`known-hosts.json`). If a later
+  connection presents a different key, it is refused and Settings shows the
+  old and new fingerprints with a **Trust the new key** button: expected
+  after replacing a switch or regenerating its key, and otherwise a sign
+  that something is impersonating it.
 - **Secrets in logs and responses.** Passwords, community strings, SNMPv3
   keys and RADIUS/TACACS keys are redacted at any depth in `logs/app.log`,
   SET values are not logged, and collector snapshots never return

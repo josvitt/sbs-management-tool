@@ -12178,6 +12178,36 @@
     setTimeout(() => { try { previous.close(); } catch (e) {} go(); }, 2000);
   }
 
+  /**
+   * The switch answered with a different SSH host key than the one the app
+   * remembered (known-hosts.js), and the server refused the connection. Say
+   * so plainly with both fingerprints, and offer the one explicit way on:
+   * trusting the new key, behind the two-tap confirm, then connecting again.
+   * A replaced or re-keyed switch needs that click once; an impostor is
+   * never let through silently.
+   */
+  function showHostKeyChanged(s, msg) {
+    appLog('warn', 'SSH host key changed; connection refused', { host: msg.host, expected: msg.expected, presented: msg.fingerprint });
+    subDot(s, 'ssh', 'err');
+    s.sshStatus.textContent = 'refused: the SSH host key changed';
+    const box = s.sshError;
+    clear(box);
+    box.style.display = 'block';
+    box.appendChild(el('div', '', 'The SSH host key of ' + msg.host + ':' + msg.port + ' has changed, so the connection was refused. ' +
+      'This is expected after replacing the switch or regenerating its key; otherwise someone may be impersonating it.'));
+    box.appendChild(el('div', 'card-sub', 'Remembered: ' + msg.expected));
+    box.appendChild(el('div', 'card-sub', 'Presented:  ' + msg.fingerprint));
+    const btn = el('button', 'btn', 'Trust the new key');
+    btn.type = 'button';
+    withConfirm(btn, (e) => runButtonAction(e.currentTarget, {
+      failLabel: 'Trust the new key',
+      run: () => apiPost('/api/ssh/trust-key', { host: msg.host, port: msg.port, fingerprint: msg.fingerprint }),
+      settle: () => { showErr(s.sshError, ''); sshConnect(s); return Promise.resolve(); }
+    }), { label: 'Trust the new key', danger: true });
+    box.appendChild(btn);
+    enableConnectButtons(s);
+  }
+
   function sshConnect(s, serialOpts) {
     const host = serialOpts ? serialOpts.path : (s.sshHost.value.trim() || s.host);
     const port = serialOpts ? serialOpts.baudRate : (parseInt(s.sshPort.value, 10) || 22);
@@ -12303,6 +12333,9 @@
           enableConnectButtons(s);
           s.disconnectBtn.style.display = 'none';
           s.reconnectBtn.style.display = 'inline-block';
+          break;
+        case 'hostkey-changed':
+          showHostKeyChanged(s, msg);
           break;
         case 'exec-started':
           s.capturing = true;

@@ -5,3 +5,4 @@ state.enc.*
 .state-key
 history.json
 layouts.json
+known-hosts.json

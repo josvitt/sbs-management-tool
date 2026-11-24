@@ -8,10 +8,25 @@
 const log = require('../logger');
 const vault = require('../vault');
 const credentials = require('../credentials');
+const knownHosts = require('../known-hosts');
 const serial = require('../serial');
 const { Client } = require('ssh2');
 
 module.exports = function register(app, wss) {
+  // "Trust the new key": the explicit step that replaces a remembered SSH host
+  // key after the page showed the user the old and new fingerprints.
+  app.post('/api/ssh/trust-key', (req, res) => {
+    const { host, port, fingerprint } = req.body || {};
+    if (!host) return res.status(400).json({ error: 'host is required.' });
+    try {
+      knownHosts.trust(host, port, fingerprint);
+      log.warn('ssh', 'New SSH host key trusted by the user', { host, port: Number(port) || 22, fingerprint });
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // -----------------------------------------------------------------
   // Console (serial)
   // -----------------------------------------------------------------
@@ -304,7 +319,16 @@ module.exports = function register(app, wss) {
             });
           });
 
+          // Set when the switch presented a different host key than the one
+          // remembered; the connection is refused and the page is told why.
+          let hostKeyChanged = null;
+
           conn.on('error', (err) => {
+            if (hostKeyChanged) {
+              send({ type: 'hostkey-changed', host, port: port || 22, ...hostKeyChanged });
+              notifyEnded('Connection refused: the switch\'s SSH host key has changed. Open Settings to review it.');
+              return;
+            }
             log.error('ssh', `SSH error [#${connId}]`, { host, error: err.message, level: err.level });
             send({ type: 'error', message: 'SSH error: ' + err.message });
             notifyEnded('Session ended due to an error.');
@@ -321,7 +345,22 @@ module.exports = function register(app, wss) {
             username,
             password,
             readyTimeout: 15000,
-            algorithms: LEGACY_ALGORITHMS
+            algorithms: LEGACY_ALGORITHMS,
+            // Trust on first use (known-hosts.js): remember a new switch's
+            // key, accept it again, refuse a different one.
+            hostVerifier: (key) => {
+              const v = knownHosts.check(host, port || 22, key);
+              if (v.result === 'new') {
+                log.info('ssh', `Remembered a new SSH host key [#${connId}]`, { host, port: port || 22, fingerprint: v.fingerprint });
+                send({ type: 'status', message: 'First connection: remembered host key ' + v.fingerprint });
+              }
+              if (v.result !== 'changed') return true;
+              hostKeyChanged = { fingerprint: v.fingerprint, expected: v.expected };
+              log.warn('ssh', `SSH host key CHANGED; connection refused [#${connId}]`, {
+                host, port: port || 22, expected: v.expected, presented: v.fingerprint
+              });
+              return false;
+            }
           });
           break;
         }
