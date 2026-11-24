@@ -2242,27 +2242,41 @@ app.post('/api/health', async (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, verifyClient: guard.verifyClient(log) });
 
-// Legacy algorithms are included because many Cisco IOS/IOS-XE switches,
-// especially older ones, only support older SSH key exchange / cipher
-// suites. Modern ssh2 disables these by default.
+// Strongest first; every algorithm the list offered before is still offered.
+// SSH picks the client's FIRST choice the switch also supports, so a switch
+// that only speaks the old suites still connects, and one that speaks modern
+// suites is no longer talked down to SHA-1 / CBC / ssh-rsa. The
+// legacy entries stay because older Cisco firmware may offer nothing else
+// (modern ssh2 drops them by default).
 const LEGACY_ALGORITHMS = {
   kex: [
-    'diffie-hellman-group14-sha256',
-    'diffie-hellman-group14-sha1',
+    'curve25519-sha256', 'curve25519-sha256@libssh.org',
+    'ecdh-sha2-nistp256', 'ecdh-sha2-nistp384', 'ecdh-sha2-nistp521',
     'diffie-hellman-group-exchange-sha256',
+    'diffie-hellman-group14-sha256',
+    // legacy
+    'diffie-hellman-group14-sha1',
     'diffie-hellman-group-exchange-sha1',
-    'diffie-hellman-group1-sha1',
-    'ecdh-sha2-nistp256',
-    'ecdh-sha2-nistp384',
-    'ecdh-sha2-nistp521'
+    'diffie-hellman-group1-sha1'
   ],
   cipher: [
+    'aes128-gcm@openssh.com', 'aes256-gcm@openssh.com', 'chacha20-poly1305@openssh.com',
     'aes128-ctr', 'aes192-ctr', 'aes256-ctr',
+    // legacy
     'aes128-cbc', 'aes192-cbc', 'aes256-cbc',
     '3des-cbc'
   ],
-  serverHostKey: ['ssh-rsa', 'rsa-sha2-256', 'rsa-sha2-512', 'ssh-dss', 'ecdsa-sha2-nistp256'],
-  hmac: ['hmac-sha2-256', 'hmac-sha2-512', 'hmac-sha1', 'hmac-md5']
+  serverHostKey: [
+    'ssh-ed25519', 'ecdsa-sha2-nistp256', 'rsa-sha2-512', 'rsa-sha2-256',
+    // legacy
+    'ssh-rsa', 'ssh-dss'
+  ],
+  hmac: [
+    'hmac-sha2-256-etm@openssh.com', 'hmac-sha2-512-etm@openssh.com',
+    'hmac-sha2-256', 'hmac-sha2-512',
+    // legacy
+    'hmac-sha1', 'hmac-md5'
+  ]
 };
 
 // Terminal output is full of ANSI/VT100 control sequences -- erase-line,
