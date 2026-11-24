@@ -41,6 +41,7 @@ let keySource = null;
 // a service started without the right key, or a restored key file, must not
 // cost every saved switch. save() moves such a file aside first.
 let unreadableOnDisk = false;
+let lastLoggedCount = null;   // switches in the state last logged as restored
 
 /**
  * The key: derived from a passphrase when one is set, otherwise a random
@@ -114,9 +115,13 @@ function load() {
     if (!fs.existsSync(STATE_FILE)) { unreadableOnDisk = false; return null; }
     const parsed = JSON.parse(decrypt(fs.readFileSync(STATE_FILE)));
     unreadableOnDisk = false;
-    log.info('vault', 'Restored saved state', {
-      switches: (parsed.switches || []).length, keySource
-    });
+    // The collector reads the vault on every tick of every switch; logging
+    // each read buried app.log. Say it once, and again only when it changes.
+    const count = (parsed.switches || []).length;
+    if (count !== lastLoggedCount) {
+      lastLoggedCount = count;
+      log.info('vault', 'Restored saved state', { switches: count, keySource });
+    }
     return parsed;
   } catch (e) {
     // A wrong key, a truncated file, or a passphrase that has changed all
