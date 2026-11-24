@@ -1635,6 +1635,13 @@ app.get('/api/collector/status', (req, res) => {
   res.json({ switches: collector.status() });
 });
 
+// A snapshot as it leaves the server. The collector keeps the full target
+// (it needs the credentials to poll); a response never carries them, the same
+// redaction the log applies. The browser does not read snapshot.target.
+function publicSnapshot(snap) {
+  return snap && snap.target ? { ...snap, target: redactTarget(snap.target) } : snap;
+}
+
 // The latest server-collected health snapshot for one switch, so a browser
 // can render current state without polling the switch itself.
 app.get('/api/collector/snapshot', (req, res) => {
@@ -1642,7 +1649,7 @@ app.get('/api/collector/snapshot', (req, res) => {
   if (!host) return res.status(400).json({ error: 'host is required.' });
   const snap = collector.snapshotByHost(host);
   if (!snap) return res.status(404).json({ error: 'No snapshot yet for ' + host });
-  res.json(snap);
+  res.json(publicSnapshot(snap));
 });
 
 // Manual "Refresh" = nudge the server to poll this switch now, then return the
@@ -1654,8 +1661,8 @@ app.post('/api/collect/now', async (req, res) => {
   try {
     const snap = await collector.nudge(target);
     if (!snap) return res.status(503).json({ error: 'Collector is not running.' });
-    if (snap.error) return res.status(502).json({ error: snap.error, snapshot: snap });
-    res.json(snap);
+    if (snap.error) return res.status(502).json({ error: snap.error, snapshot: publicSnapshot(snap) });
+    res.json(publicSnapshot(snap));
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
