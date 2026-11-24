@@ -644,6 +644,34 @@ app.post('/api/snmp/walk', (req, res) => {
   });
 });
 
+// The ONE conversion from the JSON varbind shape the UI and the plan builders
+// use ({ oid, type, value | valueHex }) to what net-snmp's session.set takes.
+// Every SET path goes through it: /api/snmp/set, snmp-config's bundle, and the
+// OPC / AAA / flash step runners. Numeric types become numbers; an OctetString
+// may arrive as a hex string (VLAN bitmaps and other binary values cannot
+// travel through JSON as raw bytes) and becomes a Buffer; anything else, a
+// Buffer included, passes through unchanged. Throws on an unknown type or an
+// odd-length hex string rather than sending a corrupted value.
+function mapSetVarbinds(varbinds) {
+  return varbinds.map((vb) => {
+    const type = snmp.ObjectType[vb.type];
+    if (type === undefined) throw new Error(`Unknown SNMP type: ${vb.type}`);
+    let value;
+    if (type === snmp.ObjectType.Integer || type === snmp.ObjectType.Counter
+      || type === snmp.ObjectType.Gauge || type === snmp.ObjectType.TimeTicks) {
+      value = Number(vb.value);
+    } else if (type === snmp.ObjectType.OctetString && vb.valueHex !== undefined) {
+      // Whitespace is tolerated so "00 60 .." pastes work.
+      const hex = String(vb.valueHex).replace(/[^0-9a-fA-F]/g, '');
+      if (hex.length % 2 !== 0) throw new Error('valueHex must have an even number of hex digits');
+      value = Buffer.from(hex, 'hex');
+    } else {
+      value = vb.value;
+    }
+    return { oid: mib.resolveOid(vb.oid), type, value };
+  });
+}
+
 // SET one or more OIDs.
 app.post('/api/snmp/set', (req, res) => {
   const { target, varbinds } = req.body || {};
@@ -667,25 +695,7 @@ app.post('/api/snmp/set', (req, res) => {
 
   let mapped;
   try {
-    mapped = varbinds.map((vb) => {
-      const type = snmp.ObjectType[vb.type];
-      if (type === undefined) throw new Error(`Unknown SNMP type: ${vb.type}`);
-      let value;
-      if (type === snmp.ObjectType.Integer || type === snmp.ObjectType.Counter
-        || type === snmp.ObjectType.Gauge || type === snmp.ObjectType.TimeTicks) {
-        value = Number(vb.value);
-      } else if (type === snmp.ObjectType.OctetString && vb.valueHex !== undefined) {
-        // Binary octet strings (e.g. VLAN-list bitmaps) can't travel through
-        // JSON as raw bytes, so they arrive as a hex string and become a Buffer
-        // here. Whitespace is tolerated so "00 60 .." pastes work.
-        const hex = String(vb.valueHex).replace(/[^0-9a-fA-F]/g, '');
-        if (hex.length % 2 !== 0) throw new Error('valueHex must have an even number of hex digits');
-        value = Buffer.from(hex, 'hex');
-      } else {
-        value = vb.value;
-      }
-      return { oid: mib.resolveOid(vb.oid), type, value };
-    });
+    mapped = mapSetVarbinds(varbinds);
   } catch (e) {
     session.close();
     return res.status(400).json({ error: e.message });
@@ -738,14 +748,7 @@ function snmpConfigBundle(session) {
     set: (varbinds) => new Promise((resolve) => {
       let mapped;
       try {
-        mapped = varbinds.map((vb) => {
-          const type = snmp.ObjectType[vb.type];
-          if (type === undefined) throw new Error('Unknown SNMP type: ' + vb.type);
-          const value = (type === snmp.ObjectType.Integer || type === snmp.ObjectType.Counter
-            || type === snmp.ObjectType.Gauge || type === snmp.ObjectType.TimeTicks)
-            ? Number(vb.value) : vb.value;
-          return { oid: mib.resolveOid(vb.oid), type, value };
-        });
+        mapped = mapSetVarbinds(varbinds);
       } catch (e) { return resolve(e.message); }
       session.set(mapped, (error, resultVarbinds) => {
         if (error) return resolve(error.message);
@@ -940,23 +943,6 @@ app.post('/api/config/sync', async (req, res) => {
 
 // Map opc plan varbinds ({oid,type,value|valueHex}) to net-snmp varbinds,
 // resolving type names and hex octet strings the same way /api/snmp/set does.
-function mapOpcVarbinds(varbinds) {
-  return varbinds.map((vb) => {
-    const type = snmp.ObjectType[vb.type];
-    if (type === undefined) throw new Error('Unknown SNMP type: ' + vb.type);
-    let value;
-    if (type === snmp.ObjectType.Integer || type === snmp.ObjectType.Counter
-      || type === snmp.ObjectType.Gauge || type === snmp.ObjectType.TimeTicks) {
-      value = Number(vb.value);
-    } else if (type === snmp.ObjectType.OctetString && vb.valueHex !== undefined) {
-      value = Buffer.from(String(vb.valueHex).replace(/[^0-9a-fA-F]/g, ''), 'hex');
-    } else {
-      value = vb.value;
-    }
-    return { oid: mib.resolveOid(vb.oid), type, value };
-  });
-}
-
 function snmpSetPromise(session, varbinds) {
   return new Promise((resolve, reject) => {
     session.set(varbinds, (error, result) => {
@@ -975,7 +961,7 @@ async function runOpcSteps(target, groups) {
   try {
     for (const g of groups) {
       if (!g.varbinds || !g.varbinds.length) continue;
-      await snmpSetPromise(session, mapOpcVarbinds(g.varbinds));
+      await snmpSetPromise(session, mapSetVarbinds(g.varbinds));
     }
   } finally {
     try { session.close(); } catch (e) { /* ignore */ }
@@ -1082,7 +1068,7 @@ app.post('/api/opc/delete', async (req, res) => {
     // not block removing the capture point itself.
     const session = buildSnmpSession(b.target);
     for (const vb of opc.planDeleteCapture(b.name)) {
-      try { await snmpSetPromise(session, mapOpcVarbinds([vb])); } catch (e) { /* ignore */ }
+      try { await snmpSetPromise(session, mapSetVarbinds([vb])); } catch (e) { /* ignore */ }
     }
     try { session.close(); } catch (e) {}
     res.json({ ok: true });
@@ -1339,7 +1325,7 @@ async function runAaaSteps(target, groups) {
   try {
     for (const g of groups) {
       if (!g || !g.length) continue;
-      await snmpSetPromise(session, mapOpcVarbinds(g));   // same type-mapping as OPC/flash
+      await snmpSetPromise(session, mapSetVarbinds(g));   // the shared SET type-mapping
     }
   } finally {
     try { session.close(); } catch (e) { /* ignore */ }
