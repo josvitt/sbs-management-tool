@@ -115,7 +115,7 @@ function load() {
     const parsed = JSON.parse(decrypt(fs.readFileSync(STATE_FILE)));
     unreadableOnDisk = false;
     log.info('vault', 'Restored saved state', {
-      switches: (parsed.switches || []).length, key: keySource
+      switches: (parsed.switches || []).length, keySource
     });
     return parsed;
   } catch (e) {

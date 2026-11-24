@@ -1,7 +1,7 @@
 /**
  * Minimal structured logger.
  * - Writes timestamped lines to the console AND to logs/app.log
- * - Never logs password fields (redacted before formatting)
+ * - Never logs credential fields at any depth (see SECRET_KEY)
  * - No external dependencies, so nothing extra to install on Windows
  */
 
@@ -22,13 +22,26 @@ if (!fs.existsSync(LOG_DIR)) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 
-function redact(meta) {
+// Field names whose VALUES never reach a log line: passwords and
+// passphrases, SNMP community strings, SNMPv3 auth/priv keys, RADIUS/TACACS
+// shared keys (`key`), and anything called a secret or token. Matched at any
+// depth, because credentials travel nested (target.community, target.v3.authKey)
+// and the old top-level-only check let them through.
+const SECRET_KEY = /pass(word|phrase)?|secret|token|community|^key$|^(auth|priv)Key$/i;
+
+function redact(meta, depth, seen) {
   if (!meta || typeof meta !== 'object') return meta;
-  const clone = { ...meta };
-  for (const key of Object.keys(clone)) {
-    if (/pass(word)?|secret|token/i.test(key)) {
-      clone[key] = '[REDACTED]';
-    }
+  depth = depth || 0;
+  seen = seen || new WeakSet();
+  if (seen.has(meta) || depth > 8) return '[…]';
+  seen.add(meta);
+  if (Buffer.isBuffer(meta)) return meta;
+  if (Array.isArray(meta)) return meta.map((v) => redact(v, depth + 1, seen));
+  const clone = {};
+  for (const key of Object.keys(meta)) {
+    clone[key] = SECRET_KEY.test(key) && meta[key] !== undefined && meta[key] !== null && meta[key] !== ''
+      ? '[REDACTED]'
+      : redact(meta[key], depth + 1, seen);
   }
   return clone;
 }

@@ -706,7 +706,12 @@ app.post('/api/snmp/set', (req, res) => {
     return res.status(400).json({ error: 'target.host and a non-empty varbinds array are required.' });
   }
 
-  log.info('snmp', 'SET request', { target: redactTarget(target), varbinds });
+  // OIDs and types only: a SET value can be a community string, a shared
+  // key or a password, and the log is not the place for any of them.
+  log.info('snmp', 'SET request', {
+    target: redactTarget(target),
+    varbinds: varbinds.map((vb) => ({ oid: vb && vb.oid, type: vb && vb.type }))
+  });
 
   let session;
   try {
