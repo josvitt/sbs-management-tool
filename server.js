@@ -275,7 +275,14 @@ const WALK_DEFAULTS = {
   // default 2 concurrent walks that is a ~100 pps ceiling - the agreed maximum
   // CPU input rate for the switch, while giving faster collections than a
   // gentler pace would. Raise paceMs (or lower concurrency) to go gentler.
-  paceMs: Number(process.env.SNMP_PACE_MS) || 20
+  paceMs: Number(process.env.SNMP_PACE_MS) || 20,
+  // A safety net per request, the same one snmpResponder gives GET and SET:
+  // net-snmp normally answers or times out on its own, but a reply that fails
+  // to parse can leave a callback pending forever. Without this a stuck walk
+  // hangs its HTTP request and, in the collector, leaves that switch marked
+  // in-flight so it is never polled again until a restart. It bounds ONE
+  // request, not the whole walk, so a long legitimate walk is unaffected.
+  stepWatchdogMs: Number(process.env.SNMP_STEP_WATCHDOG_MS) || 12000
 };
 
 function isWithinSubtree(base, oid) {
@@ -296,18 +303,29 @@ function oidCompare(a, b) {
   return 0;
 }
 
+// The ONE walk. `raw: true` returns untouched net-snmp varbinds
+// ({ oid, value, type }) for callers that decode values themselves
+// (snmp-config) and skips per-varbind errors; otherwise rows are described
+// for the UI. onDone fires exactly once.
 function boundedWalk(session, baseOid, options, onDone) {
   const opts = Object.assign({}, WALK_DEFAULTS, options || {});
   const useBulk = opts.mode !== 'next' && session.version !== snmp.Version1;
   const results = [];
   let current = baseOid;
   let truncated = null;
+  let done = false;
+  let watchdog = null;
 
   function finish(error) {
+    if (done) return;
+    done = true;
+    clearTimeout(watchdog);
     onDone(error || null, results, truncated);
   }
 
   function handle(error, varbinds) {
+    if (done) return;               // the watchdog already ended this walk
+    clearTimeout(watchdog);
     if (error) return finish(error);
 
     for (const vb of varbinds) {
@@ -331,7 +349,9 @@ function boundedWalk(session, baseOid, options, onDone) {
         return finish(null);
       }
 
-      if (snmp.isVarbindError(vb)) {
+      if (opts.raw) {
+        if (!snmp.isVarbindError(vb)) results.push({ oid: vb.oid, value: vb.value, type: vb.type });
+      } else if (snmp.isVarbindError(vb)) {
         results.push(annotate({ oid: vb.oid, error: snmp.varbindError(vb) }));
       } else {
         results.push(describeVarbind(vb));
@@ -351,10 +371,17 @@ function boundedWalk(session, baseOid, options, onDone) {
   }
 
   function step() {
+    if (done) return;
+    if (opts.stepWatchdogMs > 0) {
+      watchdog = setTimeout(() => {
+        log.error('snmp', 'Walk request got no SNMP reply; ending the walk', { oid: current, rows: results.length });
+        finish(new Error('The switch did not reply in time.'));
+      }, opts.stepWatchdogMs);
+    }
     if (useBulk) {
       session.getBulk([current], 0, opts.maxRepetitions, (error, varbinds) => {
         // getBulk hands back an array of arrays for the repeater.
-        if (error) return finish(error);
+        if (error) return handle(error);
         const flat = Array.isArray(varbinds[0]) ? varbinds[0] : varbinds;
         handle(null, flat);
       });
@@ -762,53 +789,16 @@ function snmpConfigBundle(session) {
 }
 
 // A walk that returns RAW varbinds (oid + untouched net-snmp value + type),
-// which snmp-config decodes itself. boundedWalk can't be reused here because
-// it runs describeVarbind and discards the raw Buffer. getNext-only (not
-// getBulk) keeps it simple and correct across the config tables, which are
-// small. A table the model doesn't implement resolves to [] rather than
+// which snmp-config decodes itself: the shared boundedWalk in raw mode, with
+// the tighter limits the config tables have always used. GETBULK for v2c/v3
+// keeps a small switch (C1300) stable: a config table like snmpTargetAddrTable
+// is ~120 varbinds, ~12 frames instead of ~120. A table the model doesn't
+// implement (or any error) resolves to the rows read so far rather than
 // rejecting, so one hidden table never blocks the rest.
-// Same pacing the primary walk uses, so health collection stays near the ~100
-// pps ceiling (2 concurrent walks x ~50 req/s). Tunable via the same env var.
-const RAW_PACE_MS = Number(process.env.SNMP_PACE_MS) || 20;
-
 function boundedWalkRaw(session, baseOid) {
-  const MAX_ROWS = 4000, MAX_DEPTH = 64, MAX_REP = 10;
-  // Use GETBULK for v2c/v3 so one request returns up to MAX_REP varbinds
-  // instead of one per round trip. A config table like snmpTargetAddrTable has
-  // ~15 rows across 8 columns, i.e. ~120 varbinds: GETNEXT means ~120 frames,
-  // GETBULK means ~12. Fewer frames keeps a small switch (C1300) stable,
-  // especially when several tables are read around a config change. v1 has no
-  // GETBULK, so fall back to GETNEXT there.
-  const useBulk = session.version !== snmp.Version1;
   return new Promise((resolve) => {
-    const rows = [];
-    let current = baseOid, done = false;
-    function handle(error, varbinds) {
-      if (done) return;
-      if (error) { done = true; return resolve(rows); }
-      const list = Array.isArray(varbinds[0]) ? varbinds[0] : varbinds;
-      for (const vb of list) {
-        if (vb.type === snmp.ObjectType.EndOfMibView ||
-            vb.type === snmp.ObjectType.NoSuchObject ||
-            vb.type === snmp.ObjectType.NoSuchInstance) { done = true; return resolve(rows); }
-        if (!isWithinSubtree(baseOid, vb.oid)) { done = true; return resolve(rows); }
-        if (oidCompare(vb.oid, current) <= 0) { done = true; return resolve(rows); }
-        if (vb.oid.split('.').length > MAX_DEPTH) { done = true; return resolve(rows); }
-        if (!snmp.isVarbindError(vb)) rows.push({ oid: vb.oid, value: vb.value, type: vb.type });
-        current = vb.oid;
-        if (rows.length >= MAX_ROWS) { done = true; return resolve(rows); }
-      }
-      // Pace the next request so the health collection (initial scan and
-      // Refresh Now) is gentle on the switch CPU, the same cap the other walk
-      // path uses. With concurrency 2 and ~20ms spacing this holds near 100 pps.
-      if (RAW_PACE_MS > 0) setTimeout(step, RAW_PACE_MS); else step();
-    }
-    function step() {
-      if (done) return;
-      if (useBulk) session.getBulk([current], 0, MAX_REP, handle);
-      else session.getNext([current], handle);
-    }
-    step();
+    boundedWalk(session, baseOid, { raw: true, maxRows: 4000, maxOidLength: 64, maxRepetitions: 10 },
+      (error, rows) => resolve(rows));
   });
 }
 
