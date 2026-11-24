@@ -915,6 +915,7 @@
       mibStatus: q('.f-mib-status'), targetError: q('.f-target-form .form-error'),
       hostInput: q('.f-host'), portInput: q('.f-port'), versionInput: q('.f-version'),
       communityField: q('.community-field'), communityInput: q('.f-community'),
+      transportNote: q('.f-transport-note'),
       v3Fields: q('.v3-fields'), v3User: q('.f-v3-username'), v3Level: q('.f-v3-level'),
       v3Auth: q('.f-v3-auth'), v3AuthKey: q('.f-v3-authkey'), v3AuthKeyField: q('.f-v3-authkey-field'),
       v3Priv: q('.f-v3-priv'), v3PrivKey: q('.f-v3-privkey'), v3PrivKeyField: q('.f-v3-privkey-field'),
@@ -1486,6 +1487,7 @@
     const v3 = s.versionInput.value === '3';
     s.communityField.classList.toggle('hidden', v3);
     s.v3Fields.classList.toggle('visible', v3);
+    paintTransportNote(s);
     if (!v3) return;
 
     // Password fields only matter when the matching method is in use, and
@@ -1505,6 +1507,23 @@
       s.v3Level.style.color = '';
     }
   }
+  /**
+   * Say, where the credentials are chosen, what an SNMP write exposes. v1 and
+   * v2c send the community string and every value written in the clear, and
+   * so does v3 without privacy; anyone capturing the traffic between this PC
+   * and the switch reads them. Stated once here rather than as a prompt on
+   * every write, so it informs the choice without getting in the way of it.
+   */
+  function paintTransportNote(s) {
+    if (!s.transportNote) return;
+    const v3 = s.versionInput.value === '3';
+    const priv = v3 && s.v3Priv && s.v3Priv.value !== 'none';
+    s.transportNote.textContent = priv ? '' : (v3
+      ? '\u26A0 Without privacy, values written to the switch travel unencrypted.'
+      : '\u26A0 v' + s.versionInput.value + ' sends the community string and every value written unencrypted. SNMPv3 with privacy encrypts them.');
+    s.transportNote.style.display = priv ? 'none' : '';
+  }
+
   function buildTarget(s) {
     const t = {
       host: s.hostInput.value.trim(),
