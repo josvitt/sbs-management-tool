@@ -25,6 +25,7 @@
 const fs = require('fs');
 const path = require('path');
 const log = require('./logger');
+const rotate = require('./rotate');
 
 const FILE = path.join(__dirname, 'history.json');
 
@@ -68,7 +69,7 @@ function writeNow() {
   try {
     const out = { savedAt: new Date().toISOString(), series: {} };
     for (const [host, samples] of series) out.series[host] = samples;
-    fs.writeFileSync(FILE, JSON.stringify(out));
+    rotate.writeFileAtomic(FILE, JSON.stringify(out));
   } catch (e) {
     log.error('history', 'Could not write the history file', { message: e.message });
   }

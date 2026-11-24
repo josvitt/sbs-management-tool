@@ -2081,7 +2081,7 @@ function loadLayouts() {
 
 function saveLayouts() {
   try {
-    fs.writeFileSync(LAYOUT_FILE, JSON.stringify(layouts, null, 2));
+    rotate.writeFileAtomic(LAYOUT_FILE, JSON.stringify(layouts, null, 2));
   } catch (e) {
     log.error('layout', 'Could not write layouts.json', { message: e.message });
   }

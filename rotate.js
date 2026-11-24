@@ -12,6 +12,11 @@
  * dropped. Appends are synchronous so a rotation can never interleave with a
  * concurrent write from the same process; every call is best-effort and never
  * throws (a logging store must not be able to crash the app).
+ *
+ * It also owns the other half of "how a store reaches disk": writeFileAtomic,
+ * for the whole-file stores (state.enc, history.json, layouts.json). Those
+ * were written in place, so a crash or power cut mid-write left a truncated
+ * file. For the vault that meant every saved switch and credential at once.
  */
 
 const fs = require('fs');
@@ -87,4 +92,33 @@ function readLines(file, opts) {
   return out.slice(-limit);
 }
 
-module.exports = { appendLine, readLines, rotateIfNeeded, DEFAULT_MAX_BYTES, DEFAULT_KEEP };
+/**
+ * Replace a whole file so a reader only ever sees the old content or the new,
+ * never half of one: write a sibling temp file, flush it to disk, then rename
+ * it over the target (atomic on the same volume, Windows included).
+ * `opts.mode` is applied to the new file (0o600 for secrets). Unlike
+ * appendLine this THROWS on failure, because its callers already report a
+ * failed save in their own words; the temp file is removed either way.
+ */
+function writeFileAtomic(file, data, opts) {
+  const mode = opts && opts.mode;
+  const tmp = `${file}.tmp-${process.pid}-${Date.now().toString(36)}`;
+  let fd = null;
+  try {
+    fd = fs.openSync(tmp, 'w', mode === undefined ? 0o666 : mode);
+    fs.writeFileSync(fd, data);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    if (mode !== undefined) {
+      try { fs.chmodSync(tmp, mode); } catch (e) { /* Windows has no mode */ }
+    }
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    if (fd !== null) { try { fs.closeSync(fd); } catch (e2) { /* already closed */ } }
+    try { fs.unlinkSync(tmp); } catch (e2) { /* never created */ }
+    throw e;
+  }
+}
+
+module.exports = { appendLine, readLines, rotateIfNeeded, writeFileAtomic, DEFAULT_MAX_BYTES, DEFAULT_KEEP };

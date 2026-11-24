@@ -25,6 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const log = require('./logger');
+const rotate = require('./rotate');
 
 const DIR = __dirname;
 const STATE_FILE = path.join(DIR, 'state.enc');
@@ -35,6 +36,11 @@ const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
 
 let cachedKey = null;
 let keySource = null;
+// Set when the last load found a state file it could not decrypt. The UI then
+// starts fresh, and its next save would otherwise overwrite the only copy:
+// a service started without the right key, or a restored key file, must not
+// cost every saved switch. save() moves such a file aside first.
+let unreadableOnDisk = false;
 
 /**
  * The key: derived from a passphrase when one is set, otherwise a random
@@ -105,8 +111,9 @@ function decrypt(buffer) {
 
 function load() {
   try {
-    if (!fs.existsSync(STATE_FILE)) return null;
+    if (!fs.existsSync(STATE_FILE)) { unreadableOnDisk = false; return null; }
     const parsed = JSON.parse(decrypt(fs.readFileSync(STATE_FILE)));
+    unreadableOnDisk = false;
     log.info('vault', 'Restored saved state', {
       switches: (parsed.switches || []).length, key: keySource
     });
@@ -115,6 +122,7 @@ function load() {
     // A wrong key, a truncated file, or a passphrase that has changed all
     // land here. Saying which is impossible and guessing would be worse
     // than admitting the file cannot be read.
+    unreadableOnDisk = true;
     log.error('vault', 'Could not read the saved state', {
       message: e.message,
       hint: (process.env.SBS_PASSPHRASE || process.env.SWITCH_CONSOLE_PASSPHRASE)
@@ -128,8 +136,13 @@ function load() {
 function save(state) {
   try {
     const payload = JSON.stringify(state);
-    fs.writeFileSync(STATE_FILE, encrypt(payload), { mode: 0o600 });
-    try { fs.chmodSync(STATE_FILE, 0o600); } catch (e) { /* Windows */ }
+    if (unreadableOnDisk && fs.existsSync(STATE_FILE)) {
+      const kept = STATE_FILE + '.unreadable-' + new Date().toISOString().replace(/[:.]/g, '-');
+      fs.renameSync(STATE_FILE, kept);
+      unreadableOnDisk = false;
+      log.warn('vault', 'Kept the unreadable state file instead of overwriting it', { file: kept });
+    }
+    rotate.writeFileAtomic(STATE_FILE, encrypt(payload), { mode: 0o600 });
     return true;
   } catch (e) {
     log.error('vault', 'Could not save state', { message: e.message });
