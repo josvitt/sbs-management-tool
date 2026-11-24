@@ -71,5 +71,6 @@ module.exports = {
   info: (source, message, meta) => log('INFO', source, message, meta),
   warn: (source, message, meta) => log('WARN', source, message, meta),
   error: (source, message, meta) => log('ERROR', source, message, meta),
-  LOG_FILE
+  LOG_FILE,
+  redact   // exported for the offline tests
 };
