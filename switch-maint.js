@@ -198,10 +198,14 @@ async function pushFile(buildSession, opts) {
   try { port = await tftp.start(opts.tftpPort); }
   catch (e) { throw new Error('Could not start the built-in TFTP server on UDP ' + (opts.tftpPort || 69) + ': ' + e.message); }
   const localIp = await configFetch.localAddressFor(opts.host);
-  // Random and short-lived: the TFTP server hands this file to anyone who
-  // asks by name, so the name is the secret.
-  const fileName = (dest === 'startup' ? 'restore-' : 'image-') + Date.now().toString(36) + '-' +
-    crypto.randomBytes(6).toString('hex') + (dest === 'startup' ? '.cfg' : '.bin');
+  // The TFTP server hands an offered file to anyone who asks by name. A
+  // configuration gets a random, short-lived name, so the name is the secret.
+  // A firmware image is public, so it keeps the uploaded file's name, which
+  // is the name the switch stores it under and shows in its image list.
+  const given = dest === 'image' && opts.fileName
+    ? String(opts.fileName).replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[._]+/, '').slice(0, 120) : '';
+  const fileName = given || ((dest === 'startup' ? 'restore-' : 'image-') + Date.now().toString(36) + '-' +
+    crypto.randomBytes(6).toString('hex') + (dest === 'startup' ? '.cfg' : '.bin'));
   const timeoutMs = Number(opts.timeoutMs) || (dest === 'image' ? 20 * 60000 : 120000);
   tftp.offer(fileName, opts.buffer, timeoutMs + 60000);
 

@@ -189,3 +189,27 @@ test('sameConfig ignores line endings and trailing blanks only', () => {
   assert.equal(maint.sameConfig('a\r\nb  \r\n\r\n', 'a\nb'), true);
   assert.equal(maint.sameConfig('a\nb', 'a\nc'), false);
 });
+
+test('pushFile keeps an image\'s uploaded name, but never a configuration\'s', async () => {
+  const port = await tftp.start(0);
+  const names = [];
+  const run = (dest, fileName) => {
+    const values = {};
+    const s = fakeSession(values, {
+      onSet: (vbs) => {
+        const row = vbs.find((v) => v.oid.indexOf(COPY + '.17.') === 0 && v.value === 4);
+        if (!row) return;
+        const index = row.oid.split('.').pop();
+        const name = String(values[COPY + '.6.' + index][1]);
+        names.push(name);
+        values[COPY + '.14.' + index] = [T.Integer, 2];
+        tftpRead(port, name).then(() => { values[COPY + '.14.' + index] = [T.Integer, 5]; });
+      }
+    });
+    return maint.pushFile(() => s, { host: '127.0.0.1', dest, buffer: Buffer.alloc(600, 1), fileName, tftpPort: port, timeoutMs: 15000 });
+  };
+  await run('image', 'image_Cat1200_1300_4.1.9.92 official.bin');
+  await run('startup', 'chosen.cfg');
+  assert.equal(names[0], 'image_Cat1200_1300_4.1.9.92_official.bin');
+  assert.match(names[1], /^restore-[0-9a-z]+-[0-9a-f]{12}\.cfg$/);
+});

@@ -123,7 +123,7 @@ module.exports = function register(app) {
     if (!s) return res.status(404).json({ error: 'That upload has expired. Choose the file again.' });
     try {
       const pushed = await maint.pushFile(() => buildSnmpSession(target), {
-        host: target.host, dest: 'image', buffer: s.buffer,
+        host: target.host, dest: 'image', buffer: s.buffer, fileName: s.name,
         tftpPort: tftpPort(), waitForFinish: copyFinishedWaiter(target.host), unit: req.body.unit
       });
       dropStaged(req.body.id);

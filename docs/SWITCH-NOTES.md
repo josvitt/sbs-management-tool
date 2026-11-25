@@ -90,6 +90,13 @@ Proven on a C1300 (25 Nov 2026, firmware 4.1.9.92, `scripts/switch-test-maint.js
 - **The images are listed in `rndImageInfoTable`, one row per unit,** with a
   name, version and build date and time column for each slot. The name is a
   full path such as `flash://system/images/<file>.bin`.
+- **A firmware install is the same copy with file type image(8).** A 65.7 MB
+  image took 121 s. The switch writes it to the slot it is not running,
+  stores it under the TFTP file name it was offered, and makes that slot
+  the next boot image by itself.
+- **Reading startup back over TFTP can stall right after a copy into it.**
+  Twice the upload sat at uploadInProgress until the app gave up; a later
+  read worked.
 
 ## Spanning tree (`health.js`)
 

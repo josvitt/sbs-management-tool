@@ -4,7 +4,7 @@
  * Supervised test of reboot, firmware and configuration restore on one
  * switch. Run it only with the owner's approval, on the test switch.
  *
- *   SBS_COMM=<community> node scripts/switch-test-maint.js <address> [--image <file>] [--reboot] [results folder]
+ *   SBS_COMM=<community> node scripts/switch-test-maint.js <address> [--image <file>] [--roundtrip] [--save-first] [--reboot] [--diff-only] [results folder]
  *
  * It starts the app's own routes on 127.0.0.1 and goes through them, so
  * the requests are the ones the dashboard sends. Without options it never
@@ -14,15 +14,17 @@
  *      and whether the running configuration is saved.
  *   2. Schedules a reboot an hour out, checks it, cancels it, checks that.
  *   3. Makes the other image the next boot image, checks, and puts it back.
- *   4. Reads the startup configuration and copies the same text back into
- *      startup over TFTP, then reads startup again and compares. If it
- *      differs, the text read at the start (held in memory) is copied back
- *      again. The running configuration is never touched.
+ *   4. Only with --roundtrip: reads the startup configuration and copies
+ *      the same text back into startup over TFTP, then reads startup again
+ *      and compares. If it differs, startup is put back. The running
+ *      configuration is never touched. Off by default: on 4.1.9.92 the
+ *      switch drops lines from a startup copied this way (SWITCH-NOTES.md).
  *
  *   --image <file>  also installs that firmware file into the inactive
  *                   image slot. Use the version the switch already runs
  *                   unless you mean to upgrade: the old inactive image is
  *                   overwritten.
+ *   --roundtrip     runs step 4.
  *   --save-first    saves running to startup before the round trip (the
  *                   owner's choice, on the test switch only), so startup
  *                   starts as a known copy and a rewritten one can be put
@@ -52,10 +54,11 @@ const imagePath = imageAt > 0 ? args[imageAt + 1] : null;
 const doReboot = args.includes('--reboot');
 const diffOnly = args.includes('--diff-only');
 const saveFirst = args.includes('--save-first');
+const roundTrip = args.includes('--roundtrip') || saveFirst;
 const outDir = args.filter((a, i) => i > 0 && !a.startsWith('--') && i !== imageAt + 1)[0] || null;
 const community = process.env.SBS_COMM;
 if (!host || !community || (imageAt > 0 && !imagePath)) {
-  console.error('Usage: SBS_COMM=<community> node scripts/switch-test-maint.js <address> [--image <file>] [--reboot] [results folder]');
+  console.error('Usage: SBS_COMM=<community> node scripts/switch-test-maint.js <address> [--image <file>] [--roundtrip] [--save-first] [--reboot] [--diff-only] [results folder]');
   process.exit(2);
 }
 
@@ -205,11 +208,12 @@ async function main() {
   // ---- 4. startup configuration round trip ----------------------------------
   let startupText = null;
   let savedNow = saved0 === true;
-  if (saveFirst && !savedNow) {
+  if (!roundTrip) say('SKIP startup round trip: add --roundtrip to run it.');
+  if (roundTrip && saveFirst && !savedNow) {
     const sv = await post('/api/config/sync', { target, from: 'running', to: 'startup' });
     savedNow = check('save running to startup first (--save-first)', sv.httpOk && !sv.error && (await isSaved()) === true, sv.error || '');
   }
-  try {
+  if (roundTrip) try {
     const a = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
     startupText = a.text;
     say('  startup configuration read: ' + a.lines + ' lines');
