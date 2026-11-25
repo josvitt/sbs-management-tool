@@ -11520,6 +11520,15 @@
       bar.appendChild(confirmRow);
       host.appendChild(bar);
     }
+    host.appendChild(diffPre(diff));
+  }
+
+  /**
+   * A diffLines result as a <pre class="diff">: "+"/"\u2212" lines with their
+   * block context, unchanged runs folded. The one renderer for every diff
+   * view (startup vs running, and config history).
+   */
+  function diffPre(diff) {
     const pre = document.createElement('pre');
     pre.className = 'diff';
     const show = visibleDiffLines(diff);
@@ -11532,7 +11541,7 @@
         (d.t === ' ' ? '  ' : d.t + ' ') + d.text + '\n'));
     }
     if (run) pre.appendChild(el('span', 'diff-skip', '  \u22ef ' + run + ' unchanged line(s)\n'));
-    host.appendChild(pre);
+    return pre;
   }
 
   /**
