@@ -159,7 +159,7 @@
         onApplied: () => { markConfigDirty(s, [modeSel, ipIn, prefIn]); if (iface.vlanId != null) s._vlanFlash = iface.vlanId; },
         settle: () => refreshSvi(s).then(() => { if (done) done(); })
       });
-    });
+    }, { when: () => !!(cur || dhcpOn), confirmText: 'Tap again to change the address' });
     form.appendChild(actions); form.appendChild(msg);
     // Remove button when something is configured.
     if (cur || dhcpOn) {

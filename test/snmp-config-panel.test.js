@@ -92,3 +92,13 @@ test('the server route offers no preview, status or diagnostics actions', () => 
   assert.doesNotMatch(route, /-preview'|case 'status'|case 'diagnostics'/);
   assert.match(route, /finally \{\s*try \{ session\.close\(\)/);
 });
+
+test('the community or SNMPv3 user this app connects with is flagged in use, so it offers no Delete', () => {
+  const { markInUse } = require('../routes/snmp-config');
+  const comms = markInUse({ communities: [{ community: 'public' }, { community: 'private' }] }, 'communities', 'community', 'private');
+  assert.deepEqual(comms.communities.map((c) => !!c.inUse), [false, true]);
+  const users = markInUse({ users: [{ name: 'joe' }] }, 'users', 'name', false);
+  assert.equal(users.users[0].inUse, undefined);
+  assert.match(read('17-snmp-config.js'), /inUseCell\(c\) \|\|/);
+  assert.match(read('17-snmp-config.js'), /inUseCell\(u\) \|\|/);
+});

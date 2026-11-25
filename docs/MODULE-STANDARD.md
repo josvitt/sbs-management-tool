@@ -241,7 +241,11 @@ here), never as inline styles on a one-off node.
   meaning (A2).
 - **Form** — a modal via `openTabbedPopout(s, title, tabs, [])`; inside, group with
   `formSection(title)` (amber ruled title) and lay out fields with `field(label,
-  control)` (`.snmp-field`: stacked label + input).
+  control)` (`.snmp-field`: stacked label + input). `openTabbedPopout` is the only
+  pop-out: no inline row editors, no forms opened inside a panel, and no second
+  modal helper (`openDetailDialog` is a one-tab `openTabbedPopout`). A form has no
+  Cancel button; **Esc** closes it. Errors go on a red `.sw-err` line under the
+  button.
 - **Change flash** — `flashValue(node)` adds `.value-changed` (a 1.7s settle
   animation) so a value that just changed is felt. Used for inline edits.
 
@@ -577,6 +581,9 @@ on the periodic timer is a cost decision, not just a correctness one.
       works. This was established by a delete-probe that tried each variant (rule 5:
       the negative was proven, not assumed), after reading both CISCOSB-dnscl.mib and
       rfc1612.mib. Both cases show a 🔒 with a reason instead of a Delete button.
+  (c) the SNMP community or SNMPv3 user the app is connected with: the server
+      flags it `inUse` (it knows the resolved credential, including a saved
+      switch's) and the panel shows `🔒 in use` instead of Delete.
 - **Protect connectivity-critical writes.** A write that could sever the app's own
   SNMP path to the switch is locked, not merely confirmed — the same protection the
   management SVI/VLAN already has (`isManagementIf`). This covers deleting the
@@ -655,6 +662,7 @@ on the periodic timer is a cost decision, not just a correctness one.
 | Status pill | `el('span','pill '+variant, label)` |
 | Modal form | `openTabbedPopout(s, title, tabs, [])`, `formSection`, `field` |
 | Two-tap confirm only when the click is drastic | `withConfirm(btn, run, { when, confirmText })`: `when()` false runs on the first tap; `confirmText` may be a function naming what goes |
+| Which clicks take two taps | Every delete; a write that replaces something in place (overwrite startup, change an existing address, rebuild a channel's members, configure the switch's logging); a port setting that can drop the link (speed/duplex, switchport mode, 802.1X port control); a key sent without SNMPv3 privacy. Add, create, rename and other saves take one tap. A two-tap button arms in place (`withConfirm`); never a separate Yes/Cancel row |
 | IPv4 address of an L3 interface (VLAN SVI or routed port) | `buildSviEditor(s, iface, ifIndex, pane, done)` in `15-ipv4-addressing.js`, `iface` = `vlanIface(vlan)` or `l3Iface(s, ifIndex)`; one editor, one management lock. Every interface address is set in the IPv4 Addressing panel only (`openIpv4Editor`, `openIpv4AddForm`), never in a VLAN or port popout |
 | Remove one interface's address / DHCP client (reports failure) | `removeIfAddress(s, ifIndex, cur, dhcpOn)`; `teardownSvi(s, ifIndex)` is the best-effort teardown before a VLAN delete or a switch back to switchport |
 | The user IPv4 addresses (static/dhcp rows of rsIpAddrTable) | `ipv4Addresses(s)` |

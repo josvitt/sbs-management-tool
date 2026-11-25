@@ -77,7 +77,7 @@
           const pen = el('button', 'hero-edit-btn', '\u270E');
           pen.title = 'Edit name, location and contact';
           pen.type = 'button';
-          pen.addEventListener('click', (e) => { e.stopPropagation(); editSysIdentity(s, pen); });
+          pen.addEventListener('click', (e) => { e.stopPropagation(); editSysIdentity(s); });
           nameRow.appendChild(pen);
         }
         main.appendChild(nameRow);
@@ -877,13 +877,11 @@
               { v: dv(r.port) }, { v: dv(r.mac) }]), h.dot1xLocked, (r) => String(dv(r.port)) + '|' + String(dv(r.mac))));
         }
 
-        // --- AAA servers (RADIUS + TACACS+) --- not yet keyed; skipped on
-        // reconcile (a full repaint still renders them, and a change to their
-        // tables forces a full repaint via PANEL_FULL_REPAINT_TABLES).
-        if (!s._ktReconcile) {
-          buildDot1xGlobal(s, body, h, section);
-          buildAaaServers(s, body, h, section, p);
-        }
+        // --- 802.1X global settings (an editor: built on a full paint only;
+        // a change to the scalars it shows repaints the panel) and the AAA
+        // servers (keyed tables, reconciled in place) ---
+        if (!s._ktReconcile) buildDot1xGlobal(s, body, h, section);
+        buildAaaServers(s, body, h, section, p);
 
         if (!s._ktReconcile && !body.children.length) {
           body.appendChild(el('div', 'empty-state',
@@ -1356,67 +1354,63 @@
   const SYS_EDIT_OIDS = {
     name: '1.3.6.1.2.1.1.5.0', location: '1.3.6.1.2.1.1.6.0', contact: '1.3.6.1.2.1.1.4.0'
   };
-  function editSysIdentity(s, anchor) {
+  // Edit the system name, location and contact in the standard pop-out (A5):
+  // one tap to save (B8), the failure as the red line under the button.
+  function editSysIdentity(s) {
     if (!s.target) return;
     const h = s.health;
     const cur = (k) => {
       const v = h && h.scalars && h.scalars[k] ? h.scalars[k].display : '';
       return (v && v !== '(empty)') ? v : '';
     };
-    // Render a small inline form inside the hero's main column, below the
-    // name/details, so it sits in normal flow rather than becoming a stray
-    // flex item in the (wrapping) .hero row.
-    const heroMain = anchor && anchor.closest('.hero-main');
-    const host = heroMain || (anchor && anchor.closest('.hero'));
-    let form = document.getElementById('sysid-form');
-    if (form) form.remove();
-    form = el('div', 'snmp-form'); form.id = 'sysid-form'; form.style.marginTop = '10px';
-    form.appendChild(el('h5', '', 'Edit identity'));
-    const defs = [
-      ['name', 'System name', SYS_EDIT_OIDS.name, cur('sysName')],
-      ['location', 'Location', SYS_EDIT_OIDS.location, cur('sysLocation')],
-      ['contact', 'Contact', SYS_EDIT_OIDS.contact, cur('sysContact')]
-    ];
-    const grid = el('div', 'snmp-form-grid');
-    const inputs = {};
-    for (const [key, label, oid, value] of defs) {
-      const inp = textInput(value);
-      inputs[key] = { inp, oid, current: value, label };
-      grid.appendChild(field(label, inp));
-    }
-    form.appendChild(grid);
-    const msg = el('div'); form.appendChild(msg);
-    const actions = el('div', 'snmp-form-actions');
-    const save = el('button', 'btn btn-small', 'Save');
-    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
-    cancel.addEventListener('click', () => form.remove());
-    withConfirm(save, (ev) => {
-      const changes = Object.values(inputs).filter((f) => f.inp.value !== f.current)
-        .map((f) => ({ label: f.label, oid: f.oid, value: f.inp.value }));
-      if (!changes.length) { form.remove(); return; }
-      runButtonAction(ev.currentTarget, {
-        failLabel: 'Save identity', spinLabel: 'Saving\u2026',
-        run: async () => {
-          for (const ch of changes) {
+    openTabbedPopout(s, 'Switch identity', [{ label: 'Identity', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const sec = formSection('Identity');
+      sec.body.classList.add('acl-stack');
+      const defs = [
+        ['name', 'System name', SYS_EDIT_OIDS.name, cur('sysName')],
+        ['location', 'Location', SYS_EDIT_OIDS.location, cur('sysLocation')],
+        ['contact', 'Contact', SYS_EDIT_OIDS.contact, cur('sysContact')]
+      ];
+      const inputs = {};
+      for (const [key, label, oid, value] of defs) {
+        const inp = textInput(value);
+        inputs[key] = { inp, oid, current: value, label };
+        sec.body.appendChild(field(label, inp));
+      }
+      form.appendChild(sec.sec);
+      const { actions, apply, msg } = applyActions('Save');
+      apply.addEventListener('click', (ev) => {
+        clear(msg);
+        const changes = Object.values(inputs).filter((f) => f.inp.value !== f.current)
+          .map((f) => ({ label: f.label, oid: f.oid, value: f.inp.value }));
+        if (!changes.length) { close(); return; }
+        runButtonAction(ev.currentTarget, {
+          failLabel: 'Save identity', spinLabel: 'Saving\u2026',
+          run: async () => {
+            s.writeBusy = true;
             try {
-              const { body: j } = await apiPost('/api/snmp-config/status-set-apply', { target: s.target, cfg: { oid: ch.oid, value: ch.value } });
-              if (!j || !j.ok) return { ok: false, error: ch.label + ': ' + ((j && j.error) || 'failed') };
-              if (!j.applied.ok) { const d = (j.applied.log && j.applied.log[0] && j.applied.log[0].detail) || 'change failed'; return { ok: false, error: ch.label + ' could not be changed: ' + d }; }
-            } catch (e) { return { ok: false, error: 'Lost contact: ' + e.message }; }
+              for (const ch of changes) {
+                const { body: j } = await apiPost('/api/snmp-config/status-set-apply', { target: s.target, cfg: { oid: ch.oid, value: ch.value } });
+                if (!j || !j.ok) return { ok: false, error: ch.label + ': ' + ((j && j.error) || 'failed') };
+                if (!j.applied.ok) { const d = (j.applied.log && j.applied.log[0] && j.applied.log[0].detail) || 'change failed'; return { ok: false, error: ch.label + ' could not be changed: ' + d }; }
+              }
+              return { ok: true };
+            } catch (e) { return { ok: false, error: 'lost contact with the local server: ' + e.message }; }
+            finally { s.writeBusy = false; }
+          },
+          ok: (r) => r && r.ok,
+          error: (r) => { const e = (r && r.error) || 'failed'; msg.appendChild(el('div', 'sw-err', 'Save identity failed: ' + e)); return e; },
+          onApplied: () => markConfigDirty(s),
+          settle: () => {
+            const panel = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === 'summary');
+            return Promise.resolve(panel ? refreshPanel(s, panel) : startHealth(s)).then(() => close());
           }
-          return { ok: true };
-        },
-        ok: (r) => r && r.ok,
-        error: (r) => { msg.className = 'snmp-msg bad'; msg.textContent = (r && r.error) || 'failed'; return (r && r.error) || 'failed'; },
-        onApplied: () => markConfigDirty(s),
-        settle: () => {
-          const panel = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === 'summary');
-          if (panel) return Promise.resolve(refreshPanel(s, panel)); else { startHealth(s); return Promise.resolve(); }
-        }
+        });
       });
-    });
-    actions.appendChild(save); actions.appendChild(cancel);
-    form.appendChild(actions);
-    if (host) host.appendChild(form); else if (anchor) anchor.parentElement.appendChild(form);
-    inputs.name.inp.focus();
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+      inputs.name.inp.focus();
+    } }], []);
   }
+

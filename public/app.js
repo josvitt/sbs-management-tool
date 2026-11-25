@@ -2456,7 +2456,7 @@
     interfaces: ['interfaces', 'poe', 'lagAgg', 'lagMembers', 'lagCreation', 'lagPortKey', 'bridgePorts', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode', 'vlans', 'vlansCurrent', 'portModes', 'portL2L3', 'portAccessVlan', 'portNativeVlan', 'sviAddrs'],
     vlans: ['vlans', 'vlansCurrent', 'interfaces', 'sviAddrs', 'portModes', 'portL2L3', 'voiceOUI', 'voiceLocalSrc', 'scalars'],
     summary: ['vlans', 'interfaces', 'sviAddrs', 'scalars', 'poe'],
-    auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs'],
+    auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs', 'radiusServers', 'radiusStats', 'tacacsServers'],
     connected: ['macTable', 'interfaces', 'bridgePorts', 'dot1xHosts'],
     stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts'],
     routing: ['sviAddrs', 'interfaces', 'vlans', 'portL2L3', 'routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],
@@ -2842,7 +2842,7 @@
   //   { v, pill }                    -> coloured status pill
   //   { v, click:{open} }            -> row-opens-detail link cell
   //   { actions }                    -> port action buttons (via portActionsCell)
-  //   { vlanDelete } / { rowActions }-> module-specific action cells
+  //   { vlanDelete }                 -> VLAN delete cell
   //   { cellNode }                   -> a caller-built DOM node (buttons, etc.)
   // Value cells diff by their value; node-bearing cells (cellNode/actions/...)
   // carry an explicit `sig` string the caller sets to whatever determines their
@@ -2888,12 +2888,6 @@
       td.appendChild(c.cellNode);
       return td;
     }
-    if (c && c.rowActions) {
-      const td = el('td', 'port-actions');
-      td.addEventListener('click', (e) => e.stopPropagation());
-      if (s._aaaRowAction) s._aaaRowAction(td, c.rowActions);
-      return td;
-    }
     if (c && c.click) {
       const td = el('td', 'col-value');
       td.appendChild(el('span', 'port-link', c.v === undefined || c.v === null ? '' : c.v));
@@ -2922,7 +2916,7 @@
     if (typeof c !== 'object') return 't:' + c;
     // Cells carrying a live DOM node diff by a caller-supplied sig; without one
     // they rebuild every reconcile (safe default).
-    if (c.actions || c.cellNode || c.vlanDelete || c.rowActions || (c.node instanceof Node)) {
+    if (c.actions || c.cellNode || c.vlanDelete || (c.node instanceof Node)) {
       return 'n:' + (c.sig !== undefined ? c.sig : ('\u0000rand' + Math.random()));
     }
     const kind = c.pill ? 'p' : (c.click ? 'c' : 'v');
@@ -3172,10 +3166,11 @@
   // panelIsConverted lists the keys that use keyed tables for every table they
   // render; a converted panel is safe to reconcile without a full repaint.
   const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg']);   // filled in as each is converted
-  // A converted panel may still have unkeyed sections (auth's AAA servers). When
-  // a refresh changes a table those read, full-repaint instead of reconciling.
+  // A converted panel may still have sections built on a full paint only (auth's
+  // 802.1X editor). When a refresh changes a table those read, full-repaint
+  // instead of reconciling.
   const PANEL_FULL_REPAINT_TABLES = {
-    auth: ['radius', 'radiusServers', 'radiusStats', 'tacacs', 'tacacsServers', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode']
+    auth: ['radius', 'tacacs', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode']
     // (routing's scalar-driven status pills update in place during reconcile -
     // see paintRoutingPanel - so it does not need a forced full repaint.)
   };
@@ -3654,75 +3649,23 @@
     ['Out queue len', 'rlifPresentOutQLen', 'ifOutQLen']
   ];
 
-  // A generic read-only detail popout: a title, a list of [label, value] pairs,
-  // and optional named sub-sections each with their own pairs. Reused for
-  // per-host 802.1X counters and similar.
-  // Reusable edit popout with the same tabbed layout as the interface detail:
-  // a "Configuration" tab (filled by fillConfig(pane)) and, when fillCounters
-  // is provided, a "Counters" tab. Used so every table opens the SAME kind of
-  // popout on row-click. fillConfig / fillCounters receive the pane element to
-  // append into. Returns nothing; manages its own close.
-  function openEditPopout(s, title, fillConfig, fillCounters, opts) {
-    opts = opts || {};
-    const prev = document.querySelector('.port-detail-back');
-    if (prev) prev.remove();
-    const back = el('div', 'port-detail-back');
-    const pop = el('div', 'port-detail');
-    const close = () => back.remove();
-    back.addEventListener('click', (e) => { if (e.target === back) close(); });
-    const head = el('div', 'port-detail-head');
-    head.appendChild(el('h3', '', title));
-    const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
-    x.addEventListener('click', close); head.appendChild(x);
-    pop.appendChild(head);
-
-    const hasCounters = typeof fillCounters === 'function';
-    if (hasCounters) {
-      const tabs = el('div', 'pd-tabs');
-      const cfgBtn = el('button', 'pd-tab active', opts.configLabel || 'Configuration'); cfgBtn.type = 'button';
-      const ctrBtn = el('button', 'pd-tab', opts.countersLabel || 'Counters'); ctrBtn.type = 'button';
-      tabs.appendChild(cfgBtn); tabs.appendChild(ctrBtn); pop.appendChild(tabs);
-      const cfgPane = el('div', 'pd-pane');
-      const ctrPane = el('div', 'pd-pane'); ctrPane.style.display = 'none';
-      pop.appendChild(cfgPane); pop.appendChild(ctrPane);
-      const show = (cfg) => { cfgPane.style.display = cfg ? '' : 'none'; ctrPane.style.display = cfg ? 'none' : ''; cfgBtn.classList.toggle('active', cfg); ctrBtn.classList.toggle('active', !cfg); };
-      cfgBtn.addEventListener('click', () => show(true));
-      ctrBtn.addEventListener('click', () => show(false));
-      fillConfig(cfgPane, close);
-      fillCounters(ctrPane, close);
-    } else {
-      const pane = el('div', 'pd-pane');
-      pop.appendChild(pane);
-      fillConfig(pane, close);
-    }
-    back.appendChild(pop);
-    document.body.appendChild(back);
-  }
-
+  // A read-only detail pop-out: a title, a list of [label, value] pairs, and
+  // optional named sub-sections each with their own pairs (per-host 802.1X
+  // counters, a port channel without write access). The standard tabbed
+  // pop-out with one Details tab, so it closes with Esc like every other.
   function openDetailDialog(s, title, pairs, sections) {
-    const prev = document.querySelector('.port-detail-back');
-    if (prev) prev.remove();
-    const back = el('div', 'port-detail-back');
-    const pop = el('div', 'port-detail');
-    const close = () => back.remove();
-    back.addEventListener('click', (e) => { if (e.target === back) close(); });
-    const head = el('div', 'port-detail-head');
-    head.appendChild(el('h3', '', title));
-    const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
-    x.addEventListener('click', close); head.appendChild(x);
-    pop.appendChild(head);
     const grid = (ps) => {
       const dl = el('dl', 'port-detail-grid');
       for (const [k, v] of ps) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
       return dl;
     };
-    pop.appendChild(grid(pairs));
-    if (sections) for (const name in sections) {
-      pop.appendChild(el('div', 'port-detail-sub', name));
-      pop.appendChild(grid(sections[name]));
-    }
-    back.appendChild(pop);
-    document.body.appendChild(back);
+    openTabbedPopout(s, title, [{ label: 'Details', fill: (pane) => {
+      pane.appendChild(grid(pairs));
+      if (sections) for (const name in sections) {
+        pane.appendChild(el('div', 'port-detail-sub', name));
+        pane.appendChild(grid(sections[name]));
+      }
+    } }], []);
   }
 
   // A popout with any number of tabs. tabs: [{ label, fill(pane, close), onShow }].
@@ -3734,9 +3677,12 @@
     if (prev) prev.remove();
     const back = el('div', 'port-detail-back');
     const pop = el('div', 'port-detail');
-    const close = () => { for (const t of (popTimers || [])) clearInterval(t); back.remove(); };
+    // Esc closes it (A5). The listener goes with the pop-out however it closes,
+    // so a later Esc cannot close the next one opened.
+    const esc = (e) => { if (e.key === 'Escape') close(); };
+    const close = () => { for (const t of (popTimers || [])) clearInterval(t); back.remove(); document.removeEventListener('keydown', esc); };
     back.addEventListener('click', (e) => { if (e.target === back) close(); });
-    document.addEventListener('keydown', function esc(e) { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); } });
+    document.addEventListener('keydown', esc);
     const head = el('div', 'port-detail-head');
     head.appendChild(el('h3', '', title));
     const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
@@ -3966,7 +3912,7 @@
       form.appendChild(sec.sec);
       const { actions, apply } = applyActions('Add static MAC');
       const msg = el('div', 'port-detail-msg');
-      withConfirm(apply, (ev) => {
+      apply.addEventListener('click', (ev) => {
         clear(msg);
         const mac = (macIn.value || '').trim();
         if (!isValidMac(mac)) { msg.appendChild(el('div', 'sw-err', 'Enter a MAC like AA:BB:CC:DD:EE:FF.')); return; }
@@ -4264,7 +4210,7 @@
 
     const { actions, apply, msg } = applyActions('Apply');
     const voiceVid = () => parseInt((s.health && s.health.scalars && (s.health.scalars.vlanVoiceAdminVid || {}).value), 10);
-    withConfirm(apply, (ev) => {
+    apply.addEventListener('click', (ev) => {
       clear(msg);
       const newVoice = parseInt(voiceSel.value, 10);
       const newQos = parseInt(voiceQosSel.value, 10);
@@ -4992,7 +4938,7 @@
       form.appendChild(sec.sec);
       const { actions, apply } = applyActions('Save name');
       const msg = el('div', 'port-detail-msg');
-      withConfirm(apply, (ev) => {
+      apply.addEventListener('click', (ev) => {
         clear(msg);
         runButtonAction(ev.currentTarget, {
           failLabel: 'Rename VLAN',
@@ -5053,7 +4999,7 @@
       form.appendChild(sec.sec);
       const { actions, apply } = applyActions('Create VLAN');
       const msg = el('div', 'port-detail-msg');
-      withConfirm(apply, (ev) => {
+      apply.addEventListener('click', (ev) => {
         const id = parseInt(idIn.value, 10);
         clear(msg);
         if (!Number.isFinite(id) || id < 2 || id > 4094) { msg.appendChild(el('div', 'sw-err', 'Enter a VLAN id between 2 and 4094.')); return; }
@@ -5406,34 +5352,6 @@
   // 09-aaa.js: 802.1X global settings and AAA (RADIUS/TACACS+) servers.
   // =================================================================
 
-  // Open an inline editor directly under a table row (the AAA server edit).
-  // Returns the host <div> inside a full-width cell. Any existing inline editor
-  // is closed first.
-  function openRowEditor(tr, colspan) {
-    closeRowEditors(tr.closest('table'));
-    const editTr = el('tr', 'snmp-edit-row');
-    const td = el('td'); td.colSpan = colspan;
-    const host = el('div', 'snmp-edit-host');
-    td.appendChild(host); editTr.appendChild(td);
-    tr.insertAdjacentElement('afterend', editTr);
-    host.scrollIntoView({ block: 'nearest' });
-    return host;
-  }
-  function closeRowEditors(scope) {
-    const root = scope || document;
-    root.querySelectorAll('.snmp-edit-row').forEach((r) => r.remove());
-  }
-
-  // AAA server inventory (RADIUS + TACACS+) for the Authentication panel. Each
-  // server is one summary row with an expander revealing the deep detail:
-  // timeouts/retries/deadtime, shared-key status, and (RADIUS) the full RFC
-  // 4668 statistics. The shared key itself is write-only on the switch, so we
-  // show whether a key is set, not its value.
-  // AAA server inventory (RADIUS + TACACS+) for the Authentication panel,
-  // rendered as standard tables with column headers. Each server row is
-  // clickable to open a detail popout with the deep data (timeouts, deadtime,
-  // shared-key status, and the full RADIUS statistics). The shared key is
-  // write-only on the switch, so only whether one is set is ever shown.
   // Global 802.1X settings for the Sessions & authentication panel: port-based
   // auth enable, guest VLAN id/timeout, and the notification (trap) toggles -
   // all scalar read-write objects. Shown always; editable controls write via
@@ -5650,419 +5568,281 @@
           return refreshScalars(s, changedScalars).then(() => { setTimeout(() => repaintPanel(s, 'auth'), 1900); });
         }
       });
-    });
+    // Switching port-based authentication on or off changes access on every
+    // 802.1X port, so that one change asks for a second tap; the rest apply
+    // on the first (B8).
+    }, { when: () => (sysSel.value === 'on') !== isOn, confirmText: () => (sysSel.value === 'on' ? 'Enable 802.1X?' : 'Disable 802.1X?') });
     wrap.appendChild(actions); wrap.appendChild(msg);
     body.appendChild(wrap);
   }
 
-  function buildAaaServers(s, body, h, section, p) {
-    const dv2 = (cell) => (cell && (cell.display !== undefined && cell.display !== null && cell.display !== '')
-      ? cell.display : (cell && cell.value !== undefined ? cell.value : ''));
-    const RADIUS_USAGE = { 1: 'login', 2: '802.1X', 3: 'all', 4: 'wireless' };
-
-    // InetAddress columns arrive as raw bytes (hex). Decode to a readable IP.
-    const inetAddr = (cell) => {
-      let raw = (cell && cell.value !== undefined && cell.value !== null && cell.value !== '')
-        ? cell.value : dv2(cell);
-      if (raw === '' || raw === null || raw === undefined) return '';
-      let str = String(raw).replace(/\s*\(hex\)\s*$/i, '');
-      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(str) || str.indexOf(':') >= 0) return str;
-      const hex = str.replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '');
-      if (hex.length === 8) return [0, 2, 4, 6].map((i) => parseInt(hex.substr(i, 2), 16)).join('.');
-      if (hex.length === 32) return (hex.match(/.{4}/g) || []).join(':').replace(/\b0+(\w)/g, '$1');
-      return str;
-    };
-    const keyStatus = (useGlobalCell, keyCell) => {
-      if (/true|1|yes/i.test(String(dv2(useGlobalCell)))) return 'global default';
-      const k = dv2(keyCell);
-      const hex = String(k).replace(/[^0-9a-fA-F]/g, '');
-      return (k !== '' && k !== null && k !== undefined && !/^0+$/.test(hex)) ? 'set' : 'none';
-    };
-
-    const statsByAddr = new Map();
-    for (const r of (h.radiusStats || [])) {
-      const addr = inetAddr(r.radiusAuthServerAddress);
-      if (addr) statsByAddr.set(String(addr), r);
-    }
-
-    const radius = h.radiusServers || [];
-    const tacacs = h.tacacsServers || [];
-    // Show the section when there are servers, or when the operator can add one.
-    const editableEarly = (s._snmp && s._snmp.editable) || s._aaaEditable;
-    if (!radius.length && !tacacs.length && !editableEarly) return;
-
-    const sc = (k) => (h.scalars && h.scalars[k]);
-    const isOn = (k) => sc(k) && /true|enable|1|yes/i.test(String(sc(k).display || sc(k).value));
-
-    // A detail popout, reusing the generic key/value dialog look.
-    const openDetail = (title, pairs, statsRow) => {
-      const prev = document.querySelector('.port-detail-back');
-      if (prev) prev.remove();
-      const back = el('div', 'port-detail-back');
-      const pop = el('div', 'port-detail');
-      const close = () => back.remove();
-      back.addEventListener('click', (e) => { if (e.target === back) close(); });
-      const head = el('div', 'port-detail-head');
-      head.appendChild(el('h3', '', title));
-      const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
-      x.addEventListener('click', close); head.appendChild(x);
-      pop.appendChild(head);
-      const grid = (ps) => {
-        const dl = el('dl', 'port-detail-grid');
-        for (const [k, v] of ps) {
-          if (v === undefined || v === null || v === '') continue;
-          dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v)));
-        }
-        return dl;
-      };
-      pop.appendChild(grid(pairs));
-      if (statsRow) {
-        pop.appendChild(el('div', 'port-detail-sub', 'RADIUS statistics'));
-        pop.appendChild(grid([
-          ['Round-trip (ms)', dv2(statsRow.radiusAuthClientRoundTripTime)],
-          ['Access-Requests', dv2(statsRow.radiusAuthClientAccessRequests)],
-          ['Accepts', dv2(statsRow.radiusAuthClientAccessAccepts)],
-          ['Rejects', dv2(statsRow.radiusAuthClientAccessRejects)],
-          ['Challenges', dv2(statsRow.radiusAuthClientAccessChallenges)],
-          ['Retransmissions', dv2(statsRow.radiusAuthClientAccessRetransmissions)],
-          ['Timeouts', dv2(statsRow.radiusAuthClientTimeouts)],
-          ['Pending', dv2(statsRow.radiusAuthClientPendingRequests)],
-          ['Bad authenticators', dv2(statsRow.radiusAuthClientBadAuthenticators)],
-          ['Malformed responses', dv2(statsRow.radiusAuthClientMalformedAccessResponses)],
-          ['Unknown types', dv2(statsRow.radiusAuthClientUnknownTypes)],
-          ['Packets dropped', dv2(statsRow.radiusAuthClientPacketsDropped)]
-        ]));
-      }
-      back.appendChild(pop);
-      document.body.appendChild(back);
-    };
-
-    // --- write support: add / edit / delete ---
-    // Write access is "full DefaultSuper" credential. The SNMP config panel
-    // learns this when it loads; if it hasn't, fetch it here (once, cached) and
-    // repaint when it arrives, so the add/edit/delete controls appear without
-    // needing to visit the SNMP panel first.
-    let editable = (s._snmp && s._snmp.editable) || s._aaaEditable;
-    if (editable === undefined && !s._aaaAccessPending) {
+  // ---- AAA servers (RADIUS + TACACS+) ----
+  // Keyed tables (B2/B3) in the Sessions & authentication panel, reconciled in
+  // place like the rest of it. A row opens the server in the standard pop-out:
+  // its settings (an editor, or read-only without write access) and, for
+  // RADIUS, its RFC 4668 counters. The shared key is write-only on the switch,
+  // so only whether one is set is ever shown.
+  const RADIUS_USAGE = { 1: 'login', 2: '802.1X', 3: 'all', 4: 'wireless' };
+  const AAA_TABLES = ['radiusServers', 'radiusStats', 'tacacsServers'];
+  function aaaDv(cell) {
+    return (cell && (cell.display !== undefined && cell.display !== null && cell.display !== ''))
+      ? cell.display : (cell && cell.value !== undefined ? cell.value : '');
+  }
+  // InetAddress columns arrive as raw bytes (hex). Decode to a readable IP.
+  function aaaInetAddr(cell) {
+    const raw = (cell && cell.value !== undefined && cell.value !== null && cell.value !== '') ? cell.value : aaaDv(cell);
+    if (raw === '' || raw === null || raw === undefined) return '';
+    const str = String(raw).replace(/\s*\(hex\)\s*$/i, '');
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(str) || str.indexOf(':') >= 0) return str;
+    const hex = str.replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '');
+    if (hex.length === 8) return [0, 2, 4, 6].map((i) => parseInt(hex.substr(i, 2), 16)).join('.');
+    if (hex.length === 32) return (hex.match(/.{4}/g) || []).join(':').replace(/\b0+(\w)/g, '$1');
+    return str;
+  }
+  function aaaKeyStatus(useGlobalCell, keyCell) {
+    if (/true|1|yes/i.test(String(aaaDv(useGlobalCell)))) return 'global default';
+    const k = aaaDv(keyCell);
+    const hex = String(k).replace(/[^0-9a-fA-F]/g, '');
+    return (k !== '' && k !== null && k !== undefined && !/^0+$/.test(hex)) ? 'set' : 'none';
+  }
+  // The servers as the table, the pop-out and the writes read them.
+  function aaaModel(h) {
+    h = h || {};
+    const stats = new Map();
+    for (const r of (h.radiusStats || [])) { const a = aaaInetAddr(r.radiusAuthServerAddress); if (a) stats.set(String(a), r); }
+    const radius = (h.radiusServers || []).map((r) => {
+      const addr = aaaInetAddr(r.rlRadiusServerInetAddress);
+      return { addr, authPort: aaaDv(r.rlRadiusServerInetAuthPortNumber), acctPort: aaaDv(r.rlRadiusServerInetAcctPortNumber),
+        priority: aaaDv(r.rlRadiusServerInetPriority),
+        usage: RADIUS_USAGE[Number(aaaDv(r.rlRadiusServerInetUsage))] || aaaDv(r.rlRadiusServerInetUsage),
+        timeout: aaaDv(r.rlRadiusServerInetTimeout), retries: aaaDv(r.rlRadiusServerInetRetries),
+        deadtime: aaaDv(r.rlRadiusServerInetDeadtime), source: aaaDv(r.rlRadiusServerInetSource),
+        key: aaaKeyStatus(r.rlRadiusServerInetUseGlobalDefaultKey, r.rlRadiusServerInetKey),
+        useGlobalKey: /true|1|yes/i.test(String(aaaDv(r.rlRadiusServerInetUseGlobalDefaultKey))),
+        stats: stats.get(String(addr)) || null };
+    });
+    const tacacs = (h.tacacsServers || []).map((r) => {
+      const statusRaw = String(aaaDv(r.rlTacacsServerInetConnectionStatus));
+      return { addr: aaaInetAddr(r.rlTacacsServerInetAddress), port: aaaDv(r.rlTacacsServerInetPortNumber),
+        status: statusRaw, connected: /connected\(0\)|^0$|^connected$/i.test(statusRaw) && !/not/i.test(statusRaw),
+        type: aaaDv(r.rlTacacsServerInetConnectionType), priority: aaaDv(r.rlTacacsServerInetPriority),
+        timeout: aaaDv(r.rlTacacsServerInetTimeout),
+        key: aaaKeyStatus(r.rlTacacsServerInetUseGlobalDefaultKey, r.rlTacacsServerInetKey),
+        useGlobalKey: /true|1|yes/i.test(String(aaaDv(r.rlTacacsServerInetUseGlobalDefaultKey))) };
+    });
+    return { radius, tacacs };
+  }
+  // Whether this credential may change the switch's config (a full SNMP Admin).
+  // Learned from the SNMP configuration panel when it has loaded; otherwise
+  // asked once here, and the panel repainted when the answer arrives.
+  function aaaEditable(s) {
+    const known = (s._snmp && s._snmp.editable) || s._aaaEditable;
+    if (known === undefined && !s._aaaAccessPending && s.target) {
       s._aaaAccessPending = true;
       snmpCfgPost(s, 'access').then((access) => {
         s._aaaEditable = !!(access && access.ok && access.level === 'full');
         s._aaaAccessPending = false;
-        const p = s.panels.find((x) => x.key === 'auth');
-        if (p && p._body) paintPanelBody(s, p);
+        repaintPanel(s, 'auth');
       }).catch(() => { s._aaaAccessPending = false; });
     }
-    editable = editable || false;
-    // Pre-emptive cleartext-key note: is this session SNMPv3 authPriv?
+    return !!known;
+  }
+  // The session negotiates privacy, so a shared key typed here is encrypted.
+  function aaaIsV3Priv(s) {
     const t = s.target || {};
-    const isV3Priv = String(t.version) === '3' && t.v3 && String(t.v3.level) === 'authPriv';
+    return String(t.version) === '3' && !!t.v3 && String(t.v3.level) === 'authPriv';
+  }
+  function aaaRefresh(s) { return refreshTables(s, AAA_TABLES); }
+  // One add/edit/delete. A 409 carries the server's warning that the shared key
+  // would cross the network in cleartext; the caller asks before resending.
+  async function aaaWrite(s, url, payload) {
+    s.writeBusy = true;
+    try {
+      const { status, body } = await apiPost(url, Object.assign({ target: s.target }, payload));
+      if (status === 409 && body && body.warning) return { ok: false, warning: body.warning, error: body.warning };
+      if (body && body.ok) return { ok: true };
+      return { ok: false, error: (body && body.error) || 'the switch rejected it' };
+    } catch (e) {
+      return { ok: false, error: 'lost contact with the local server: ' + e.message };
+    } finally { s.writeBusy = false; }
+  }
 
-    // A field row helper for the add/edit forms.
-    const inp = (type, val, ph) => { const i = el('input'); i.type = type; if (val != null) i.value = val; if (ph) i.placeholder = ph; return i; };
-
-    // In-app confirm: renders a message with Confirm / Cancel buttons into a
-    // host element and resolves true/false. No browser dialog.
-    const inAppConfirm = (host, message, confirmLabel) => new Promise((resolve) => {
-      for (const old of Array.from(host.querySelectorAll('.inapp-confirm'))) old.remove();
-      const box = el('div', 'inapp-confirm');
-      box.appendChild(el('div', 'sw-warn', message));
-      const row = el('div', 'snmp-form-actions');
-      const yes = el('button', 'btn btn-small btn-danger', confirmLabel || 'Confirm'); yes.type = 'button';
-      const no = el('button', 'btn btn-small', 'Cancel'); no.type = 'button';
-      yes.addEventListener('click', () => { box.remove(); resolve(true); });
-      no.addEventListener('click', () => { box.remove(); resolve(false); });
-      row.appendChild(yes); row.appendChild(no); box.appendChild(row);
-      host.appendChild(box);
-    });
-
-    // Submit an add/edit. If the server replies that the key would be sent in
-    // cleartext (409 + warning), show an in-app confirm rather than a browser
-    // prompt, then resend with confirm=true.
-    const submit = (url, payload, host, onOk) => {
-      const go = (confirmed) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(Object.assign({ target: s.target, confirm: confirmed }, payload)) })
-        .then((r) => r.json().then((b) => ({ status: r.status, b })))
-        .then(({ status, b }) => {
-          if (status === 409 && b.warning && !confirmed) {
-            return inAppConfirm(host, b.warning + ' Send the key anyway?', 'Send anyway')
-              .then((ok) => { if (ok) return go(true); });
-          }
-          if (b && b.ok) { onOk(); markConfigDirty(s); refreshPanel(s, s.panels.find((p) => p.key === 'auth')); }
-          else { clearErr(host); host.appendChild(el('div', 'sw-err', (b && b.error) || 'Failed.')); }
-        })
-        .catch((e) => { clearErr(host); host.appendChild(el('div', 'sw-err', e.message)); });
-      s.writeBusy = true;
-      Promise.resolve(go(false)).finally(() => { s.writeBusy = false; });
-    };
-
-    // Delete with an in-app confirm rendered next to the row's action cell.
-    // The Delete button confirms itself (two-tap), so this deletes directly and
-    // refreshes just the auth panel.
-    const delDirect = (url, payload) => {
-      s.writeBusy = true;
-      fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(Object.assign({ target: s.target }, payload)) })
-        .then((r) => r.json()).then((b) => {
-          s.writeBusy = false;
-          if (b && b.ok) { markConfigDirty(s); refreshPanel(s, s.panels.find((p) => p.key === 'auth')); }
-          else { appLog('error', 'Delete failed', { message: (b && b.error) || 'unknown' }); toast('Delete failed: ' + ((b && b.error) || 'the switch rejected it'), 'error'); }
-        }).catch((e) => { s.writeBusy = false; appLog('error', 'Delete error', { message: e.message }); toast('Delete failed: ' + e.message, 'error'); });
-    };
-
-    // Build an add/edit form for RADIUS or TACACS.
-    const serverForm = (kind, host, existing) => {
-      const wrap = el('div', 'aaa-form');
-      if (!isV3Priv) wrap.appendChild(el('div', 'sw-warn',
-        'This session is not SNMPv3 with privacy — a shared key entered here is sent in cleartext.'));
-      const grid = el('div', 'snmp-form-grid');
-      const addr = inp('text', existing ? existing.address : '', 'e.g. 192.168.1.3');
-      if (existing) addr.disabled = true;   // address is the key; edit keeps it fixed
-      grid.appendChild(field('Server IP', addr));
-      let authPort, acctPort, port, usageSel;
-      if (kind === 'radius') {
-        authPort = inp('number', existing ? existing.authPort : 1812); grid.appendChild(field('Auth port', authPort));
-        acctPort = inp('number', existing ? existing.acctPort : 1813); grid.appendChild(field('Acct port', acctPort));
-        usageSel = el('select'); for (const u of ['all', 'login', '802.1x', 'wireless']) { const o = el('option', '', u); o.value = u; usageSel.appendChild(o); }
-        if (existing && existing.usage) usageSel.value = existing.usage;
-        grid.appendChild(field('Usage', usageSel));
-      } else {
-        port = inp('number', existing ? existing.port : 49); grid.appendChild(field('Port', port));
+  function buildAaaServers(s, body, h, section, p) {
+    const editable = aaaEditable(s);
+    const model = aaaModel(h);
+    const sc = (k) => (h.scalars && h.scalars[k]);
+    const isOn = (k) => sc(k) && /true|enable|1|yes/i.test(String(sc(k).display || sc(k).value));
+    if (!s._ktReconcile) p._aaaNotes = {};
+    // A section with its count note kept in a stable node, so a reconcile
+    // refreshes it in place (B2).
+    const head = (name, title, note, addLabel, onAdd) => {
+      if (!s._ktReconcile) {
+        section(title, ' ');
+        const st = body.lastChild;
+        const n = st && st.querySelector && st.querySelector('.st-note');
+        if (n) p._aaaNotes[name] = n;
+        if (addLabel && editable) body.appendChild(addControl(addLabel, onAdd));
       }
-      const prio = inp('number', existing ? existing.priority : 0); grid.appendChild(field('Priority', prio));
-      const timeout = inp('number', existing ? existing.timeout : '', 'optional'); grid.appendChild(field('Timeout (s)', timeout));
-      const globalKey = el('input'); globalKey.type = 'checkbox'; globalKey.checked = existing ? !!existing.useGlobalKey : false;
-      const gkWrap = el('label', 'snmp-field-check'); gkWrap.appendChild(globalKey); gkWrap.appendChild(el('span', '', 'Use global default key'));
-      const key = inp('password', '', existing ? '(unchanged)' : 'shared secret');
-      // Key field with a show/hide toggle so the operator can verify what they
-      // typed without re-entering it.
-      const keyField = el('div', 'snmp-field');
-      keyField.appendChild(el('label', '', 'Shared key'));
-      const keyRow = el('div', 'key-row');
-      const showToggle = el('button', 'btn btn-small key-show', 'Show'); showToggle.type = 'button';
-      showToggle.addEventListener('click', () => {
-        const shown = key.type === 'text';
-        key.type = shown ? 'password' : 'text';
-        showToggle.textContent = shown ? 'Show' : 'Hide';
+      const n = p._aaaNotes && p._aaaNotes[name];
+      if (n) n.textContent = note;
+    };
+    const delCell = (kind, url, payload, addr) => ({ cellNode: actGroup([actBtnConfirm('Delete', (e) => {
+      runButtonAction(e.currentTarget, {
+        failLabel: 'Delete ' + (kind === 'radius' ? 'RADIUS' : 'TACACS+') + ' server',
+        run: () => aaaWrite(s, url, payload),
+        ok: (r) => r && r.ok,
+        error: (r) => (r && r.error) || 'the switch rejected it',
+        onApplied: () => markConfigDirty(s),
+        settle: () => aaaRefresh(s)
       });
-      keyRow.appendChild(key); keyRow.appendChild(showToggle);
-      keyField.appendChild(keyRow);
-      const syncKey = () => { keyField.style.display = globalKey.checked ? 'none' : ''; };
-      globalKey.addEventListener('change', syncKey); syncKey();
-      grid.appendChild(gkWrap);
-      grid.appendChild(keyField);
-      wrap.appendChild(grid);
+    }, 'danger', 'Delete server ' + addr)]), sig: 'del' });
 
-      const cancel = el('button', 'btn btn-small', 'Cancel'); cancel.type = 'button';
-      cancel.addEventListener('click', () => wrap.remove());
-      const { actions, apply: save } = applyActions(existing ? 'Save' : 'Add', { extra: [cancel] });
-      save.addEventListener('click', () => {
-        const a = (addr.value || '').trim();
-        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(a)) { clearErr(wrap); wrap.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
-        const common = { address: a, edit: !!existing, priority: parseInt(prio.value, 10),
-          timeout: timeout.value === '' ? undefined : parseInt(timeout.value, 10),
-          useGlobalKey: globalKey.checked, key: globalKey.checked ? undefined : (key.value || undefined) };
-        if (kind === 'radius') {
-          submit('/api/aaa/radius', Object.assign(common, {
-            authPort: parseInt(authPort.value, 10) || 1812, acctPort: parseInt(acctPort.value, 10) || 1813,
-            usage: usageSel.value }), wrap, () => wrap.remove());
-        } else {
-          submit('/api/aaa/tacacs', Object.assign(common, { port: parseInt(port.value, 10) || 49 }), wrap, () => wrap.remove());
-        }
-      });
-      wrap.appendChild(actions);
-      host.appendChild(wrap);
-    };
-    const clearErr = (node) => { for (const e of Array.from(node.querySelectorAll('.sw-err'))) e.remove(); };
-
-    // Remove any open inline AAA editor/add-form/confirm anywhere in the panel,
-    // so only one is ever shown.
-    const closeAaaEditors = () => {
-      for (const n of Array.from(body.querySelectorAll('.aaa-inline-row'))) n.remove();
-      for (const n of Array.from(body.querySelectorAll('.aaa-form'))) n.remove();
-      for (const n of Array.from(body.querySelectorAll('.inapp-confirm'))) n.remove();
-      // Mark any in-place editing rows as no longer editing (a repaint, if one
-      // follows, rebuilds them clean).
-      for (const tr of Array.from(body.querySelectorAll('tr.aaa-editing'))) {
-        tr._editing = false; tr.classList.remove('aaa-editing');
-      }
-    };
-    s._aaaCloseEditors = closeAaaEditors;
-
-
-    // Build an edit form into a row-editor host (the proven SNMP-groups pattern:
-    // openRowEditor inserts a <tr> after the row and returns a div to fill).
-    // Edit form rendered into a row-editor host (openRowEditor inserts a <tr>
-    // after the row and returns a div to fill).
-    const editForm = (kind, host, cur, tr, onCancel) => {
-      const form = el('div', 'snmp-form');
-      form.appendChild(el('h5', '', 'Edit ' + (kind === 'radius' ? 'RADIUS' : 'TACACS+') + ' server ' + cur.address));
-      if (!isV3Priv) form.appendChild(el('div', 'sw-warn',
-        'This session is not SNMPv3 with privacy — a shared key entered here is sent in cleartext.'));
-      const grid = el('div', 'snmp-form-grid');
-      // A number input rejects a value it can't parse (e.g. "1,812" or
-      // "1812 (auth)"), silently showing empty - so pull the numeric part out
-      // of whatever the display string is before assigning it.
-      const num = (v) => {
-        const i = el('input'); i.type = 'number';
-        if (v != null && v !== '') {
-          const m = String(v).replace(/,/g, '').match(/-?\d+(\.\d+)?/);
-          if (m) i.value = m[0];
-        }
-        return i;
-      };
-      let authPort, acctPort, port, usageSel;
-      if (kind === 'radius') {
-        authPort = num(cur.authPort); grid.appendChild(field('Auth port', authPort));
-        acctPort = num(cur.acctPort); grid.appendChild(field('Acct port', acctPort));
-        usageSel = el('select'); for (const u of ['all', 'login', '802.1X', 'wireless']) { const o = el('option', '', u); o.value = u; usageSel.appendChild(o); }
-        // Pre-select the current usage, matching case-insensitively so "802.1X"
-        // from the switch lines up with the option regardless of letter case.
-        if (cur.usage) {
-          const want = String(cur.usage).toLowerCase();
-          for (const o of usageSel.options) { if (o.value.toLowerCase() === want) { usageSel.value = o.value; break; } }
-        }
-        grid.appendChild(field('Usage', usageSel));
-      } else {
-        port = num(cur.port); grid.appendChild(field('Port', port));
-      }
-      const prio = num(cur.priority); grid.appendChild(field('Priority', prio));
-      const timeout = num(cur.timeout); grid.appendChild(field('Timeout (s)', timeout));
-      const gk = el('input'); gk.type = 'checkbox'; gk.checked = !!cur.useGlobalKey;
-      const gkWrap = el('label', 'snmp-field-check'); gkWrap.appendChild(gk); gkWrap.appendChild(el('span', '', 'Use global default key'));
-      const key = el('input'); key.type = 'password'; key.placeholder = '(unchanged)';
-      const keyField = el('div', 'snmp-field'); keyField.appendChild(el('label', '', 'Shared key'));
-      const keyRow = el('div', 'key-row');
-      const showBtn = el('button', 'btn btn-small', 'Show'); showBtn.type = 'button';
-      showBtn.addEventListener('click', () => { const sh = key.type === 'text'; key.type = sh ? 'password' : 'text'; showBtn.textContent = sh ? 'Show' : 'Hide'; });
-      keyRow.appendChild(key); keyRow.appendChild(showBtn); keyField.appendChild(keyRow);
-      const syncKey = () => { keyField.style.display = gk.checked ? 'none' : ''; };
-      gk.addEventListener('change', syncKey); syncKey();
-      grid.appendChild(gkWrap); grid.appendChild(keyField);
-      form.appendChild(grid);
-      const cancel = el('button', 'btn btn-small secondary', 'Cancel'); cancel.type = 'button';
-      cancel.addEventListener('click', () => { if (onCancel) onCancel(); else if (tr) closeRowEditors(tr.closest('table')); });
-      const { actions, apply: save } = applyActions('Save', { extra: [cancel] });
-      save.addEventListener('click', () => {
-        const common = { address: cur.address, edit: true, priority: parseInt(prio.value, 10),
-          timeout: timeout.value === '' ? undefined : parseInt(timeout.value, 10),
-          useGlobalKey: gk.checked, key: gk.checked ? undefined : (key.value || undefined) };
-        if (kind === 'radius') submit('/api/aaa/radius', Object.assign(common, {
-          authPort: parseInt(authPort.value, 10) || 1812, acctPort: parseInt(acctPort.value, 10) || 1813, usage: usageSel.value }), host, () => {});
-        else submit('/api/aaa/tacacs', Object.assign(common, { port: parseInt(port.value, 10) || 49 }), host, () => {});
-      });
-      form.appendChild(actions);
-      host.appendChild(form);
-    };
-
-    // Edit/Delete buttons for a row, using the row-editor host (the detail popout
-    // stays available via the clickable address cell).
-    const rowActionsCell = (kind, addr, extra) => {
-      const btns = [];
-      // Editing is via row-click (opens the edit popout); the row action is
-      // delete only, unless a caller explicitly wants the inline Edit too.
-      if (!extra.deleteOnly) btns.push(actBtn('Edit', (e) => { const tr = e.target.closest('tr');
-        editForm(kind, openRowEditor(tr, tr.children.length), Object.assign({ address: addr }, extra.cur), tr); }, '', 'Edit this server'));
-      btns.push(actBtnConfirm('Delete', (e) => { const tr = e.target.closest('tr');
-        delDirect(extra.delUrl, extra.delPayload); }, 'danger', 'Delete this server'));
-      return actGroup(btns);
-    };
-    // Read-only key/value grid for a server popout when the session can't edit.
-    const aaaReadonly = (pairs) => {
-      const dl = el('dl', 'port-detail-grid');
-      for (const [k, v] of pairs) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
-      return dl;
-    };
-    // RADIUS live-stats grid (RFC 4668 counters) for the Counters tab.
-    const radiusStatsGrid = (stats) => {
-      const wrap = el('div');
-      wrap.appendChild(el('div', 'port-detail-sub', 'RADIUS statistics'));
-      const dl = el('dl', 'port-detail-grid');
-      for (const [k, v] of Object.entries(stats || {})) {
-        if (k === 'index') continue;
-        const val = (v && typeof v === 'object') ? (v.display !== undefined ? v.display : v.value) : v;
-        if (val === undefined || val === null || val === '') continue;
-        dl.appendChild(el('dt', '', k.replace(/^radiusAuthClient/, '').replace(/([A-Z])/g, ' $1').trim())); dl.appendChild(el('dd', '', String(val)));
-      }
-      wrap.appendChild(dl);
-      return wrap;
-    };
-
-    if (radius.length || editable) {
-      section('RADIUS servers', radius.length + (isOn('rlAAARadiusEnabled') ? ' \u00b7 enabled' : ' \u00b7 disabled'));
-      if (radius.length) mountInto(body, s, p, 'radius',
+    // Shown when there are servers, or when the operator can add one.
+    if (model.radius.length || editable) {
+      head('radius', 'RADIUS servers', model.radius.length + (isOn('rlAAARadiusEnabled') ? ' \u00b7 enabled' : ' \u00b7 disabled'),
+        'Add RADIUS server', () => openAaaServer(s, 'radius', null));
+      if (model.radius.length) mountInto(body, s, p, 'radius',
         ['Address', 'Auth port', 'Acct port', 'Priority', 'Usage', 'Timeout', 'Retries', 'Key'].concat(editable ? [''] : []),
-        radius.map((r) => {
-          const addr = inetAddr(r.rlRadiusServerInetAddress);
-          const authPort = dv2(r.rlRadiusServerInetAuthPortNumber);
-          const acctPort = dv2(r.rlRadiusServerInetAcctPortNumber);
-          const usage = RADIUS_USAGE[Number(dv2(r.rlRadiusServerInetUsage))] || dv2(r.rlRadiusServerInetUsage);
-          const key = keyStatus(r.rlRadiusServerInetUseGlobalDefaultKey, r.rlRadiusServerInetKey);
-          const stats = statsByAddr.get(String(addr));
-          const cur = { address: addr, authPort, acctPort, priority: dv2(r.rlRadiusServerInetPriority), usage,
-            timeout: dv2(r.rlRadiusServerInetTimeout),
-            useGlobalKey: /true|1|yes/i.test(String(dv2(r.rlRadiusServerInetUseGlobalDefaultKey))) };
-          // Row-click opens the standard edit popout: Config tab = the edit form
-          // (when editable, else a read-only view), Counters tab = RADIUS stats.
-          const openIt = () => openEditPopout(s, 'RADIUS \u00b7 ' + addr,
-            (pane, close) => { if (editable) editForm('radius', pane, cur, null, close); else pane.appendChild(aaaReadonly([
-              ['Address', addr], ['Auth port', authPort], ['Acct port', acctPort],
-              ['Priority', dv2(r.rlRadiusServerInetPriority)], ['Usage', usage],
-              ['Timeout (s)', dv2(r.rlRadiusServerInetTimeout)], ['Retries', dv2(r.rlRadiusServerInetRetries)],
-              ['Deadtime (min)', dv2(r.rlRadiusServerInetDeadtime)], ['Source', dv2(r.rlRadiusServerInetSource)],
-              ['Shared key', key]])); },
-            stats ? (pane) => pane.appendChild(radiusStatsGrid(stats)) : null);
-          const row = [
-            { click: { open: openIt }, v: addr },
-            { v: authPort }, { v: acctPort }, { v: dv2(r.rlRadiusServerInetPriority) }, { v: usage },
-            { v: dv2(r.rlRadiusServerInetTimeout) }, { v: dv2(r.rlRadiusServerInetRetries) }, { v: key }
-          ];
-          if (editable) row.push({ cellNode: rowActionsCell('radius', addr, { cur, deleteOnly: true,
-            delUrl: '/api/aaa/radius/delete', delPayload: { address: addr, authPort, acctPort } }), sig: 'ra' });
-          return { key: 'radius:' + addr, cells: row };
-        }));
-      if (editable) {
-        body.appendChild(addControl('Add RADIUS server', (host) => {
-          const open = host.querySelector('.aaa-form'); if (s._aaaCloseEditors) s._aaaCloseEditors();
-          if (!open) serverForm('radius', host, null); else host.querySelector('.aaa-form').remove();
-        }));
-      }
+        model.radius.map((r) => ({ key: 'radius:' + r.addr, cells: [
+          { v: r.addr, click: { open: () => openAaaServer(s, 'radius', r.addr) } },
+          { v: r.authPort }, { v: r.acctPort }, { v: r.priority }, { v: r.usage }, { v: r.timeout }, { v: r.retries }, { v: r.key }]
+          .concat(editable ? [delCell('radius', '/api/aaa/radius/delete', { address: r.addr, authPort: r.authPort, acctPort: r.acctPort }, r.addr)] : []) })));
+      else if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'No RADIUS servers configured.'));
     }
-
-    if (tacacs.length || editable) {
-      section('TACACS+ servers', tacacs.length + (isOn('rlAAATacacsEnabled') ? ' \u00b7 enabled' : ' \u00b7 disabled'));
-      if (tacacs.length) mountInto(body, s, p, 'tacacs',
+    if (model.tacacs.length || editable) {
+      head('tacacs', 'TACACS+ servers', model.tacacs.length + (isOn('rlAAATacacsEnabled') ? ' \u00b7 enabled' : ' \u00b7 disabled'),
+        'Add TACACS+ server', () => openAaaServer(s, 'tacacs', null));
+      if (model.tacacs.length) mountInto(body, s, p, 'tacacs',
         ['Address', 'Port', 'State', 'Priority', 'Timeout', 'Key'].concat(editable ? [''] : []),
-        tacacs.map((r) => {
-          const addr = inetAddr(r.rlTacacsServerInetAddress);
-          const port = dv2(r.rlTacacsServerInetPortNumber);
-          const statusRaw = String(dv2(r.rlTacacsServerInetConnectionStatus));
-          const connected = /connected\(0\)|^0$|^connected$/i.test(statusRaw) && !/not/i.test(statusRaw);
-          const key = keyStatus(r.rlTacacsServerInetUseGlobalDefaultKey, r.rlTacacsServerInetKey);
-          const cur = { address: addr, port, priority: dv2(r.rlTacacsServerInetPriority), timeout: dv2(r.rlTacacsServerInetTimeout),
-            useGlobalKey: /true|1|yes/i.test(String(dv2(r.rlTacacsServerInetUseGlobalDefaultKey))) };
-          const openIt = () => openEditPopout(s, 'TACACS+ \u00b7 ' + addr,
-            (pane, close) => { if (editable) editForm('tacacs', pane, cur, null, close); else pane.appendChild(aaaReadonly([
-              ['Address', addr], ['Port', port], ['Connection', dv2(r.rlTacacsServerInetConnectionStatus)],
-              ['Type', dv2(r.rlTacacsServerInetConnectionType)], ['Priority', dv2(r.rlTacacsServerInetPriority)],
-              ['Timeout (s)', dv2(r.rlTacacsServerInetTimeout)], ['Shared key', key]])); },
-            null);
-          const row = [
-            { click: { open: openIt }, v: addr },
-            { v: port }, { pill: true, v: connected ? 'connected' : 'not connected' },
-            { v: dv2(r.rlTacacsServerInetPriority) }, { v: dv2(r.rlTacacsServerInetTimeout) }, { v: key }
-          ];
-          if (editable) row.push({ cellNode: rowActionsCell('tacacs', addr, { cur, deleteOnly: true,
-            delUrl: '/api/aaa/tacacs/delete', delPayload: { address: addr } }), sig: 'ta' });
-          return { key: 'tacacs:' + addr, cells: row };
-        }));
-      if (editable) {
-        body.appendChild(addControl('Add TACACS+ server', (host) => {
-          const open = host.querySelector('.aaa-form'); if (s._aaaCloseEditors) s._aaaCloseEditors();
-          if (!open) serverForm('tacacs', host, null); else host.querySelector('.aaa-form').remove();
-        }));
-      }
+        model.tacacs.map((r) => ({ key: 'tacacs:' + r.addr, cells: [
+          { v: r.addr, click: { open: () => openAaaServer(s, 'tacacs', r.addr) } },
+          { v: r.port }, { pill: true, v: r.connected ? 'connected' : 'not connected' },
+          { v: r.priority }, { v: r.timeout }, { v: r.key }]
+          .concat(editable ? [delCell('tacacs', '/api/aaa/tacacs/delete', { address: r.addr }, r.addr)] : []) })));
+      else if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'No TACACS+ servers configured.'));
     }
+  }
 
+  // Open a server (addr) or the add form (addr null) in the standard pop-out,
+  // read from the current tables so it always shows what the switch holds now.
+  function openAaaServer(s, kind, addr) {
+    const model = aaaModel(s.health);
+    const list = kind === 'radius' ? model.radius : model.tacacs;
+    const cur = addr ? list.find((x) => x.addr === addr) : null;
+    if (addr && !cur) return;
+    const label = kind === 'radius' ? 'RADIUS' : 'TACACS+';
+    const title = cur ? label + ' \u00b7 ' + cur.addr : 'Add ' + label + ' server';
+    const tabs = [];
+    if (aaaEditable(s)) tabs.push({ label: 'Server', fill: (pane, close) => aaaServerForm(s, kind, cur, pane, close) });
+    else {
+      tabs.push({ label: 'Server', fill: (pane) => {
+        const dl = el('dl', 'port-detail-grid');
+        const pairs = kind === 'radius'
+          ? [['Address', cur.addr], ['Auth port', cur.authPort], ['Acct port', cur.acctPort], ['Priority', cur.priority],
+            ['Usage', cur.usage], ['Timeout (s)', cur.timeout], ['Retries', cur.retries], ['Deadtime (min)', cur.deadtime],
+            ['Source', cur.source], ['Shared key', cur.key]]
+          : [['Address', cur.addr], ['Port', cur.port], ['Connection', cur.status], ['Type', cur.type],
+            ['Priority', cur.priority], ['Timeout (s)', cur.timeout], ['Shared key', cur.key]];
+        for (const [k, v] of pairs) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
+        pane.appendChild(dl);
+      } });
+    }
+    if (cur && cur.stats) {
+      tabs.push({ label: 'Counters', fill: (pane) => {
+        const dl = el('dl', 'port-detail-grid');
+        for (const [k, v] of Object.entries(cur.stats)) {
+          if (k === 'index') continue;
+          const val = (v && typeof v === 'object') ? (v.display !== undefined ? v.display : v.value) : v;
+          if (val === undefined || val === null || val === '') continue;
+          dl.appendChild(el('dt', '', k.replace(/^radiusAuthClient/, '').replace(/^radiusAuthServer/, 'Server ').replace(/([A-Z])/g, ' $1').trim()));
+          dl.appendChild(el('dd', '', String(val)));
+        }
+        pane.appendChild(dl);
+      } });
+    }
+    openTabbedPopout(s, title, tabs, []);
+  }
+
+  // The add/edit form (A5/B6/B8): one tap to save, except that a shared key
+  // which would travel in cleartext asks for a second tap first.
+  function aaaServerForm(s, kind, cur, pane, close) {
+    const form = el('div', 'snmp-form acl-form');
+    const v3Priv = aaaIsV3Priv(s);
+    // A number input rejects a value it can't parse ("1,812"), so keep only
+    // the numeric part of what the switch displays.
+    const num = (v, ph) => {
+      const i = el('input'); i.type = 'number'; if (ph) i.placeholder = ph;
+      const m = v != null && v !== '' ? String(v).replace(/,/g, '').match(/-?\d+(\.\d+)?/) : null;
+      if (m) i.value = m[0];
+      return i;
+    };
+    const sec = formSection('Server');
+    const addr = textInput(cur ? cur.addr : '', 'e.g. 192.168.1.3');
+    if (cur) addr.disabled = true;   // the address is the row's identity
+    sec.body.appendChild(field('Server IP', addr));
+    let authPort, acctPort, port, usageSel;
+    if (kind === 'radius') {
+      authPort = num(cur ? cur.authPort : 1812); sec.body.appendChild(field('Auth port', authPort));
+      acctPort = num(cur ? cur.acctPort : 1813); sec.body.appendChild(field('Acct port', acctPort));
+      const want = String((cur && cur.usage) || 'all').toLowerCase();
+      usageSel = selectInput(['all', 'login', '802.1X', 'wireless'].map((u) => ({ label: u, value: u })), '');
+      for (const o of usageSel.options) if (o.value.toLowerCase() === want) usageSel.value = o.value;
+      sec.body.appendChild(field('Usage', usageSel));
+    } else {
+      port = num(cur ? cur.port : 49); sec.body.appendChild(field('Port', port));
+    }
+    const prio = num(cur ? cur.priority : 0); sec.body.appendChild(field('Priority', prio));
+    const timeout = num(cur ? cur.timeout : '', 'optional'); sec.body.appendChild(field('Timeout (s)', timeout));
+    form.appendChild(sec.sec);
+
+    const keySec = formSection('Shared key');
+    if (!v3Priv) keySec.body.appendChild(el('div', 'sw-warn', 'This session is not SNMPv3 with privacy, so a shared key entered here is sent in cleartext.'));
+    const gk = el('input'); gk.type = 'checkbox'; gk.checked = !!(cur && cur.useGlobalKey);
+    const gkWrap = el('label', 'snmp-field-check'); gkWrap.appendChild(gk); gkWrap.appendChild(el('span', '', 'Use global default key'));
+    keySec.body.appendChild(gkWrap);
+    const key = el('input'); key.type = 'password'; key.placeholder = cur ? '(unchanged)' : 'shared secret';
+    const keyRow = el('div', 'key-row');
+    const show = el('button', 'btn btn-small', 'Show'); show.type = 'button';
+    show.addEventListener('click', () => { const shown = key.type === 'text'; key.type = shown ? 'password' : 'text'; show.textContent = shown ? 'Show' : 'Hide'; });
+    keyRow.appendChild(key); keyRow.appendChild(show);
+    const keyField = field('Key', keyRow);
+    keySec.body.appendChild(keyField);
+    const syncKey = () => { keyField.style.display = gk.checked ? 'none' : ''; };
+    gk.addEventListener('change', syncKey); syncKey();
+    form.appendChild(keySec.sec);
+
+    const keyTyped = () => !gk.checked && !!key.value;
+    let warned = false;   // the server said the key would go in cleartext
+    const { actions, apply, msg } = applyActions(cur ? 'Save' : 'Add server');
+    withConfirm(apply, (ev) => {
+      clear(msg);
+      const a = (addr.value || '').trim();
+      if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(a)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
+      const payload = { address: a, edit: !!cur, priority: parseInt(prio.value, 10),
+        timeout: timeout.value === '' ? undefined : parseInt(timeout.value, 10),
+        useGlobalKey: gk.checked, key: gk.checked ? undefined : (key.value || undefined),
+        confirm: warned || (keyTyped() && !v3Priv) };
+      if (kind === 'radius') Object.assign(payload, { authPort: parseInt(authPort.value, 10) || 1812, acctPort: parseInt(acctPort.value, 10) || 1813, usage: usageSel.value });
+      else payload.port = parseInt(port.value, 10) || 49;
+      const label = (cur ? 'Save ' : 'Add ') + (kind === 'radius' ? 'RADIUS' : 'TACACS+') + ' server';
+      runButtonAction(ev.currentTarget, {
+        failLabel: label, spinLabel: cur ? 'Saving\u2026' : 'Adding\u2026',
+        run: () => aaaWrite(s, '/api/aaa/' + kind, payload),
+        ok: (r) => r && r.ok,
+        error: (r) => {
+          if (r && r.warning) { warned = true; msg.appendChild(el('div', 'sw-warn', r.warning + ' Tap ' + apply.dataset.restLabel + ' again to send it anyway.')); return 'the key would be sent in cleartext'; }
+          const e = (r && r.error) || 'the switch rejected it';
+          msg.appendChild(el('div', 'sw-err', label + ' failed: ' + e));
+          return e;
+        },
+        onApplied: () => markConfigDirty(s),
+        settle: () => aaaRefresh(s).then(() => close())
+      });
+    }, { when: () => keyTyped() && !v3Priv && !warned, confirmText: 'Send key in cleartext?' });
+    apply.dataset.restLabel = cur ? 'Save' : 'Add server';
+    form.appendChild(actions); form.appendChild(msg);
+    pane.appendChild(form);
+    if (!cur) addr.focus();
   }
 
   // =================================================================
@@ -6303,7 +6083,7 @@
       const chIfxNum = parseInt(aggIdx, 10);
       const openIt = () => {
         if (!editable) { detail(); return; }
-        if (!Number.isFinite(chIfxNum)) { openEditPopout(s, 'Port channel ' + chName, (pane, close) => editChannel(c, agg, members, pane, close)); return; }
+        if (!Number.isFinite(chIfxNum)) { openTabbedPopout(s, 'Port channel ' + chName, [{ label: 'Membership', fill: (pane, close) => editChannel(c, agg, members, pane, close) }], []); return; }
         const chDetail = buildChannelDetail(s, h, chIfxNum, chName, { mode, memNames, memberKeyInfo });
         const membershipTab = { label: 'Membership', fill: (pane, close) => { editChannel(c, agg, members, pane, close); } };
         openPortDetail(s, chDetail, { title: 'Port channel ' + chName, leadingTabs: [membershipTab] });
@@ -6331,7 +6111,7 @@
             });
           }, adminUp ? 'danger' : '', (adminUp ? 'Administratively disable ' : 'Re-enable ') + chName));
         }
-        acts.push(actBtnConfirm('Clear', (e) => clearChannel(c, members), 'danger', 'Remove all members and unconfigure'));
+        if (members.length) acts.push(actBtnConfirm('Clear', (e) => clearChannel(e.currentTarget, members), 'danger', 'Remove all members from ' + chName));
         // sig captures what the action buttons depend on: the channel's admin
         // state (Shut/No-shut label) and whether it has members (Clear present).
         const chRow2 = (s.health && s.health.interfaces || []).find((x) => String(x.index) === aggIdx);
@@ -6343,24 +6123,12 @@
     });
     mountInto(body, s, p, 'channels', cols,
       rows.map((cells) => ({ key: cells._key, cells: cells })));
-    // Editors render into this host, placed immediately below the channel table.
-    // On reconcile the host already exists; reuse it rather than appending a
-    // second one (which would strand an open editor).
-    let chEditHost = s._ktReconcile ? body.querySelector('.ch-edit-host') : null;
-    if (!chEditHost) { chEditHost = el('div', 'ch-edit-host'); if (!s._ktReconcile) body.appendChild(chEditHost); }
-
-    // --- editors ---
-    function closeChEditors() { clear(chEditHost); }
-
-    function editChannel(c, agg, currentMembers, pane, popClose) {
+    // The Membership editor: a tab in the channel's pop-out (A5).
+    function editChannel(c, agg, currentMembers, host, popClose) {
       const aggIdx = String(c.index);
-      const aggKey = agg ? parseInt(dv2(agg.dot3adAggActorAdminKey), 10) : NaN;
-      // Render into the popout pane when given one; else the old inline host.
-      const inPopout = !!pane;
-      if (!inPopout) closeChEditors();
-      const host = pane || el('div', 'ch-editor aaa-form');
-      if (!inPopout) host.appendChild(el('h5', '', 'Edit port channel ' + (nameByIdx.get(aggIdx) || aggIdx)));
-      const grid = el('div', 'snmp-form-grid');
+      const form = el('div', 'snmp-form acl-form');
+      const modeSec = formSection('Mode');
+      const grid = modeSec.body;
       // Mode: static or LACP - the only two modes a port channel has here
       // (CLI "channel-group N mode on|auto"). There is no "off": a channel with
       // no members is simply empty, and the members' actor state is written as
@@ -6372,12 +6140,13 @@
       // wrote when members were added under it.
       const curStates = currentMembers.map((p) => String(portState.get(String(p)) || '').replace(/0x|\s|\(hex\)|"/gi, ''));
       modeSel.value = curStates.some((st) => st && !/^0*$/.test(st)) ? 'lacp' : 'static';
-      { const f = el('div', 'snmp-field'); f.appendChild(el('label', '', 'Mode')); f.appendChild(modeSel); grid.appendChild(f); }
-      host.appendChild(grid);
+      grid.appendChild(field('Mode', modeSel));
+      form.appendChild(modeSec.sec);
 
       // Members: a checkbox list of physical ports (those not already in a
       // different channel). Current members pre-checked.
-      host.appendChild(el('div', 'aaa-sub', 'Member ports'));
+      const memSec = formSection('Member ports');
+      memSec.body.classList.add('acl-stack');
       const memWrap = el('div', 'ch-members');
       const cur = new Set(currentMembers.map(String));
       const physPorts = (h.interfaces || []).filter((r) => {
@@ -6400,12 +6169,12 @@
         lab.appendChild(cb); lab.appendChild(el('span', '', dv(r.rlifPresentName) || pIdx));
         memWrap.appendChild(lab); checks.push(cb);
       }
-      host.appendChild(memWrap);
+      memSec.body.appendChild(memWrap);
+      form.appendChild(memSec.sec);
 
-      // Cancel is a muted button: green means "do this" (MODULE-STANDARD A2).
-      const cancel = el('button', 'tbl-act-btn', 'Cancel'); cancel.type = 'button';
-      cancel.addEventListener('click', () => { if (inPopout && popClose) popClose(); else closeChEditors(); });
-      const { actions, apply: save, msg } = applyActions('Save', { extra: [cancel] });
+      // Changing membership or mode re-forms a live link, so Save asks for a
+      // second tap (B8: the click is drastic).
+      const { actions, apply: save, msg } = applyActions('Save');
       withConfirm(save, (ev) => {
         clear(msg);
         const mode = modeSel.value;
@@ -6487,43 +6256,34 @@
           ok: (r) => r && r.ok,
           error: (r) => { msg.appendChild(el('div', 'sw-err', 'Change failed: ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
           onApplied: () => { markConfigDirty(s, modeSel); },
+          // LACP takes a few seconds to re-form the channel, so the spinner
+          // holds for the first read-back; a short-handed channel is read once
+          // more a little later.
           settle: () => {
             const expect = want.size;
-            const check = (attempt) => refreshLagTables(s).then((memCount) => {
-              if (memCount < expect && attempt < 2) setTimeout(() => check(attempt + 1), 5000);
+            return new Promise((res) => setTimeout(res, 4000)).then(() => refreshLagTables(s)).then((memCount) => {
+              if (memCount < expect) setTimeout(() => refreshLagTables(s), 5000);
             });
-            setTimeout(() => check(1), 4000);
-            return Promise.resolve();
           }
         });
       });
-      host.appendChild(actions); host.appendChild(msg);
-      if (!inPopout) { chEditHost.appendChild(host); chEditHost.scrollIntoView({ block: 'nearest' }); }
+      form.appendChild(actions); form.appendChild(msg);
+      host.appendChild(form);
     }
 
-    function clearChannel(c, members) {
-      closeChEditors();
-      const aggIdx = String(c.index);
-      const host = el('div', 'ch-editor aaa-form');
-      host.appendChild(el('div', 'sw-warn', 'Remove all members and unconfigure port channel ' + (nameByIdx.get(aggIdx) || aggIdx) + '?'));
-      const row = el('div', 'snmp-form-actions');
-      const yes = actBtn('Clear', async () => {
-        // Take every member out (leaveChannel: state + key in one SET). The
-        // creation-table flags are NotWritable, so membership is managed
-        // purely through the ports' actor key and state.
-        const steps = [];
-        for (const p of members) steps.push(...leaveChannel(p));
-        if (steps.length) {
-          const r = await setVb(steps);
-          if (!r.ok || r.b.error) { toast('Could not clear the channel: ' + (r.b.error || 'the switch rejected it'), 'error'); return; }
-          markConfigDirty(s);   // members removed -> running differs from startup
-        }
-        closeChEditors();
-        setTimeout(() => refreshLagTables(s), 2000);   // clearing is immediate; one light read
-      }, 'danger');
-      const no = actBtn('Cancel', closeChEditors);
-      row.appendChild(yes); row.appendChild(no); host.appendChild(row);
-      chEditHost.appendChild(host); chEditHost.scrollIntoView({ block: 'nearest' });
+    // Clear: take every member out (leaveChannel: state + key in one SET).
+    // The two-tap Delete-style button already confirmed it (B6).
+    function clearChannel(btn, members) {
+      const steps = [];
+      for (const pIdx of members) steps.push(...leaveChannel(pIdx));
+      runButtonAction(btn, {
+        failLabel: 'Clear port channel',
+        run: () => setVb(steps),
+        ok: (r) => r && r.ok && !(r.b && r.b.error),
+        error: (r) => (r && r.b && r.b.error) || 'the switch rejected it',
+        onApplied: () => markConfigDirty(s),
+        settle: () => new Promise((res) => setTimeout(res, 2000)).then(() => refreshLagTables(s))
+      });
     }
   }
 
@@ -6606,7 +6366,7 @@
           const pen = el('button', 'hero-edit-btn', '\u270E');
           pen.title = 'Edit name, location and contact';
           pen.type = 'button';
-          pen.addEventListener('click', (e) => { e.stopPropagation(); editSysIdentity(s, pen); });
+          pen.addEventListener('click', (e) => { e.stopPropagation(); editSysIdentity(s); });
           nameRow.appendChild(pen);
         }
         main.appendChild(nameRow);
@@ -7406,13 +7166,11 @@
               { v: dv(r.port) }, { v: dv(r.mac) }]), h.dot1xLocked, (r) => String(dv(r.port)) + '|' + String(dv(r.mac))));
         }
 
-        // --- AAA servers (RADIUS + TACACS+) --- not yet keyed; skipped on
-        // reconcile (a full repaint still renders them, and a change to their
-        // tables forces a full repaint via PANEL_FULL_REPAINT_TABLES).
-        if (!s._ktReconcile) {
-          buildDot1xGlobal(s, body, h, section);
-          buildAaaServers(s, body, h, section, p);
-        }
+        // --- 802.1X global settings (an editor: built on a full paint only;
+        // a change to the scalars it shows repaints the panel) and the AAA
+        // servers (keyed tables, reconciled in place) ---
+        if (!s._ktReconcile) buildDot1xGlobal(s, body, h, section);
+        buildAaaServers(s, body, h, section, p);
 
         if (!s._ktReconcile && !body.children.length) {
           body.appendChild(el('div', 'empty-state',
@@ -7885,69 +7643,64 @@
   const SYS_EDIT_OIDS = {
     name: '1.3.6.1.2.1.1.5.0', location: '1.3.6.1.2.1.1.6.0', contact: '1.3.6.1.2.1.1.4.0'
   };
-  function editSysIdentity(s, anchor) {
+  // Edit the system name, location and contact in the standard pop-out (A5):
+  // one tap to save (B8), the failure as the red line under the button.
+  function editSysIdentity(s) {
     if (!s.target) return;
     const h = s.health;
     const cur = (k) => {
       const v = h && h.scalars && h.scalars[k] ? h.scalars[k].display : '';
       return (v && v !== '(empty)') ? v : '';
     };
-    // Render a small inline form inside the hero's main column, below the
-    // name/details, so it sits in normal flow rather than becoming a stray
-    // flex item in the (wrapping) .hero row.
-    const heroMain = anchor && anchor.closest('.hero-main');
-    const host = heroMain || (anchor && anchor.closest('.hero'));
-    let form = document.getElementById('sysid-form');
-    if (form) form.remove();
-    form = el('div', 'snmp-form'); form.id = 'sysid-form'; form.style.marginTop = '10px';
-    form.appendChild(el('h5', '', 'Edit identity'));
-    const defs = [
-      ['name', 'System name', SYS_EDIT_OIDS.name, cur('sysName')],
-      ['location', 'Location', SYS_EDIT_OIDS.location, cur('sysLocation')],
-      ['contact', 'Contact', SYS_EDIT_OIDS.contact, cur('sysContact')]
-    ];
-    const grid = el('div', 'snmp-form-grid');
-    const inputs = {};
-    for (const [key, label, oid, value] of defs) {
-      const inp = textInput(value);
-      inputs[key] = { inp, oid, current: value, label };
-      grid.appendChild(field(label, inp));
-    }
-    form.appendChild(grid);
-    const msg = el('div'); form.appendChild(msg);
-    const actions = el('div', 'snmp-form-actions');
-    const save = el('button', 'btn btn-small', 'Save');
-    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
-    cancel.addEventListener('click', () => form.remove());
-    withConfirm(save, (ev) => {
-      const changes = Object.values(inputs).filter((f) => f.inp.value !== f.current)
-        .map((f) => ({ label: f.label, oid: f.oid, value: f.inp.value }));
-      if (!changes.length) { form.remove(); return; }
-      runButtonAction(ev.currentTarget, {
-        failLabel: 'Save identity', spinLabel: 'Saving\u2026',
-        run: async () => {
-          for (const ch of changes) {
+    openTabbedPopout(s, 'Switch identity', [{ label: 'Identity', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const sec = formSection('Identity');
+      sec.body.classList.add('acl-stack');
+      const defs = [
+        ['name', 'System name', SYS_EDIT_OIDS.name, cur('sysName')],
+        ['location', 'Location', SYS_EDIT_OIDS.location, cur('sysLocation')],
+        ['contact', 'Contact', SYS_EDIT_OIDS.contact, cur('sysContact')]
+      ];
+      const inputs = {};
+      for (const [key, label, oid, value] of defs) {
+        const inp = textInput(value);
+        inputs[key] = { inp, oid, current: value, label };
+        sec.body.appendChild(field(label, inp));
+      }
+      form.appendChild(sec.sec);
+      const { actions, apply, msg } = applyActions('Save');
+      apply.addEventListener('click', (ev) => {
+        clear(msg);
+        const changes = Object.values(inputs).filter((f) => f.inp.value !== f.current)
+          .map((f) => ({ label: f.label, oid: f.oid, value: f.inp.value }));
+        if (!changes.length) { close(); return; }
+        runButtonAction(ev.currentTarget, {
+          failLabel: 'Save identity', spinLabel: 'Saving\u2026',
+          run: async () => {
+            s.writeBusy = true;
             try {
-              const { body: j } = await apiPost('/api/snmp-config/status-set-apply', { target: s.target, cfg: { oid: ch.oid, value: ch.value } });
-              if (!j || !j.ok) return { ok: false, error: ch.label + ': ' + ((j && j.error) || 'failed') };
-              if (!j.applied.ok) { const d = (j.applied.log && j.applied.log[0] && j.applied.log[0].detail) || 'change failed'; return { ok: false, error: ch.label + ' could not be changed: ' + d }; }
-            } catch (e) { return { ok: false, error: 'Lost contact: ' + e.message }; }
+              for (const ch of changes) {
+                const { body: j } = await apiPost('/api/snmp-config/status-set-apply', { target: s.target, cfg: { oid: ch.oid, value: ch.value } });
+                if (!j || !j.ok) return { ok: false, error: ch.label + ': ' + ((j && j.error) || 'failed') };
+                if (!j.applied.ok) { const d = (j.applied.log && j.applied.log[0] && j.applied.log[0].detail) || 'change failed'; return { ok: false, error: ch.label + ' could not be changed: ' + d }; }
+              }
+              return { ok: true };
+            } catch (e) { return { ok: false, error: 'lost contact with the local server: ' + e.message }; }
+            finally { s.writeBusy = false; }
+          },
+          ok: (r) => r && r.ok,
+          error: (r) => { const e = (r && r.error) || 'failed'; msg.appendChild(el('div', 'sw-err', 'Save identity failed: ' + e)); return e; },
+          onApplied: () => markConfigDirty(s),
+          settle: () => {
+            const panel = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === 'summary');
+            return Promise.resolve(panel ? refreshPanel(s, panel) : startHealth(s)).then(() => close());
           }
-          return { ok: true };
-        },
-        ok: (r) => r && r.ok,
-        error: (r) => { msg.className = 'snmp-msg bad'; msg.textContent = (r && r.error) || 'failed'; return (r && r.error) || 'failed'; },
-        onApplied: () => markConfigDirty(s),
-        settle: () => {
-          const panel = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === 'summary');
-          if (panel) return Promise.resolve(refreshPanel(s, panel)); else { startHealth(s); return Promise.resolve(); }
-        }
+        });
       });
-    });
-    actions.appendChild(save); actions.appendChild(cancel);
-    form.appendChild(actions);
-    if (host) host.appendChild(form); else if (anchor) anchor.parentElement.appendChild(form);
-    inputs.name.inp.focus();
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+      inputs.name.inp.focus();
+    } }], []);
   }
 
   // =================================================================
@@ -8448,27 +8201,13 @@
 
     const go = el('button', 'btn btn-amber', 'Configure this switch');
     go.type = 'button'; go.style.width = 'auto';
-    const confirm = el('div', 'cfg-confirm');
-    confirm.style.display = 'none';
-
-    go.addEventListener('click', () => {
-      clear(confirm);
-      confirm.appendChild(el('span', 'card-sub',
-        'Add ' + cfg.ourAddress + ':' + ((cfg.receiver && cfg.receiver.port) || 514) +
-        ' to the syslog collectors on ' + s.host + '? This writes to the switch.'));
-      const yes = el('button', 'btn btn-danger', 'Yes, configure it');
-      yes.type = 'button'; yes.style.width = 'auto';
-      const no = el('button', 'btn', 'Cancel');
-      no.type = 'button'; no.style.width = 'auto';
-      no.addEventListener('click', () => { confirm.style.display = 'none'; go.style.display = ''; });
-      yes.addEventListener('click', () => configureSyslog(s, sev.value));
-      confirm.appendChild(yes); confirm.appendChild(no);
-      confirm.style.display = 'flex';
-      go.style.display = 'none';
+    // Two taps (B8): the first arms the button, the second writes.
+    withConfirm(go, () => configureSyslog(s, sev.value), {
+      danger: true,
+      confirmText: () => 'Tap again to add ' + cfg.ourAddress + ':' + ((cfg.receiver && cfg.receiver.port) || 514) + ' to ' + s.host
     });
     row.appendChild(go);
     box.appendChild(row);
-    box.appendChild(confirm);
     return box;
   }
 
@@ -9092,22 +8831,10 @@
       const go = el('button', 'btn btn-amber', 'Save running to startup');
       go.type = 'button'; go.style.width = 'auto';
       go.title = 'Copies running-config over startup-config on the switch';
-      const confirmRow = el('div', 'cfg-confirm');
-      confirmRow.style.display = 'none';
-      confirmRow.appendChild(el('span', 'card-sub',
-        'Overwrite the startup configuration on ' + s.host + ' with the running configuration?'));
-      const yes = el('button', 'btn btn-danger', 'Yes, overwrite startup');
-      yes.type = 'button'; yes.style.width = 'auto';
-      const no = el('button', 'btn', 'Cancel');
-      no.type = 'button'; no.style.width = 'auto';
-      confirmRow.appendChild(yes); confirmRow.appendChild(no);
-
-      go.addEventListener('click', () => { go.style.display = 'none'; confirmRow.style.display = 'flex'; });
-      no.addEventListener('click', () => { confirmRow.style.display = 'none'; go.style.display = ''; });
-      yes.addEventListener('click', () => syncConfigs(s));
+      // Two taps (B8): the first arms the button, the second overwrites startup.
+      withConfirm(go, () => syncConfigs(s), { danger: true, confirmText: 'Tap again to overwrite startup' });
 
       bar.appendChild(go);
-      bar.appendChild(confirmRow);
       host.appendChild(bar);
     }
     host.appendChild(diffPre(diff));
@@ -10146,7 +9873,7 @@
         onApplied: () => { markConfigDirty(s, [modeSel, ipIn, prefIn]); if (iface.vlanId != null) s._vlanFlash = iface.vlanId; },
         settle: () => refreshSvi(s).then(() => { if (done) done(); })
       });
-    });
+    }, { when: () => !!(cur || dhcpOn), confirmText: 'Tap again to change the address' });
     form.appendChild(actions); form.appendChild(msg);
     // Remove button when something is configured.
     if (cur || dhcpOn) {
@@ -11426,6 +11153,16 @@
           .concat(editable ? [r.key ? snmpDeleteCell(s, 'Delete recipient', 'recipient-delete-apply', { key: r.key }, ['recipients'], 'Delete this recipient') : { v: '' }] : []) })));
     }
 
+    // The credential this app connects with cannot be deleted (the switch
+    // refuses, and it would cut the app off), so its row shows the standard
+    // lock with the reason instead of offering Delete (B6).
+    const inUseCell = (row) => {
+      if (!row.inUse) return null;
+      const locked = el('span', 'card-sub', '\uD83D\uDD12 in use');
+      locked.title = 'This app connects to the switch with this credential, so it cannot be deleted here.';
+      return { cellNode: locked, sig: 'locked' };
+    };
+
     // ---- Communities ----
     // Traps and Status are not shown: Traps is only filled for the legacy
     // station-restricted community table (unused here), and a community is
@@ -11442,7 +11179,7 @@
           const key = 'comm:' + (c.key ? c.key.source + ':' + c.key.index : c.community);
           const first = (editable && c.key) ? { v: c.community, click: { open: () => openSnmpCommunityForm(s, key) } } : { v: c.community };
           return { key, cells: [first, { v: c.station || 'any' }, { v: c.access || '' }, { v: c.view || '\u2014' }]
-            .concat(editable ? [c.key ? snmpDeleteCell(s, 'Delete community', 'community-delete-apply', { key: c.key }, ['communities'], 'Delete this community') : { v: '' }] : []) };
+            .concat(editable ? [inUseCell(c) || (c.key ? snmpDeleteCell(s, 'Delete community', 'community-delete-apply', { key: c.key }, ['communities'], 'Delete this community') : { v: '' })] : []) };
         }));
     }
 
@@ -11473,7 +11210,7 @@
       else mountInto(body, s, p, 'snmp:usr', ['User', 'Auth', 'Privacy', 'Group', 'Status'].concat(act),
         users.map((u) => ({ key: 'usr:' + (u.key ? u.key.index : u.name), cells: [
           { v: u.name }, { v: u.auth }, { v: u.priv }, { v: u.group }, { v: u.status }]
-          .concat(editable ? [u.key ? snmpDeleteCell(s, 'Delete user', 'user-delete-apply', { key: u.key }, ['users'], 'Delete this user') : { v: '' }] : []) })));
+          .concat(editable ? [inUseCell(u) || (u.key ? snmpDeleteCell(s, 'Delete user', 'user-delete-apply', { key: u.key }, ['users'], 'Delete this user') : { v: '' })] : []) })));
     }
   }
 

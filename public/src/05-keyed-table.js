@@ -27,7 +27,7 @@
   //   { v, pill }                    -> coloured status pill
   //   { v, click:{open} }            -> row-opens-detail link cell
   //   { actions }                    -> port action buttons (via portActionsCell)
-  //   { vlanDelete } / { rowActions }-> module-specific action cells
+  //   { vlanDelete }                 -> VLAN delete cell
   //   { cellNode }                   -> a caller-built DOM node (buttons, etc.)
   // Value cells diff by their value; node-bearing cells (cellNode/actions/...)
   // carry an explicit `sig` string the caller sets to whatever determines their
@@ -73,12 +73,6 @@
       td.appendChild(c.cellNode);
       return td;
     }
-    if (c && c.rowActions) {
-      const td = el('td', 'port-actions');
-      td.addEventListener('click', (e) => e.stopPropagation());
-      if (s._aaaRowAction) s._aaaRowAction(td, c.rowActions);
-      return td;
-    }
     if (c && c.click) {
       const td = el('td', 'col-value');
       td.appendChild(el('span', 'port-link', c.v === undefined || c.v === null ? '' : c.v));
@@ -107,7 +101,7 @@
     if (typeof c !== 'object') return 't:' + c;
     // Cells carrying a live DOM node diff by a caller-supplied sig; without one
     // they rebuild every reconcile (safe default).
-    if (c.actions || c.cellNode || c.vlanDelete || c.rowActions || (c.node instanceof Node)) {
+    if (c.actions || c.cellNode || c.vlanDelete || (c.node instanceof Node)) {
       return 'n:' + (c.sig !== undefined ? c.sig : ('\u0000rand' + Math.random()));
     }
     const kind = c.pill ? 'p' : (c.click ? 'c' : 'v');

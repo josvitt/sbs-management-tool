@@ -236,7 +236,7 @@
       const chIfxNum = parseInt(aggIdx, 10);
       const openIt = () => {
         if (!editable) { detail(); return; }
-        if (!Number.isFinite(chIfxNum)) { openEditPopout(s, 'Port channel ' + chName, (pane, close) => editChannel(c, agg, members, pane, close)); return; }
+        if (!Number.isFinite(chIfxNum)) { openTabbedPopout(s, 'Port channel ' + chName, [{ label: 'Membership', fill: (pane, close) => editChannel(c, agg, members, pane, close) }], []); return; }
         const chDetail = buildChannelDetail(s, h, chIfxNum, chName, { mode, memNames, memberKeyInfo });
         const membershipTab = { label: 'Membership', fill: (pane, close) => { editChannel(c, agg, members, pane, close); } };
         openPortDetail(s, chDetail, { title: 'Port channel ' + chName, leadingTabs: [membershipTab] });
@@ -264,7 +264,7 @@
             });
           }, adminUp ? 'danger' : '', (adminUp ? 'Administratively disable ' : 'Re-enable ') + chName));
         }
-        acts.push(actBtnConfirm('Clear', (e) => clearChannel(c, members), 'danger', 'Remove all members and unconfigure'));
+        if (members.length) acts.push(actBtnConfirm('Clear', (e) => clearChannel(e.currentTarget, members), 'danger', 'Remove all members from ' + chName));
         // sig captures what the action buttons depend on: the channel's admin
         // state (Shut/No-shut label) and whether it has members (Clear present).
         const chRow2 = (s.health && s.health.interfaces || []).find((x) => String(x.index) === aggIdx);
@@ -276,24 +276,12 @@
     });
     mountInto(body, s, p, 'channels', cols,
       rows.map((cells) => ({ key: cells._key, cells: cells })));
-    // Editors render into this host, placed immediately below the channel table.
-    // On reconcile the host already exists; reuse it rather than appending a
-    // second one (which would strand an open editor).
-    let chEditHost = s._ktReconcile ? body.querySelector('.ch-edit-host') : null;
-    if (!chEditHost) { chEditHost = el('div', 'ch-edit-host'); if (!s._ktReconcile) body.appendChild(chEditHost); }
-
-    // --- editors ---
-    function closeChEditors() { clear(chEditHost); }
-
-    function editChannel(c, agg, currentMembers, pane, popClose) {
+    // The Membership editor: a tab in the channel's pop-out (A5).
+    function editChannel(c, agg, currentMembers, host, popClose) {
       const aggIdx = String(c.index);
-      const aggKey = agg ? parseInt(dv2(agg.dot3adAggActorAdminKey), 10) : NaN;
-      // Render into the popout pane when given one; else the old inline host.
-      const inPopout = !!pane;
-      if (!inPopout) closeChEditors();
-      const host = pane || el('div', 'ch-editor aaa-form');
-      if (!inPopout) host.appendChild(el('h5', '', 'Edit port channel ' + (nameByIdx.get(aggIdx) || aggIdx)));
-      const grid = el('div', 'snmp-form-grid');
+      const form = el('div', 'snmp-form acl-form');
+      const modeSec = formSection('Mode');
+      const grid = modeSec.body;
       // Mode: static or LACP - the only two modes a port channel has here
       // (CLI "channel-group N mode on|auto"). There is no "off": a channel with
       // no members is simply empty, and the members' actor state is written as
@@ -305,12 +293,13 @@
       // wrote when members were added under it.
       const curStates = currentMembers.map((p) => String(portState.get(String(p)) || '').replace(/0x|\s|\(hex\)|"/gi, ''));
       modeSel.value = curStates.some((st) => st && !/^0*$/.test(st)) ? 'lacp' : 'static';
-      { const f = el('div', 'snmp-field'); f.appendChild(el('label', '', 'Mode')); f.appendChild(modeSel); grid.appendChild(f); }
-      host.appendChild(grid);
+      grid.appendChild(field('Mode', modeSel));
+      form.appendChild(modeSec.sec);
 
       // Members: a checkbox list of physical ports (those not already in a
       // different channel). Current members pre-checked.
-      host.appendChild(el('div', 'aaa-sub', 'Member ports'));
+      const memSec = formSection('Member ports');
+      memSec.body.classList.add('acl-stack');
       const memWrap = el('div', 'ch-members');
       const cur = new Set(currentMembers.map(String));
       const physPorts = (h.interfaces || []).filter((r) => {
@@ -333,12 +322,12 @@
         lab.appendChild(cb); lab.appendChild(el('span', '', dv(r.rlifPresentName) || pIdx));
         memWrap.appendChild(lab); checks.push(cb);
       }
-      host.appendChild(memWrap);
+      memSec.body.appendChild(memWrap);
+      form.appendChild(memSec.sec);
 
-      // Cancel is a muted button: green means "do this" (MODULE-STANDARD A2).
-      const cancel = el('button', 'tbl-act-btn', 'Cancel'); cancel.type = 'button';
-      cancel.addEventListener('click', () => { if (inPopout && popClose) popClose(); else closeChEditors(); });
-      const { actions, apply: save, msg } = applyActions('Save', { extra: [cancel] });
+      // Changing membership or mode re-forms a live link, so Save asks for a
+      // second tap (B8: the click is drastic).
+      const { actions, apply: save, msg } = applyActions('Save');
       withConfirm(save, (ev) => {
         clear(msg);
         const mode = modeSel.value;
@@ -420,42 +409,33 @@
           ok: (r) => r && r.ok,
           error: (r) => { msg.appendChild(el('div', 'sw-err', 'Change failed: ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
           onApplied: () => { markConfigDirty(s, modeSel); },
+          // LACP takes a few seconds to re-form the channel, so the spinner
+          // holds for the first read-back; a short-handed channel is read once
+          // more a little later.
           settle: () => {
             const expect = want.size;
-            const check = (attempt) => refreshLagTables(s).then((memCount) => {
-              if (memCount < expect && attempt < 2) setTimeout(() => check(attempt + 1), 5000);
+            return new Promise((res) => setTimeout(res, 4000)).then(() => refreshLagTables(s)).then((memCount) => {
+              if (memCount < expect) setTimeout(() => refreshLagTables(s), 5000);
             });
-            setTimeout(() => check(1), 4000);
-            return Promise.resolve();
           }
         });
       });
-      host.appendChild(actions); host.appendChild(msg);
-      if (!inPopout) { chEditHost.appendChild(host); chEditHost.scrollIntoView({ block: 'nearest' }); }
+      form.appendChild(actions); form.appendChild(msg);
+      host.appendChild(form);
     }
 
-    function clearChannel(c, members) {
-      closeChEditors();
-      const aggIdx = String(c.index);
-      const host = el('div', 'ch-editor aaa-form');
-      host.appendChild(el('div', 'sw-warn', 'Remove all members and unconfigure port channel ' + (nameByIdx.get(aggIdx) || aggIdx) + '?'));
-      const row = el('div', 'snmp-form-actions');
-      const yes = actBtn('Clear', async () => {
-        // Take every member out (leaveChannel: state + key in one SET). The
-        // creation-table flags are NotWritable, so membership is managed
-        // purely through the ports' actor key and state.
-        const steps = [];
-        for (const p of members) steps.push(...leaveChannel(p));
-        if (steps.length) {
-          const r = await setVb(steps);
-          if (!r.ok || r.b.error) { toast('Could not clear the channel: ' + (r.b.error || 'the switch rejected it'), 'error'); return; }
-          markConfigDirty(s);   // members removed -> running differs from startup
-        }
-        closeChEditors();
-        setTimeout(() => refreshLagTables(s), 2000);   // clearing is immediate; one light read
-      }, 'danger');
-      const no = actBtn('Cancel', closeChEditors);
-      row.appendChild(yes); row.appendChild(no); host.appendChild(row);
-      chEditHost.appendChild(host); chEditHost.scrollIntoView({ block: 'nearest' });
+    // Clear: take every member out (leaveChannel: state + key in one SET).
+    // The two-tap Delete-style button already confirmed it (B6).
+    function clearChannel(btn, members) {
+      const steps = [];
+      for (const pIdx of members) steps.push(...leaveChannel(pIdx));
+      runButtonAction(btn, {
+        failLabel: 'Clear port channel',
+        run: () => setVb(steps),
+        ok: (r) => r && r.ok && !(r.b && r.b.error),
+        error: (r) => (r && r.b && r.b.error) || 'the switch rejected it',
+        onApplied: () => markConfigDirty(s),
+        settle: () => new Promise((res) => setTimeout(res, 2000)).then(() => refreshLagTables(s))
+      });
     }
   }

@@ -1152,7 +1152,7 @@
     interfaces: ['interfaces', 'poe', 'lagAgg', 'lagMembers', 'lagCreation', 'lagPortKey', 'bridgePorts', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode', 'vlans', 'vlansCurrent', 'portModes', 'portL2L3', 'portAccessVlan', 'portNativeVlan', 'sviAddrs'],
     vlans: ['vlans', 'vlansCurrent', 'interfaces', 'sviAddrs', 'portModes', 'portL2L3', 'voiceOUI', 'voiceLocalSrc', 'scalars'],
     summary: ['vlans', 'interfaces', 'sviAddrs', 'scalars', 'poe'],
-    auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs'],
+    auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs', 'radiusServers', 'radiusStats', 'tacacsServers'],
     connected: ['macTable', 'interfaces', 'bridgePorts', 'dot1xHosts'],
     stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts'],
     routing: ['sviAddrs', 'interfaces', 'vlans', 'portL2L3', 'routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],

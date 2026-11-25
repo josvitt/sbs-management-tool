@@ -496,27 +496,13 @@
 
     const go = el('button', 'btn btn-amber', 'Configure this switch');
     go.type = 'button'; go.style.width = 'auto';
-    const confirm = el('div', 'cfg-confirm');
-    confirm.style.display = 'none';
-
-    go.addEventListener('click', () => {
-      clear(confirm);
-      confirm.appendChild(el('span', 'card-sub',
-        'Add ' + cfg.ourAddress + ':' + ((cfg.receiver && cfg.receiver.port) || 514) +
-        ' to the syslog collectors on ' + s.host + '? This writes to the switch.'));
-      const yes = el('button', 'btn btn-danger', 'Yes, configure it');
-      yes.type = 'button'; yes.style.width = 'auto';
-      const no = el('button', 'btn', 'Cancel');
-      no.type = 'button'; no.style.width = 'auto';
-      no.addEventListener('click', () => { confirm.style.display = 'none'; go.style.display = ''; });
-      yes.addEventListener('click', () => configureSyslog(s, sev.value));
-      confirm.appendChild(yes); confirm.appendChild(no);
-      confirm.style.display = 'flex';
-      go.style.display = 'none';
+    // Two taps (B8): the first arms the button, the second writes.
+    withConfirm(go, () => configureSyslog(s, sev.value), {
+      danger: true,
+      confirmText: () => 'Tap again to add ' + cfg.ourAddress + ':' + ((cfg.receiver && cfg.receiver.port) || 514) + ' to ' + s.host
     });
     row.appendChild(go);
     box.appendChild(row);
-    box.appendChild(confirm);
     return box;
   }
 
