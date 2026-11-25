@@ -295,7 +295,7 @@
   // Edit one interface's address: the shared editor in its own popout, which
   // closes once a change has settled (the table then shows the result).
   function openIpv4Editor(s, iface, ifIndex) {
-    openTabbedPopout(s, iface.name + ' · IPv4', [{ label: 'IPv4', fill: (pane, close) => {
+    openTabbedPopout(s, iface.name + ' \u00b7 IPv4', [{ label: 'IPv4', fill: (pane, close) => {
       buildSviEditor(s, iface, ifIndex, pane, close);
     } }], []);
   }
@@ -323,12 +323,12 @@
         clear(formWrap);
         let ifx = c.ifIndex;
         if (ifx == null && c.iface.vlanId != null) {
-          formWrap.appendChild(el('div', 'card-sub', 'Reading IPv4 interface…'));
+          formWrap.appendChild(el('div', 'card-sub', 'Reading IPv4 interface\u2026'));
           ifx = await vlanSviIfIndex(s, c.iface.vlanId);
           if (mine !== token) return;
           clear(formWrap);
         }
-        if (ifx == null) { formWrap.appendChild(el('div', 'sw-err', 'Could not resolve this ' + c.iface.noun + '’s L3 ifIndex (needed to add an address).')); return; }
+        if (ifx == null) { formWrap.appendChild(el('div', 'sw-err', 'Could not resolve this ' + c.iface.noun + '\u2019s L3 ifIndex (needed to add an address).')); return; }
         // A VLAN read just now may turn out to carry the management address:
         // the shared editor then shows the lock instead of a form.
         if (isManagementIf(s, ifx)) { buildSviEditor(s, c.iface, ifx, formWrap, close); return; }
@@ -415,13 +415,13 @@
         const iface = l3Iface(s, a.ifIndex);
         const cells = [
           { v: iface.name, click: s.target ? { open: () => openIpv4Editor(s, iface, a.ifIndex) } : undefined },
-          { v: a.real ? a.ip : '—' },
+          { v: a.real ? a.ip : '\u2014' },
           { v: a.pref != null ? '/' + a.pref : '' },
           { v: a.owner === 2 ? (a.real ? 'dhcp' : 'dhcp (no lease)') : 'static' } ];
         if (s.target) {
           if (isManagementIf(s, a.ifIndex)) {
-            const locked = el('span', 'card-sub'); locked.textContent = '🔒 locked';
-            locked.title = 'This address carries this app’s connection to the switch; changing or removing it could cut off access, so it is locked.';
+            const locked = el('span', 'card-sub'); locked.textContent = '\uD83D\uDD12 locked';
+            locked.title = 'This address carries this app\u2019s connection to the switch; changing or removing it could cut off access, so it is locked.';
             cells.push({ cellNode: locked, sig: 'locked' });
           } else {
             const dhcp = a.owner === 2;
