@@ -8073,6 +8073,18 @@
       chip.addEventListener('click', () => view('diff'));
       chips.appendChild(chip);
     }
+    // Stored versions live on the server (config-history.js), so this chip is
+    // there before anything has been fetched in this browser.
+    {
+      const h = s.cfgHist;
+      const chip = el('button', 'cfg-chip' + (s.cfgView === 'history' ? ' active' : ''), 'History');
+      chip.type = 'button';
+      chip.title = 'Earlier running configurations of this switch, kept each time it changed';
+      if (h && h.versions) chip.appendChild(el('span', 'chip-meta', h.versions.length + ' stored'));
+      chip.addEventListener('click', () => { s.cfgView = 'history'; loadConfigHistory(s); });
+      chips.appendChild(chip);
+      any = true;
+    }
     if (any) {
       body.appendChild(chips);
     }
@@ -8100,6 +8112,7 @@
     }
 
     if (s.cfgView === 'diff' && s.cfgDiff) { renderDiff(out, s.cfgDiff, s); return; }
+    if (s.cfgView === 'history') { renderConfigHistory(out, s); return; }
 
     const doc = s.docs[s.cfgView];
     if (doc && doc.text) {
@@ -8121,6 +8134,109 @@
         'What you fetch stays here until you refetch. ' +
         'show tech-support is collected on its own page.'));
     }
+  }
+
+  // ---- config history (read-only: nothing here talks to the switch) ----
+
+  async function getJson(url) {
+    const r = await fetch(url);
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || body.error) throw new Error(body.error || ('HTTP ' + r.status));
+    return body;
+  }
+
+  async function loadConfigHistory(s) {
+    s.cfgHist = Object.assign(s.cfgHist || {}, { busy: 'Loading stored versions\u2026', error: null });
+    repaintConfig(s);
+    try {
+      const body = await getJson('/api/config/history?host=' + encodeURIComponent(s.host));
+      s.cfgHist.versions = body.versions || [];
+    } catch (e) {
+      s.cfgHist.error = 'Could not load the stored versions: ' + e.message;
+      appLog('error', 'Config history load failed', { host: s.host, message: e.message });
+    }
+    s.cfgHist.busy = null;
+    repaintConfig(s);
+  }
+
+  /** Open one stored version, as text ('view') or against a baseline ('compare'). */
+  async function showConfigVersion(s, v, mode) {
+    const h = s.cfgHist;
+    h.busy = 'Opening the version from ' + new Date(v.at).toLocaleString() + '\u2026';
+    h.error = null;
+    repaintConfig(s);
+    try {
+      const url = (id) => '/api/config/history/version?host=' + encodeURIComponent(s.host) + '&id=' + encodeURIComponent(id);
+      const picked = await getJson(url(v.id));
+      let against = null;
+      if (mode === 'compare') {
+        const running = s.docs && s.docs.running;
+        if (running && running.text) {
+          against = { label: 'the running configuration fetched at ' + running.at.toLocaleTimeString(), text: running.text };
+        } else {
+          const newest = h.versions[0];
+          const n = await getJson(url(newest.id));
+          against = { label: 'the newest stored version (' + new Date(newest.at).toLocaleString() + ')', text: n.text };
+        }
+      }
+      h.shown = { version: picked, mode, against, diff: against ? diffLines(picked.text, against.text) : null };
+    } catch (e) {
+      h.error = 'Could not open that version: ' + e.message;
+      appLog('error', 'Config history version failed', { host: s.host, id: v.id, message: e.message });
+    }
+    h.busy = null;
+    repaintConfig(s);
+  }
+
+  function renderConfigHistory(host, s) {
+    const h = s.cfgHist || {};
+    if (h.busy) { host.appendChild(el('div', 'card-sub', h.busy)); return; }
+    if (h.error) host.appendChild(el('div', 'panel-err', h.error));
+    const versions = h.versions || [];
+    if (!versions.length) {
+      if (!h.error) {
+        host.appendChild(el('div', 'card-sub',
+          'No versions are stored for ' + s.host + ' yet. A copy of the running configuration is ' +
+          'kept, encrypted, the first time the app pulls it and each time it changes after that ' +
+          '(the background check pulls it when the switch reports unsaved changes or a save, after ' +
+          'a reboot, and after a change made from this app; fetching it here counts too).'));
+      }
+      return;
+    }
+    const canCompareNewest = !!(s.docs && s.docs.running && s.docs.running.text);
+    host.appendChild(el('div', 'card-sub', versions.length + ' stored version(s), newest first. ' +
+      'Compare shows what changed from that version to ' +
+      (canCompareNewest ? 'the running configuration fetched here.' : 'the newest stored version.')));
+    const rows = versions.map((v, i) => [
+      new Date(v.at).toLocaleString() + (i === 0 ? ' (newest)' : ''),
+      v.hash,
+      actGroup([
+        actBtn('View', () => showConfigVersion(s, v, 'view'), null, 'Show this version'),
+        // The newest compared with itself says nothing unless running is held.
+        (i > 0 || canCompareNewest)
+          ? actBtn('Compare', () => showConfigVersion(s, v, 'compare'), null, 'What changed since this version')
+          : null
+      ])
+    ]);
+    host.appendChild(plainTable(s, ['Stored', 'Fingerprint', ''], rows));
+
+    const shown = h.shown;
+    if (!shown) return;
+    const when = new Date(shown.version.at).toLocaleString();
+    if (shown.mode === 'view') {
+      host.appendChild(el('div', 'card-sub', 'Stored version from ' + when + ' \u00b7 ' +
+        shown.version.text.split('\n').length.toLocaleString() + ' lines'));
+      const pre = document.createElement('pre');
+      pre.textContent = shown.version.text;
+      host.appendChild(pre);
+      return;
+    }
+    const changed = shown.diff.filter((d) => d.t !== ' ').length;
+    host.appendChild(el('div', 'card-sub', changed
+      ? changed + ' differing line(s) from the version of ' + when + ' to ' + shown.against.label +
+        '. "+" was added since; "\u2212" was there then and is gone now.'
+      : 'The version of ' + when + ' is identical to ' + shown.against.label + '.'));
+    if (changed) host.appendChild(diffPre(shown.diff));
   }
 
   function storeDoc(s, key, text, via) {
@@ -8172,6 +8288,7 @@
        * backwards.
        */
       s.cfgStale = false;   // fresh pull - the diff is current again
+      if (s.cfgHist) s.cfgHist.versions = null;   // the fetch may have stored a version
       s.cfgDiff = diffLines(s.docs.startup.text, s.docs.running.text);
       const changed = s.cfgDiff.filter((d) => d.t !== ' ').length;
       // Open on the comparison when there are differences, and also when

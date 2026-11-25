@@ -390,6 +390,25 @@ like the save was abandoned, and the operator cannot tell that it was not -
 the worst thing to be unsure about after pressing a button that overwrites
 a configuration. The close returns when there is an answer to show.
 
+### History
+
+The **History** chip lists earlier running configurations of the switch,
+newest first, with **View** and **Compare** on each. Compare shows what
+changed from that version to the running configuration fetched on this
+page, or to the newest stored version when none has been fetched.
+
+A version is kept each time the running configuration's text changes,
+starting with the first one the app sees. Copies come from the server's
+background change check, which pulls the running config when the switch's
+saved/unsaved flag flips, after a reboot and after a change made from this
+app, and from fetching the running config here. So the history costs no
+extra pull from the switch. A change made and saved entirely within one
+30-second probe gap can be missed (docs/SERVER-STANDARD.md §5). Each
+version is a file under `config-history/<switch>/`, encrypted with the same
+key and passphrase rule as the saved state (`state.enc`). The newest 50 per
+switch are kept; `SBS_CONFIG_HISTORY_KEEP` changes that and
+`SBS_CONFIG_HISTORY_DIR` moves the folder.
+
 ### How it works
 
 No MIB object returns configuration text, so the app drives `rlCopyTable`
@@ -409,8 +428,9 @@ Requirements and caveats, none of which the app can paper over:
   binding port 69 needs elevated privileges; `TFTP_PORT` can move it, though
   the switch will still try 69 unless it can be told otherwise.
 - **TFTP is unauthenticated and cleartext**, and a running-config contains
-  credentials and community strings. Received files are held in memory and
-  never written to disk - saving one is a deliberate act.
+  credentials and community strings. A received file reaches disk only
+  encrypted, as a config history version (below); saving a readable copy
+  is a deliberate act.
 
 The **Compare** diff uses a longest-common-subsequence pass rather than a
 line-by-line compare, so an inserted line does not report everything after

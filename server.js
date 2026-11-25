@@ -34,6 +34,7 @@ const syslog = require('./syslog');
 const vault = require('./vault');
 const history = require('./history');
 const events = require('./events');
+const configHistory = require('./config-history');
 const collector = require('./collector');
 const guard = require('./request-guard');
 const { buildSnmpSession } = require('./snmp-core');
@@ -103,7 +104,7 @@ function startCollector() {
       });
       return r && r.text;
     },
-    history, events, log
+    history, events, log, configHistory
   });
 }
 

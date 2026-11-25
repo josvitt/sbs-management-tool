@@ -7,6 +7,7 @@
 const log = require('../logger');
 const tftp = require('../tftp');
 const configFetch = require('../config-fetch');
+const configHistory = require('../config-history');
 const { copyFinishedWaiter, buildSnmpSession, redactTarget } = require('../snmp-core');
 
 module.exports = function register(app) {
@@ -21,6 +22,25 @@ module.exports = function register(app) {
 
   app.get('/api/tftp/status', (req, res) => res.json(tftp.status()));
 
+  // Stored running-config versions of one switch (config-history.js).
+  // Reads only: nothing here talks to the switch.
+  const hostOf = (req) => {
+    const h = req.query && req.query.host;
+    return (typeof h === 'string' && h && h.length <= 255) ? h : null;
+  };
+  app.get('/api/config/history', (req, res) => {
+    const host = hostOf(req);
+    if (!host) return res.status(400).json({ error: 'host is required.' });
+    res.json({ host, versions: configHistory.list(host) });
+  });
+  app.get('/api/config/history/version', (req, res) => {
+    const host = hostOf(req);
+    if (!host) return res.status(400).json({ error: 'host is required.' });
+    const v = configHistory.get(host, String(req.query.id || ''));
+    if (!v) return res.status(404).json({ error: 'No such version.' });
+    res.json(v);
+  });
+
   app.post('/api/config/fetch', async (req, res) => {
     const { target, kind, tftpPort } = req.body || {};
     if (!target || !target.host) {
@@ -34,6 +54,11 @@ module.exports = function register(app) {
         // privileged port is not possible (a non-root Linux run).
         tftpPort: tftpPort || Number(process.env.TFTP_PORT) || undefined
       });
+      // A running-config fetched by hand is a version too (config-history.js).
+      if ((kind || 'running') === 'running' && result && result.text != null) {
+        try { configHistory.record(target.host, result.text); }
+        catch (e) { log.warn('config', 'Could not store the config version', { host: target.host, message: e.message }); }
+      }
       res.json(result);
     } catch (e) {
       log.error('config', 'Configuration fetch failed', {

@@ -159,7 +159,7 @@ Event types the collector emits:
 | `reachability` | probe fails / recovers | `state: down\|up`, `error?` |
 | `reboot` | sysUpTime went backwards | `fromTicks`, `toTicks` |
 | `alert` | a `buildAlerts` alert appears / disappears | `state: raised\|cleared`, `severity`, `area`, `message` |
-| `config-change` | gated running-config content diff (see §5) | `hash`, `previousHash`, `bytes` |
+| `config-change` | gated running-config content diff (see §5) | `hash`, `previousHash`, `bytes`, `version` (the config-history id, when stored) |
 
 **Alert identity must be churn-free.** Alert messages carry live numbers
 ("CPU at 85%"), so raised/cleared is diffed on a **signature** that blanks the
@@ -205,6 +205,13 @@ the save-within-30s case would need either a genuine config-change trap (absent
 here) or distinguishing the app's own copy traps from an external
 running→startup save by the copy index — a possible future enhancement.
 
+**Every pull is also a history version.** `maybeConfigDiff` offers each pulled
+text, the first baseline included, to `config-history.js` (injected as
+`deps.configHistory`), and a hand fetch of the running-config through
+`/api/config/fetch` does the same. The history stores a version only when the
+text differs from its newest one, so it costs no extra pull: it rides on the
+gate above and inherits its blind spot.
+
 ## 6. Persistence helpers
 
 - **`rotate.writeFileAtomic(file, data, { mode })`** — the ONE way a
@@ -217,6 +224,15 @@ running→startup save by the copy index — a possible future enhancement.
   rolls to `<file>.1` … `<file>.<keep>` at `maxBytes`. Every on-disk store uses
   it; nothing re-implements rotation (§0.3). Appends are synchronous and
   best-effort — a logging store must never crash the app.
+- **`config-history.js`** — encrypted running-config versions, one file per
+  version under `config-history/<host>/<time>-<hash>.enc`
+  (`SBS_CONFIG_HISTORY_DIR` moves it), written through `writeFileAtomic` and
+  encrypted with the vault's own `encrypt`/`decrypt` (a config holds
+  community strings and password hashes). `record(host, text)` skips a text
+  equal to the newest version; only the newest `SBS_CONFIG_HISTORY_KEEP`
+  (default 50) are kept per switch. `get` accepts only ids it listed itself.
+  Read by `GET /api/config/history?host=` and
+  `GET /api/config/history/version?host=&id=`; nothing there talks to a switch.
 - **`logger.js`** — redacts credential fields (`SECRET_KEY`: passwords,
   passphrases, `community`, `key`, `authKey`/`privKey`, secrets, tokens) at
   **any depth** before a line is written, so a caller can log a whole target.

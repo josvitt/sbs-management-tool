@@ -194,4 +194,6 @@ function describe() {
   };
 }
 
-module.exports = { load, save, clear, describe };
+// encrypt/decrypt are shared with config-history.js so a saved running-config
+// is held under the same key, and the same passphrase rule, as the state.
+module.exports = { load, save, clear, describe, encrypt, decrypt };

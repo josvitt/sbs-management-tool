@@ -148,9 +148,18 @@ async function maybeConfigDiff(host, target, st, rebooted) {
     return;
   }
   if (text == null) return;
+  // Every pull is offered to the config history, the baseline included; it
+  // stores a version only when the text differs from its newest one.
+  let stored = null;
+  if (deps.configHistory) {
+    try { stored = deps.configHistory.record(host, text); }
+    catch (e) { deps.log && deps.log.warn('collector', 'Could not store the config version', { host, message: e.message }); }
+  }
   const hash = sha256(String(text));
   if (st.configHash && hash !== st.configHash) {
-    deps.events.record(host, { type: 'config-change', hash, previousHash: st.configHash, bytes: String(text).length });
+    deps.events.record(host, Object.assign(
+      { type: 'config-change', hash, previousHash: st.configHash, bytes: String(text).length },
+      stored ? { version: stored.id } : {}));
     deps.log && deps.log.info('collector', 'Running-config change detected', { host });
   }
   st.configHash = hash;

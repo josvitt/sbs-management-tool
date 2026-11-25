@@ -639,6 +639,8 @@ on the periodic timer is a cost decision, not just a correctness one.
 | Write SNMP (returns {ok,body}) | `snmpSetResult(s, vb)` |
 | Delete a RowStatus row (with fallback) | `rowStatusDelete(s, statusOid)` |
 | Button lifecycle (spinner→run→settle→done) | `runButtonAction(btn, spec)` |
+| Show a line diff (`diffLines` result) | `diffPre(diff)` → `<pre class="diff">` |
+| Read-only GET of an app API (throws on error) | `getJson(url)` |
 | Flash a changed value | `flashValue(node)` / `flashValues(nodes)` |
 | Mark running-config dirty | `markConfigDirty(s)` |
 | Section title + optional add-control | the module's `section()` (per §B2) |
