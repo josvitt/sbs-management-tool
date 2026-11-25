@@ -11,6 +11,18 @@ const opc = require('../opc');
 const { copyFinishedWaiter, buildSnmpSession, describeVarbind, redactTarget, snmpResponder, mapSetVarbinds, snmpSetPromise } = require('../snmp-core');
 const { snmpGetPromise, boundedWalkPromise } = require('../collection');
 
+// The capture points on the switch, parsed. Shared by POST /api/opc/list and
+// the server collector (SERVER-STANDARD §3).
+async function listCaptures(session) {
+  const rows = await boundedWalkPromise(session, opc.WALK.capturePoint, 'getbulk', { maxRows: 2000 });
+  // Reduce to {oid, value} using decoded display where it differs.
+  const simple = rows.map((vb) => {
+    const d = describeVarbind(vb);
+    return { oid: vb.oid, value: (d.display !== undefined && d.display !== null && d.display !== String(d.value)) ? d.display : d.value };
+  });
+  return { ok: true, captures: opc.parseCaptureList(simple) };
+}
+
 module.exports = function register(app) {
   // -----------------------------------------------------------------
   // Onboard Packet Capture (OPC)
@@ -65,13 +77,7 @@ module.exports = function register(app) {
     if (!b.target || !b.target.host) return res.status(400).json({ error: 'target.host is required.' });
     const session = buildSnmpSession(b.target);
     try {
-      const rows = await boundedWalkPromise(session, opc.WALK.capturePoint, 'getbulk', { maxRows: 2000 });
-      // Reduce to {oid, value} using decoded display where it differs.
-      const simple = rows.map((vb) => {
-        const d = describeVarbind(vb);
-        return { oid: vb.oid, value: (d.display !== undefined && d.display !== null && d.display !== String(d.value)) ? d.display : d.value };
-      });
-      res.json({ ok: true, captures: opc.parseCaptureList(simple) });
+      res.json(await listCaptures(session));
     } catch (e) {
       res.status(502).json({ error: e.message });
     } finally {
@@ -387,3 +393,5 @@ module.exports = function register(app) {
     }
   });
 };
+
+module.exports.listCaptures = listCaptures;

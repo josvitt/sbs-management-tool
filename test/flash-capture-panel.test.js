@@ -66,3 +66,26 @@ test('both panels are keyed, no health table repaints them, and the old self-man
   assert.match(src, /mountInto\(body, s, p, 'flash:files'/);
   assert.match(src, /mountInto\(body, s, p, 'capture:list'/);
 });
+
+test('a panel that the snapshot already carries does not load on open (v1.6.0)', async () => {
+  const { api, s, calls } = load(() => ({ files: [] }));
+  const ctx2 = vm.createContext({ console, Date, Promise });
+  // adoptCollectedModules lives in 04-health.js; take just that function.
+  const src = fs.readFileSync(path.join(SRC, '04-health.js'), 'utf8');
+  const start = src.indexOf('  function adoptCollectedModules(s, body) {');
+  const end = src.indexOf('\n  }\n', start) + 4;
+  const adopt = vm.runInContext('(' + src.slice(start, end).replace('function adoptCollectedModules', 'function') + ')', ctx2);
+  adopt(s, { collectedAt: new Date().toISOString(),
+    flash: { ok: true, files: [{ name: 'startup-config' }] },
+    captures: { ok: true, captures: [{ name: 'c1', stateText: 'active' }] } });
+  assert.equal(s._flash.data.files[0].name, 'startup-config');
+  assert.equal(s._capture.anyActive, true);
+  // sideEnsure (the on-open load) now leaves it alone.
+  const ensure = vm.runInContext(read('16-flash-capture.js') + '\n;sideEnsure', vm.createContext({ console, Date, Promise, setInterval: () => 1, clearInterval: () => {}, document: { body: { contains: () => true } }, apiPost: async (u) => { calls.push(u); return { ok: true, body: {} }; }, reconcilePanelInPlace: () => true, repaintPanel: () => {} }));
+  ensure(s, s._flash, api.flashLoad);
+  assert.deepEqual(calls, [], 'no listing fetched on open');
+  // A live read made after the collection is kept over an older snapshot.
+  s._flash.liveAt = Date.now() + 1000;
+  adopt(s, { collectedAt: new Date().toISOString(), flash: { ok: true, files: [] } });
+  assert.equal(s._flash.data.files.length, 1);
+});

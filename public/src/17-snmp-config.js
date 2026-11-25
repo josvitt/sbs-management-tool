@@ -34,6 +34,7 @@
     const st = s._snmp;
     if (st.loading) return st.loading;
     st.fetchedAt = Date.now();
+    st.liveAt = Date.now();
     st.loading = (async () => {
       const d = {};
       try { d.access = await snmpCfgPost(s, 'access'); }
@@ -51,6 +52,7 @@
   function ensureSnmpLoaded(s) {
     if (!s.target) return;
     const st = s._snmp || {};
+    if (st.data && st.collected) return;            // the snapshot carries it (adoptCollectedModules)
     if (st.loading || Date.now() - (st.fetchedAt || 0) < 30000) return;
     snmpLoad(s);
   }
@@ -60,6 +62,7 @@
   async function snmpRefresh(s, names) {
     const st = s._snmp;
     if (!st || !st.data || st.data.error) return snmpLoad(s);
+    st.liveAt = Date.now();      // newer than any snapshot taken before this write
     const want = names.slice();
     if (want.some((n) => n === 'recipients' || n === 'communities')) want.push('target-check');
     for (const [action, k] of SNMP_LISTS) {

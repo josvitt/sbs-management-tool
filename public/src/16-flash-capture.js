@@ -31,6 +31,7 @@
   // 30 s. `st` is the panel's state object, `load` its loader.
   function sideEnsure(s, st, load) {
     if (!s.target || !st) return;
+    if (st.data && st.collected) return;            // the snapshot carries it (adoptCollectedModules)
     if (st.loading || Date.now() - (st.fetchedAt || 0) < 30000) return;
     load(s);
   }
@@ -55,6 +56,7 @@
     if (highlight) st.highlight = bareFlashName(highlight);
     if (st.loading) return st.loading;
     st.fetchedAt = Date.now();
+    st.liveAt = Date.now();
     st.loading = sidePost('/api/flash/list', { target: s.target })
       .then((b) => { st.data = (b && !b.error) ? b : { error: (b && b.error) || 'no answer' }; })
       .finally(() => { st.loading = null; sideRepaint(s, 'flash'); });
@@ -147,6 +149,7 @@
     const st = s._capture;
     if (st.loading) return st.loading;
     st.fetchedAt = Date.now();
+    st.liveAt = Date.now();
     st.loading = sidePost('/api/opc/list', { target: s.target })
       .then((b) => {
         st.data = (b && !b.error) ? b : { error: (b && b.error) || 'no answer' };

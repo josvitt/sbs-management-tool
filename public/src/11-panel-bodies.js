@@ -907,7 +907,9 @@
         // returns an empty (or merely small) MAC result would leave
         // s.health.macTable falsy and the panel would re-fetch on every repaint,
         // thrashing the switch. The timestamp makes this fire once per visit.
-        if (!s._macFetching && (Date.now() - (s._macFetchedAt || 0) > 30000)) {
+        // Since v1.6.0 a full collection carries the MAC table (h.complete), so
+        // this fetch only runs against an older snapshot that lacks it.
+        if (!(s.health && s.health.complete) && !s._macFetching && (Date.now() - (s._macFetchedAt || 0) > 30000)) {
           s._macFetching = true;
           fetch('/api/health', { method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ target: s.target, only: ['macTable'] }) })

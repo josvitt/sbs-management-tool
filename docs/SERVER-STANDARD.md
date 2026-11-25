@@ -190,11 +190,23 @@ Each switch still sees only its own full walk once per interval, and every
 request to it — walks, GETs, SETs, the probe, from any session — passes one
 per-switch spacing gate in `buildSnmpSession` (`SNMP_MAX_RPS`, default 100
 requests a second), so no mix of loads can exceed the ~100 pps budget. The pacing gap paces the **server's fan-out** across switches, not
-any one switch's load. `onDemand` modules (snmpcfg / flash / capture) are
-**never** collected by the loop — they stay lazy and browser-only, by the same
-rule. The collector reproduces exactly the scope of the old periodic walk
-(families a/b), which is also exactly the scope `buildAlerts` reads, so
-unattended alerting needs nothing the loop doesn't already gather.
+any one switch's load. Since v1.6.0 the loop collects **every** panel's data
+(§3c); nothing is left for a panel to load when it opens.
+
+### 3c. Server-side panels in the collection (`module-collection.js`)
+
+SNMP configuration, Flash files and Packet capture are server-side views, not
+health tables. `collectModulesFor(target, keys)` reads them over one session,
+one after another, with the same functions their routes use
+(`snmpConfig.readAll`, `listFlash`, `listCaptures`), and the collector attaches
+them to the full collection as `snmpConfig`, `flash` and `captures`
+(`deps.modules`): `captures` on every full collection, `snmpConfig` and `flash`
+under the settings rule (§3), otherwise carried from the previous collection.
+`snmpConfig.readAll` walks each of its nine tables once and builds all six lists
+from them. The browser hands them to the panels (`adoptCollectedModules`); a live
+read a panel made after that collection (a write's re-read, the 15 s capture
+counter while a capture runs) is kept. A full collection is marked
+`complete: true`, which tells the panels nothing is left to load on open.
 
 ## 4. The event log — `events.js`
 
@@ -521,7 +533,7 @@ loaded, and Windows will not rename a folder holding a loaded file.
 - **`updater.js` (while running)** checks `releases/latest` once a day
   (`settings.json` `autoCheck`, never an install) and on a click prepares the
   release under `updates/staging/<version>/`: download the source tarball
-  (the API redirects to a signed codeload link; the token goes only to
+  (the API redirects to codeload.github.com; a token, if set, goes only to
   api.github.com), `extractTarGz`, check its `package.json` version, `npm ci
   --omit=dev` (cache in `updates/npm-cache`, since the service account may have
   no usable home and systemd allows writes only to the app folder), carry
@@ -552,11 +564,17 @@ loaded, and Windows will not rename a folder holding a loaded file.
 - **Restart.** Exit code 75 is restarted by node-windows' wrapper (any exit)
   and systemd (`Restart=on-failure`); `start.bat` runs `scripts/run.js`, which
   restarts on 75 only.
-- **Token.** A fine-grained token, read-only Contents on this repository, in
-  `updates/token.enc`, encrypted with the vault's `encrypt`. It comes in
-  through `POST /api/update/token` and goes out nowhere: the status says
-  only whether one is set. `SBS_UPDATE_TOKEN` overrides it;
-  `SBS_UPDATE_REPO` names another repository.
+- **Token (optional).** The repository is public, so checks and downloads
+  need no token. One only lifts GitHub's limit of 60 unauthenticated API
+  calls an hour per address. When set (a fine-grained token with public
+  repositories read-only access) it lives in `updates/token.enc`, encrypted
+  with the vault's `encrypt`; it comes in through `POST /api/update/token`
+  and goes out nowhere: the status says only whether one is set, where it
+  came from, and `refused` when GitHub answered 401 to it. A refused token
+  never blocks an update: that call is made again without it (old installs
+  still hold a token saved while the repository was private, and those
+  expire). `SBS_UPDATE_TOKEN` overrides the saved one; `SBS_UPDATE_REPO`
+  names another repository.
 - **Routes** (`routes/update.js`): `GET /api/update/status`,
   `POST /api/update/check | install | rollback | token | settings`, all behind
   the request guard like every route.

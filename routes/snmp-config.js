@@ -9,14 +9,7 @@ const log = require('../logger');
 const snmpConfig = require('../snmp-config');
 const { buildSnmpSession, snmpConfigBundle } = require('../snmp-core');
 
-// Flag the community or SNMPv3 user this app is connected with, so the panel
-// can leave out its Delete: the switch refuses to delete the credential in use.
-function markInUse(result, listKey, field, current) {
-  if (current && result && Array.isArray(result[listKey])) {
-    for (const row of result[listKey]) if (row && row[field] === current) row.inUse = true;
-  }
-  return result;
-}
+const { markInUse } = snmpConfig;
 
 module.exports = function register(app) {
   // SNMP configuration (recipients, communities, VACM groups, users,

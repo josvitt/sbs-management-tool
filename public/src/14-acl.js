@@ -15,6 +15,7 @@
   }
   function ensureAclLoaded(s) {
     if (s._aclFetching || !s.target) return;
+    if (s.health && s.health.complete) return;      // the full collection carries the ACL tables
     if (Date.now() - (s._aclFetchedAt || 0) < 30000) return;
     s._aclFetching = true;
     aclRefresh(s).then(() => { s._aclFetching = false; }, () => { s._aclFetching = false; });

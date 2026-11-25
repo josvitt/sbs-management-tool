@@ -31,8 +31,12 @@ Collection runs on the server, so closing the browser does not stop it.
 
 ## Install
 
-1. Install [Node.js](https://nodejs.org) (version 22 or newer).
-2. Double-click **`start.bat`**.
+1. Download the newest release from the
+   [Releases page](https://github.com/josvitt/sbs-management-tool/releases/latest)
+   (*Source code (zip)*) and unpack it. Or clone the repository with
+   `git clone https://github.com/josvitt/sbs-management-tool.git`.
+2. Install [Node.js](https://nodejs.org) (version 22 or newer).
+3. Double-click **`start.bat`**.
 
 The first run installs dependencies, which takes about a minute. Then your
 browser opens the dashboard. A console window titled "SBS Management Tool
@@ -74,16 +78,16 @@ newest release with its notes. The app checks once a day and shows a green
 **NEW** badge when a release is out. It never installs on its own. You
 click **Install**.
 
-**The app needs a GitHub token**, because the repository is private.
+Updates come from this public repository, so **no GitHub account or token
+is needed**.
 
-1. On GitHub, go to Settings → Developer settings → Fine-grained tokens →
-   Generate new token.
-2. Set *Repository access* to this repository only.
-3. Set *Permissions → Contents* to **Read-only**. Give it no other
-   permissions.
-4. Paste the token into the Updates window once.
-
-The token is stored encrypted, and is only ever sent to GitHub.
+GitHub allows about 60 update checks an hour from one internet address
+without a token. That is plenty for one PC. If many PCs share one address
+and the Updates window says the hourly limit is used up, you can paste an
+optional token into the Updates window: on GitHub, go to Settings →
+Developer settings → Fine-grained tokens → Generate new token, and choose
+*Public repositories (read-only)* with no permissions. It is stored
+encrypted and only ever sent to GitHub.
 
 **Install** downloads and checks the new version first, then restarts the
 app. Your saved switches, logs, history and layouts are kept. If the new
@@ -145,7 +149,7 @@ You don't need to change any of these. Set them as environment variables.
 | `SNMP_MAX_RPS` | 100 | Most SNMP requests per second sent to one switch |
 | `SESSION_IDLE_MS` | 300000 | Close an idle SSH or console session after this long |
 | `SBS_CONFIG_HISTORY_KEEP` | 50 | Config versions kept per switch |
-| `SBS_UPDATE_TOKEN` | | GitHub token, used instead of the one saved in the Updates window |
+| `SBS_UPDATE_TOKEN` | | Optional GitHub token, used instead of one saved in the Updates window |
 
 Collection timing and other tuning settings are described in
 [docs/SERVER-STANDARD.md](docs/SERVER-STANDARD.md).
@@ -162,7 +166,7 @@ All of these are in the app folder. None of them are replaced by an update.
 | `layouts.json` | Dashboard layout per switch |
 | `known-hosts.json` | Trusted SSH host keys |
 | `logs/` | The app log (connections and errors only, never session content), the event log, and received syslog and traps |
-| `updates/` | Update token, downloads and the previous version |
+| `updates/` | Update settings, downloads, the previous version and the optional token |
 
 ## Development
 

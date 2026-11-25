@@ -154,14 +154,14 @@ const TABLE_WALKS = {
     'cdpCacheAddress', 'cdpCacheDeviceId', 'cdpCacheDevicePort', 'cdpCachePlatform'] },
   lldp:       { oid: 'lldpRemTable', maxRows: 1000, columns: [
     'lldpRemChassisId', 'lldpRemPortId', 'lldpRemPortDesc', 'lldpRemSysName'] },
-  // The MAC forwarding database is large and only shown in the Connected panel,
-  // so it is fetched on demand by that panel's refresh (onDemand), not on every
-  // full health poll.
+  // The MAC forwarding database rides every full collection since v1.6.0: the
+  // per-switch request gate (snmp-core) keeps even a large one inside the pps
+  // budget, and the Connected panel then opens from the snapshot like the rest.
   // The MAC table is large (thousands of entries across VLANs) but it is a
   // simple, well-behaved standard table, so it can use a much higher GETBULK
   // repetition count than the conservative default - fewer round-trips for the
   // same data. maxRows is raised so a big forwarding database isn't truncated.
-  macTable:   { oid: 'dot1qTpFdbTable', maxRows: 8000, onDemand: true, maxRepetitions: 40, columns: [
+  macTable:   { oid: 'dot1qTpFdbTable', maxRows: 8000, maxRepetitions: 40, columns: [
     'dot1qTpFdbPort', 'dot1qTpFdbStatus'] },
   // Standard IP ACL rules (rlIpStdAclTable, indexed by ACL name + ACE index).
   // On-demand: only walked when the ACL panel asks for it.
@@ -175,7 +175,7 @@ const TABLE_WALKS = {
   // The full IP forwarding table (RFC 2096 ipCidrRouteTable): connected,
   // static, local and any dynamic routes, each with its protocol and type.
   // Can be large on a routing switch, so it is paginated in the UI.
-  routeTable: { oid: 'ipCidrRouteTable', maxRows: 4000, onDemand: true, columns: [
+  routeTable: { oid: 'ipCidrRouteTable', maxRows: 4000, columns: [
     'ipCidrRouteDest', 'ipCidrRouteMask', 'ipCidrRouteNextHop',
     'ipCidrRouteIfIndex', 'ipCidrRouteType', 'ipCidrRouteProto', 'ipCidrRouteStatus'] },
   // User-configured static routes (the editable set). IPv4, plain IpAddress
@@ -209,11 +209,11 @@ const TABLE_WALKS = {
   // QoS ACL panel (rlQosAcl 88.7 / 88.31 / 88.5). These three tables are joined
   // client-side (ACL header -> ACEs -> tuple values via pointer indirection), so
   // they are walked in RAW mode: health returns the un-pivoted walk rows the
-  // panel's existing join reads ({ index, column, value }). onDemand - loaded on
-  // first panel visit, cheap (~6 PDUs), refreshed on write in place.
-  aclNames:  { raw: true, onDemand: true, maxRows: 2000, oid: '1.3.6.1.4.1.9.6.1.101.88.7.1' },     // name(.2)+type(.3)
-  aclAces:   { raw: true, onDemand: true, maxRows: 4000, oid: '1.3.6.1.4.1.9.6.1.101.88.31' },      // ACE table (action/type/tuple ptrs)
-  aclTuples: { raw: true, onDemand: true, maxRows: 4000, oid: '1.3.6.1.4.1.9.6.1.101.88.5' },       // tuple values
+  // panel's existing join reads ({ index, column, value }). Cheap (~6 PDUs), so
+  // they ride every full collection; a write re-reads them in place.
+  aclNames:  { raw: true, maxRows: 2000, oid: '1.3.6.1.4.1.9.6.1.101.88.7.1' },     // name(.2)+type(.3)
+  aclAces:   { raw: true, maxRows: 4000, oid: '1.3.6.1.4.1.9.6.1.101.88.31' },      // ACE table (action/type/tuple ptrs)
+  aclTuples: { raw: true, maxRows: 4000, oid: '1.3.6.1.4.1.9.6.1.101.88.5' },       // tuple values
   bridgePorts: { perPort: 'ifIndex', oid: 'dot1dBasePortTable', maxRows: 1000, columns: ['dot1dBasePortIfIndex'] },
   // The operational VLAN table. Switches populate this even when the
   // static table is sparse, which is why membership has to come from here
@@ -1540,10 +1540,10 @@ async function collect({ get, walk, only, previous, reuse }) {
   // the walk itself, this keeps a full collection to gentle, steady traffic
   // rather than a brief high-pps burst. Tunable via env.
   const CONCURRENCY = Number(process.env.SNMP_CONCURRENCY) || 2;
-  // Tables marked onDemand are NOT walked on every full collection - they are
-  // large and only needed when a specific panel is open, so they are fetched by
-  // that panel's targeted refresh instead. This keeps the big MAC forwarding
-  // table (dot1qTpFdbTable, up to ~1500 rows) off the regular poll.
+  // A table marked onDemand is NOT walked on a full collection, only by a
+  // targeted refresh. No table uses it since v1.6.0 (every panel renders from
+  // the snapshot, SERVER-STANDARD §1a); the marker stays for a table that
+  // would genuinely be too big for every cycle.
   //
   // Interfaces are read first: the list of interfaces that exist is what lets
   // every per-port table be fetched for those ports alone (readTable), and the
@@ -1732,6 +1732,9 @@ async function collect({ get, walk, only, previous, reuse }) {
 
   // Settings tables carried from the previous collection rather than re-read.
   if (carried.length) health.carried = carried;
+  // A full collection holds every table a panel reads (nothing is left for a
+  // panel to fetch when it opens), so the page can render it as it stands.
+  health.complete = true;
 
   health.alerts = buildAlerts(health);
   health.summary = summarise(health);
