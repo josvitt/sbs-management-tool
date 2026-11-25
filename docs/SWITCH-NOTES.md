@@ -65,6 +65,22 @@ Proven on a C1300 (gi1/0/4, 25 Nov 2026, `scripts/switch-test.js`):
 - **Nameservers are added in `rlDnsResConfigSbeltInetTable` and deleted from
   the DNS client v2 servers table,** whose row the switch makes for each one.
 
+## Reboot and firmware (`switch-maint.js`, `26-maint.js`)
+
+Proven on a C1300 (25 Nov 2026, firmware 4.1.9.92, `scripts/switch-test-maint.js`):
+
+- **A reboot is `rlRebootDelay` (TimeTicks).** Setting 360000 schedules one in
+  an hour, and reading it back gives the time left. Setting 4294967295 cancels
+  it, and that is also what it reads when nothing is scheduled.
+  `rlManualReboot` is not a control: it is read-only and says whether the
+  last restart was orderly.
+- **The next boot image is `rndActiveSoftwareFileAfterReset.<unit>`**,
+  image1(1) or image2(2). It reads back at once. The running one is
+  `rndActiveSoftwareFile.<unit>`, read-only.
+- **The images are listed in `rndImageInfoTable`, one row per unit,** with a
+  name, version and build date and time column for each slot. The name is a
+  full path such as `flash://system/images/<file>.bin`.
+
 ## Spanning tree (`health.js`)
 
 - **`dot1dStpVersion` can't be trusted on its own.** Firmware reports `rstp`

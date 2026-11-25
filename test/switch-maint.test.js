@@ -32,11 +32,19 @@ function fakeSession(values, hooks) {
       if (hooks && hooks.onSet) hooks.onSet(varbinds, values);
       setImmediate(() => cb(null, varbinds));
     },
-    subtree(base, maxRep, feed, done) {
-      const rows = Object.keys(values).filter((o) => o.indexOf(base + '.') === 0)
-        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-        .map((oid) => ({ oid, type: values[oid][0], value: values[oid][1] }));
-      setImmediate(() => { if (rows.length) feed(rows); done(); });
+    // GETBULK as an agent answers it: the next rows after each OID, in order.
+    getBulk(oids, nonRep, reps, cb) {
+      const cmp = (a, b) => { const x = a.split('.').map(Number), y = b.split('.').map(Number);
+        for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i];
+        return x.length - y.length; };
+      const all = Object.keys(values).sort(cmp);
+      const out = [];
+      for (const start of oids) {
+        const next = all.filter((o) => cmp(o, start) > 0).slice(0, reps);
+        for (const oid of next) out.push({ oid, type: values[oid][0], value: values[oid][1] });
+        if (next.length < reps) out.push({ oid: start, type: T.EndOfMibView, value: null });
+      }
+      setImmediate(() => cb(null, out));
     }
   };
 }

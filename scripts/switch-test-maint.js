@@ -15,9 +15,9 @@
  *   2. Schedules a reboot an hour out, checks it, cancels it, checks that.
  *   3. Makes the other image the next boot image, checks, and puts it back.
  *   4. Reads the startup configuration and copies the same text back into
- *      startup over TFTP (only when running and startup are equal), then
- *      reads startup again and compares. If it differs, running is copied
- *      to startup, which was equal before, to put it back.
+ *      startup over TFTP, then reads startup again and compares. If it
+ *      differs, the text read at the start (held in memory) is copied back
+ *      again. The running configuration is never touched.
  *
  *   --image <file>  also installs that firmware file into the inactive
  *                   image slot. Use the version the switch already runs
@@ -161,28 +161,24 @@ async function main() {
 
   // ---- 4. startup configuration round trip ----------------------------------
   let startupText = null;
-  if (saved0 !== true) {
-    say('SKIP startup round trip: the running configuration has unsaved changes, so startup is not a copy of it to fall back on.');
-  } else {
-    try {
-      const a = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
-      startupText = a.text;
-      say('  startup configuration read: ' + a.lines + ' lines');
-      const pushed = await maint.pushFile(session, { host, dest: 'startup', buffer: Buffer.from(startupText, 'utf8'), tftpPort });
-      check('copy it back into startup over TFTP', pushed.finished, 'row shape "' + pushed.shape + '", completion via ' + pushed.via);
-      const b = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
-      const same = maint.sameConfig(a.text, b.text);
-      check('startup reads back the same', same, same ? '' : a.lines + ' lines before, ' + b.lines + ' after');
-      check('the switch still says running and startup are equal', (await isSaved()) === true);
-      if (!same) {
-        say('  Putting startup back: copying running (equal to the old startup) to startup.');
-        await configFetch.copyConfig(session, { host, from: 'running', to: 'startup' });
-        const c = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
-        check('startup put back', maint.sameConfig(a.text, c.text));
-      }
-    } catch (e) {
-      check('startup round trip', false, e.message);
+  try {
+    const a = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
+    startupText = a.text;
+    say('  startup configuration read: ' + a.lines + ' lines');
+    const pushed = await maint.pushFile(session, { host, dest: 'startup', buffer: Buffer.from(startupText, 'utf8'), tftpPort });
+    check('copy it back into startup over TFTP', pushed.finished, 'row shape "' + pushed.shape + '", completion via ' + pushed.via);
+    const b = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
+    const same = maint.sameConfig(a.text, b.text);
+    check('startup reads back the same', same, same ? '' : a.lines + ' lines before, ' + b.lines + ' after');
+    if (saved0 === true) check('the switch still says running and startup are equal', (await isSaved()) === true);
+    if (!same) {
+      say('  Putting startup back: copying the text read at the start into startup again.');
+      await maint.pushFile(session, { host, dest: 'startup', buffer: Buffer.from(startupText, 'utf8'), tftpPort });
+      const c = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
+      check('startup put back', maint.sameConfig(a.text, c.text));
     }
+  } catch (e) {
+    check('startup round trip', false, e.message);
   }
 
   // ---- 5. firmware install (opt-in) ----------------------------------------

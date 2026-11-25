@@ -69,13 +69,12 @@ function getVarbinds(session, oids) {
   });
 }
 
-function walkSubtree(session, base) {
-  return new Promise((resolve, reject) => {
-    const rows = [];
-    session.subtree(base, 20, (varbinds) => {
-      for (const vb of varbinds) if (!snmp.isVarbindError(vb)) rows.push(vb);
-    }, (error) => (error ? reject(error) : resolve(rows)));
-  });
+// The shared bounded walk (collection.js), so the recorder and the offline
+// replay see the same requests the collector sends.
+async function walkSubtree(session, base) {
+  const { boundedWalkPromise } = require('./collection');
+  const rows = await boundedWalkPromise(session, base, 'getbulk', { maxRows: 200 });
+  return rows.filter((vb) => !snmp.isVarbindError(vb) && String(vb.oid).indexOf(base + '.') === 0);
 }
 
 const text = (v) => (Buffer.isBuffer(v) ? v.toString('utf8') : (v == null ? '' : String(v))).replace(/\0+$/, '').trim();
