@@ -54,7 +54,7 @@ body { display: flex; flex-direction: column; }
   border: 1px solid var(--panel-border); border-radius: 3px;
   padding: 6px 9px; cursor: pointer; font-family: var(--mono); white-space: nowrap;
 }
-.icon-btn:hover { border-color: var(--amber); color: var(--amber); }
+.icon-btn:hover { border-color: var(--text); color: var(--text); }
 .icon-btn .badge {
   display: none; background: var(--red); color: #1a0805;
   border-radius: 8px; padding: 0 5px; margin-left: 5px; font-weight: 700;
@@ -169,8 +169,7 @@ main { flex: 1; min-height: 0; position: relative; display: flex; }
 }
 .field { margin-bottom: 12px; min-width: 0; }
 .field label {
-  display: block; font-size: 10.5px; color: var(--muted);
-  letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 5px;
+  display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px;
 }
 .field input, .field select {
   width: 100%; min-width: 0; background: var(--panel-2);
@@ -223,7 +222,8 @@ main { flex: 1; min-height: 0; position: relative; display: flex; }
   display: inline-flex; align-items: center; gap: 5px;
   font-size: 10px; color: var(--muted); cursor: pointer; white-space: nowrap;
 }
-.check-label input { accent-color: var(--amber); cursor: pointer; }
+.check-label input { cursor: pointer; }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--green); }
 .check-label:hover { color: var(--amber); }
 
 /* ---------- health ---------- */
@@ -333,7 +333,7 @@ main { flex: 1; min-height: 0; position: relative; display: flex; }
 .col-name { color: var(--amber); white-space: nowrap; }
 .col-oid { color: var(--blue); white-space: nowrap; font-size: 10px; }
 .col-type { color: var(--muted); white-space: nowrap; font-size: 10px; }
-.col-value { color: var(--text); word-break: break-word; }
+.col-value { color: var(--text); overflow-wrap: break-word; }
 .col-value.is-error { color: var(--red); }
 .col-index { color: var(--green); white-space: nowrap; }
 .sticky-col {
@@ -497,19 +497,14 @@ th.sticky-col { z-index: 3; }
   display: flex; align-items: center; gap: 8px;
 }
 .log-header span {
-  font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase;
-  color: var(--muted); flex: 1;
+  font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--amber); flex: 1;
 }
-.log-header button {
-  background: transparent; border: 1px solid var(--panel-border); color: var(--muted);
-  font-family: var(--mono); font-size: 10px; padding: 4px 7px; border-radius: 3px; cursor: pointer;
-}
-.log-header button:hover { color: var(--amber); border-color: var(--amber); }
 #log-list { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 12px; font-size: 11px; line-height: 1.55; }
 .log-entry { padding: 5px 0; border-bottom: 1px solid #1a251f; }
 .log-entry .ts { color: var(--muted); margin-right: 7px; }
-.log-entry .lvl { font-weight: 700; margin-right: 5px; }
-.log-entry.info .lvl { color: var(--green); }
+.log-entry .lvl { margin-right: 5px; }
+.log-entry.info .lvl { color: var(--blue); }
 .log-entry.warn .lvl { color: var(--warn); }
 .log-entry.error .lvl { color: var(--red); }
 .log-entry .msg { color: var(--text); word-break: break-word; }
@@ -674,7 +669,7 @@ th.sticky-col { z-index: 3; }
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
 .mib-detail { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding: 14px; }
-.mib-detail h3 { margin: 0 0 4px; font-size: 15px; color: var(--text); font-weight: 600; }
+.mib-detail h3 { margin: 0 0 4px; font-size: 15px; color: var(--text); font-weight: 400; }
 .mib-detail .d-oid { font-size: 11.5px; color: var(--blue); margin-bottom: 10px; }
 .mib-detail .d-desc { font-size: 11.5px; color: var(--text); line-height: 1.6; margin: 8px 0; }
 .mib-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
@@ -953,12 +948,12 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
   padding: 14px; display: flex; flex-direction: column; gap: 18px;
 }
 .topo-sect { display: flex; flex-direction: column; gap: 7px; }
-.topo-sect select { width: 100%; }
+.topo-sect select { width: 100%; font-size: 13px; padding: 8px 9px; border-radius: 3px; }
 .topo-warnings { display: flex; flex-direction: column; gap: 8px; font-size: 10.5px; }
 .topo-warn { border-left: 2px solid var(--muted); padding-left: 7px; color: var(--muted); }
 .topo-warn.wrn { border-color: var(--warn); }
 .topo-warn.err { border-color: var(--red); }
-.topo-warn b { display: block; color: var(--text); font-weight: 600; margin-bottom: 2px; }
+.topo-warn b { display: block; color: var(--text); font-weight: 400; margin-bottom: 2px; }
 .topo-legend { display: flex; flex-direction: column; gap: 5px; font-size: 10.5px; color: var(--muted); }
 .topo-legend span { display: flex; align-items: center; gap: 7px; }
 .topo-legend i { width: 16px; text-align: center; font-style: normal; }
@@ -1085,14 +1080,14 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
 /* ---- SNMP inline forms ---- */
 .snmp-form { border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px;
   margin: 10px 0; background: var(--panel-2); display: flex; flex-direction: column; gap: 12px; }
-.snmp-form h5 { margin: 0; font-size: 13px; color: var(--text); font-weight: 600; }
+.snmp-form h5 { margin: 0; font-size: 13px; color: var(--text); font-weight: 400; }
 .snmp-form .intro { font-size: 12px; color: var(--muted); margin: 0; line-height: 1.5; }
 .snmp-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
 .snmp-field { display: flex; flex-direction: column; gap: 4px; }
 .snmp-field label { font-size: 12px; color: var(--muted); }
 .snmp-field input, .snmp-field select { padding: 6px 8px; background: var(--panel); color: var(--text);
   border: 1px solid var(--panel-border); border-radius: 5px; font-size: 13px; font-family: inherit; }
-.snmp-form-actions { display: flex; gap: 8px; }
+.snmp-form-actions { display: flex; gap: 8px; margin-top: 12px; }
 .snmp-levels { display: flex; flex-direction: column; gap: 6px; }
 .snmp-lvl-label { color: var(--text); font-size: 12px; margin-top: 4px; }
 .snmp-lvl-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
@@ -1127,15 +1122,16 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
   display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 10px;
 }
-.port-detail-head h3 { margin: 0; font-size: 14px; color: var(--text); }
+.port-detail-head h3 { margin: 0; font-size: 14px; color: var(--text); font-weight: 400; }
 .port-detail-x {
   background: none; border: none; color: var(--muted);
   font-size: 20px; line-height: 1; cursor: pointer; padding: 0 2px;
 }
 .port-detail-x:hover { color: var(--text); }
 .port-detail-sub {
-  font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
-  color: var(--muted); margin: 14px 0 6px; font-weight: 600;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--amber); margin: 16px 0 7px;
+  border-bottom: 1px solid var(--panel-border); padding-bottom: 5px;
 }
 .port-detail-sub:first-of-type { margin-top: 4px; }
 .port-detail-grid {
@@ -1179,8 +1175,9 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
 
 /* ---- AAA section sub-headings in the Auth panel ---- */
 
-.aaa-sub { margin: 8px 0 4px; font-size: 10px; text-transform: uppercase;
-  letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+.aaa-sub { margin: 16px 0 7px; font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.1em; color: var(--amber);
+  border-bottom: 1px solid var(--panel-border); padding-bottom: 5px; }
 
 /* ---- AAA key field with its show/hide button ---- */
 .key-row { display: flex; gap: 6px; align-items: center; width: 100%; min-width: 0; }
@@ -1265,7 +1262,7 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
 .d1xg { max-width: 920px; }
 .d1xg-grid { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: flex-end; margin-bottom: 4px; }
 .d1xg-field { display: flex; flex-direction: column; gap: 4px; width: 220px; max-width: 100%; }
-.d1xg-field label { font-size: 10.5px; color: var(--muted); letter-spacing: 0.03em; text-transform: uppercase; }
+.d1xg-field label { font-size: 12px; color: var(--muted); }
 .d1xg-field select, .d1xg-field input {
   padding: 6px 9px; background: var(--panel); color: var(--text);
   border: 1px solid var(--panel-border); border-radius: 5px; font-size: 12px; width: 100%;
@@ -1276,7 +1273,7 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
 .d1xg-field.narrow { width: 150px; }
 /* More breathing room before each subsection heading inside this block, and a
    subtle left accent so the groups read as distinct. */
-.d1xg .aaa-sub { margin: 18px 0 8px; padding-left: 8px; border-left: 2px solid var(--amber); }
+.d1xg .aaa-sub { margin: 18px 0 8px; }
 .d1xg .aaa-sub:first-of-type { margin-top: 14px; }
 .d1xg-traps { margin: 6px 0; }
 /* Give the Apply button clear separation from the fields above it. */
@@ -1377,16 +1374,13 @@ input.value-changed, select.value-changed, textarea.value-changed {
 .acl-fsec { margin-bottom: 16px; }
 .acl-fsec-title {
   font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
-  color: var(--amber); font-weight: 600; margin-bottom: 8px;
+  color: var(--amber); margin-bottom: 8px;
   padding-bottom: 5px; border-bottom: 1px solid var(--panel-border);
 }
 .acl-fsec-body { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
 /* Fields inside a section: consistent compact label above the control. */
 .acl-fsec-body .snmp-field { display: flex; flex-direction: column; gap: 5px; margin: 0; }
-.acl-fsec-body .snmp-field > label {
-  font-size: 10.5px; letter-spacing: 0.04em; text-transform: uppercase;
-  color: var(--muted); font-weight: 500;
-}
+.acl-fsec-body .snmp-field > label { font-size: 12px; color: var(--muted); }
 .acl-fsec-body .snmp-field input[type="text"],
 .acl-fsec-body .snmp-field input[type="number"],
 .acl-fsec-body .snmp-field select {
@@ -1434,4 +1428,18 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px
     animation-duration: 0.001ms !important; animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* A note above a field keeps a gap before the next label, and an empty
+   hint draws no rule (design review finding 13). */
+.f-transport-note { margin-bottom: 12px; }
+.form-hint:has(.f-mib-status:empty) { display: none; }
+
+/* Per-row port buttons (Bounce PoE, Shut) show on the row under the pointer
+   or with keyboard focus, so 40 rows don't carry 70 buttons at rest
+   (design review finding 7). Touch screens, with no hover, always show them. */
+@media (hover: hover) {
+  .data-table tr .port-actions { opacity: 0; transition: opacity 0.12s ease; }
+  .data-table tr:hover .port-actions, .data-table tr:focus-within .port-actions,
+  .data-table tr .port-actions:has(.is-arming, .is-arming-danger) { opacity: 1; }
 }

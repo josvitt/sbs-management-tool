@@ -53,6 +53,13 @@
 
   function openMib() {
     mibPanel.classList.add('open');
+    // Two blank panes say nothing; say what to do (design review finding 17).
+    if (!mibResults.children.length && !mibQ.value.trim()) {
+      mibResults.appendChild(el('div', 'empty-state', 'Search by name or OID, or pick a filter above.'));
+    }
+    if (!mibDetail.children.length) {
+      mibDetail.appendChild(el('div', 'empty-state', 'Pick an object to see its OID, access, description and values.'));
+    }
     loadProducts().then(() => {
       // Populate the product picker once, from the registry.
       if (mibProduct && !mibProduct.options.length) {
