@@ -49,6 +49,8 @@ test('config history stores a new version only when the text changes', () => {
 
 test('config history keeps only the newest N versions per switch', () => {
   const { result } = run(`
+    // All five within one millisecond: ids must still sort newest first.
+    const t = Date.now(); Date.now = () => t;
     const h = require('./config-history.js');
     for (let i = 0; i < 5; i++) h.record('sw', 'v' + i);
     console.log(JSON.stringify(h.list('sw').map((v) => h.get('sw', v.id).text)));`,
@@ -75,17 +77,25 @@ test('history routes list versions and return one; unknown ids are 404', async (
     const script = `
       const express = require(${JSON.stringify(require.resolve('express'))});
       const h = require(${JSON.stringify(path.join(ROOT, 'config-history.js'))});
+      const http = require('http');
+      // node:http with no keep-alive rather than fetch, and exit only once the
+      // server has closed: on Windows a process exiting mid-close crashes.
+      const get = (url) => new Promise((resolve, reject) => {
+        http.get(url, { agent: false }, (res) => { let b = ''; res.on('data', (d) => b += d);
+          res.on('end', () => resolve({ status: res.statusCode, json: () => JSON.parse(b) })); }).on('error', reject);
+      });
       const app = express(); app.use(express.json());
       require(${JSON.stringify(path.join(ROOT, 'routes', 'config.js'))})(app);
       const v = h.record('10.1.1.1', 'hostname r\\n');
       const srv = app.listen(0, '127.0.0.1', async () => {
         const base = 'http://127.0.0.1:' + srv.address().port;
-        const list = await (await fetch(base + '/api/config/history?host=10.1.1.1')).json();
-        const one = await (await fetch(base + '/api/config/history/version?host=10.1.1.1&id=' + v.id)).json();
-        const miss = (await fetch(base + '/api/config/history/version?host=10.1.1.1&id=..%2F..%2Fvault.js')).status;
-        const noHost = (await fetch(base + '/api/config/history')).status;
+        const list = (await get(base + '/api/config/history?host=10.1.1.1')).json();
+        const one = (await get(base + '/api/config/history/version?host=10.1.1.1&id=' + v.id)).json();
+        const miss = (await get(base + '/api/config/history/version?host=10.1.1.1&id=..%2F..%2Fvault.js')).status;
+        const noHost = (await get(base + '/api/config/history')).status;
         console.log(JSON.stringify({ n: list.versions.length, text: one.text, miss, noHost }));
-        srv.close(); process.exit(0);
+        srv.closeAllConnections();
+        srv.close();
       });`;
     const env = { ...process.env, SBS_CONFIG_HISTORY_DIR: dir, SBS_PASSPHRASE: 'test-only passphrase' };
     const out = execFileSync(process.execPath, ['-e', script], { env }).toString().trim().split('\n').pop();

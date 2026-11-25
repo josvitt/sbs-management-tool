@@ -83,7 +83,11 @@ function record(host, text) {
   const existing = ids(host);
   if (existing.length && existing[0].endsWith('-' + hash)) return null;
 
-  const id = stamp(new Date()) + '-' + hash;
+  // Ids sort by time, so two versions stored within one millisecond must
+  // not share a stamp: the later one would sort by its hash instead.
+  let at = Date.now();
+  if (existing.length) at = Math.max(at, Date.parse(describeId(existing[0]).at) + 1);
+  const id = stamp(new Date(at)) + '-' + hash;
   const dir = dirFor(host);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   rotate.writeFileAtomic(path.join(dir, id + '.enc'), vault.encrypt(body), { mode: 0o600 });
