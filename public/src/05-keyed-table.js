@@ -4,9 +4,21 @@
 
   // ---------- rendering ----------
   const SEV_ORDER = { critical: 0, warning: 1, info: 2, ok: 3 };
-  const stateClass = (v) => /normal|^on\b|^up|^ok$/i.test(v) ? 'good'
-    : (/critical|shutdown|notFunctioning|faulty|fail/i.test(v) ? 'crit'
-    : (/notPresent|notAvailable|^off|^down/i.test(v) ? 'idle' : 'warn'));
+  // A status word's pill: healthy words are good, broken ones crit, the
+  // states that need a look warn, and anything else neutral. The word is
+  // matched without the SNMP code ("ok (1)" is ok). An unknown word is never
+  // a warning: on a healthy switch most of the screen is states nobody
+  // listed here.
+  const STATE_GOOD = /^(normal|on|up|ok|good|green|active|enabled|true|yes|present|operational|forwarding|designated|root|deliveringPower|configured|connected|established|authorized|running|success|complete|completed)$/i;
+  const STATE_CRIT = /critical|shutdown|notFunctioning|faulty|fault|fail|error|^red$|^bad$|unauthorized|errDisabled|err-disabled/i;
+  const STATE_WARN = /^(warning|degraded|testing|yellow|amber|overload|otherFault|lowerLayerDown|dormant|unknown|inconsistent|broken|denied|stale)$/i;
+  const stateClass = (v) => {
+    const w = String(enumWord(String(v == null ? '' : v))).trim();
+    if (STATE_GOOD.test(w)) return 'good';
+    if (STATE_CRIT.test(w)) return 'crit';
+    if (STATE_WARN.test(w)) return 'warn';
+    return 'idle';
+  };
 
   // ============================================================================
   // Keyed table reconciliation engine
@@ -24,7 +36,8 @@
   //
   // Cell specs are the same shapes the legacy table() builder accepts:
   //   plain string/number            -> text cell
-  //   { v, pill }                    -> coloured status pill
+  //   { v, pill }                    -> coloured status pill (pill: true picks the
+  //                                     colour from the word; 'good'|'warn'|'crit'|'idle' sets it)
   //   { v, click:{open} }            -> row-opens-detail link cell
   //   { actions }                    -> port action buttons (via portActionsCell)
   //   { vlanDelete }                 -> VLAN delete cell
@@ -81,14 +94,20 @@
     const pillText = c && c.pill ? String(c.v === undefined || c.v === null ? '' : c.v).trim() : '';
     if (c && c.pill && pillText) {
       const td = document.createElement('td');
-      td.appendChild(el('span', 'pill ' + stateClass(pillText), c.v));
+      const pv = typeof c.pill === 'string' ? c.pill : stateClass(pillText);
+      const sp = el('span', 'pill ' + pv, enumWord(pillText));
+      if (enumCode(pillText) !== null) sp.title = pillText;
+      td.appendChild(sp);
       return td;
     }
     if (c && c.pill) return el('td', 'col-value', '');
     const text = (c && typeof c === 'object')
       ? (c.v === undefined || c.v === null ? '' : c.v)
       : (c === undefined || c === null ? '' : c);
-    return el('td', 'col-value', typeof text === 'object' ? '' : text);
+    if (typeof text === 'object') return el('td', 'col-value', '');
+    const td = el('td', 'col-value', enumWord(text));
+    if (enumCode(text) !== null) td.title = text;
+    return td;
   }
 
   // A stable signature of a cell's rendered content, used to decide whether a

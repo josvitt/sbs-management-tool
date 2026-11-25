@@ -464,8 +464,9 @@
     if (st) st.classList.toggle('disabled', !on);
   }
 
-  /** Tint the whole sub-tab, so the Health tab carries the same verdict
-   *  colour as the Overview badge rather than only a small dot. */
+  /** Colour the sub-tab's dot with the verdict, so the Overview tab carries
+   *  the same colour as the Overview badge. Only the dot: the underline is
+   *  the open tab's. */
   function subTint(s, view, sev) {
     const st = s.subtabs.find((x) => x.dataset.view === view);
     if (!st) return;

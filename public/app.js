@@ -601,8 +601,21 @@
     return { sec, body };
   }
 
+  // Values are words, not SNMP codes (MODULE-STANDARD A3): the server writes
+  // an enum as "up (1)"; on screen it reads "up". Anything else is unchanged.
+  // enumCode gives the number back, for a tooltip.
+  function enumWord(v) {
+    if (typeof v !== 'string') return v;
+    const m = /^([A-Za-z][\w-]*) \((-?\d+)\)$/.exec(v.trim());
+    return m ? m[1] : v;
+  }
+  function enumCode(v) {
+    const m = typeof v === 'string' ? /^([A-Za-z][\w-]*) \((-?\d+)\)$/.exec(v.trim()) : null;
+    return m ? m[2] : null;
+  }
+
   // A cell's display text, falling back to its raw value (ACL and port-channel
-  // cells).
+  // cells). Logic parses this, so it keeps the code; show it with enumWord.
   function dvc(cell) { return cell ? (cell.display !== undefined && cell.display !== null && cell.display !== '' ? cell.display : cell.value) : ''; }
 
   const q2 = (s, sel) => s.pane.querySelector(sel);
@@ -1242,8 +1255,9 @@
     if (st) st.classList.toggle('disabled', !on);
   }
 
-  /** Tint the whole sub-tab, so the Health tab carries the same verdict
-   *  colour as the Overview badge rather than only a small dot. */
+  /** Colour the sub-tab's dot with the verdict, so the Overview tab carries
+   *  the same colour as the Overview badge. Only the dot: the underline is
+   *  the open tab's. */
   function subTint(s, view, sev) {
     const st = s.subtabs.find((x) => x.dataset.view === view);
     if (!st) return;
@@ -2829,9 +2843,21 @@
 
   // ---------- rendering ----------
   const SEV_ORDER = { critical: 0, warning: 1, info: 2, ok: 3 };
-  const stateClass = (v) => /normal|^on\b|^up|^ok$/i.test(v) ? 'good'
-    : (/critical|shutdown|notFunctioning|faulty|fail/i.test(v) ? 'crit'
-    : (/notPresent|notAvailable|^off|^down/i.test(v) ? 'idle' : 'warn'));
+  // A status word's pill: healthy words are good, broken ones crit, the
+  // states that need a look warn, and anything else neutral. The word is
+  // matched without the SNMP code ("ok (1)" is ok). An unknown word is never
+  // a warning: on a healthy switch most of the screen is states nobody
+  // listed here.
+  const STATE_GOOD = /^(normal|on|up|ok|good|green|active|enabled|true|yes|present|operational|forwarding|designated|root|deliveringPower|configured|connected|established|authorized|running|success|complete|completed)$/i;
+  const STATE_CRIT = /critical|shutdown|notFunctioning|faulty|fault|fail|error|^red$|^bad$|unauthorized|errDisabled|err-disabled/i;
+  const STATE_WARN = /^(warning|degraded|testing|yellow|amber|overload|otherFault|lowerLayerDown|dormant|unknown|inconsistent|broken|denied|stale)$/i;
+  const stateClass = (v) => {
+    const w = String(enumWord(String(v == null ? '' : v))).trim();
+    if (STATE_GOOD.test(w)) return 'good';
+    if (STATE_CRIT.test(w)) return 'crit';
+    if (STATE_WARN.test(w)) return 'warn';
+    return 'idle';
+  };
 
   // ============================================================================
   // Keyed table reconciliation engine
@@ -2849,7 +2875,8 @@
   //
   // Cell specs are the same shapes the legacy table() builder accepts:
   //   plain string/number            -> text cell
-  //   { v, pill }                    -> coloured status pill
+  //   { v, pill }                    -> coloured status pill (pill: true picks the
+  //                                     colour from the word; 'good'|'warn'|'crit'|'idle' sets it)
   //   { v, click:{open} }            -> row-opens-detail link cell
   //   { actions }                    -> port action buttons (via portActionsCell)
   //   { vlanDelete }                 -> VLAN delete cell
@@ -2906,14 +2933,20 @@
     const pillText = c && c.pill ? String(c.v === undefined || c.v === null ? '' : c.v).trim() : '';
     if (c && c.pill && pillText) {
       const td = document.createElement('td');
-      td.appendChild(el('span', 'pill ' + stateClass(pillText), c.v));
+      const pv = typeof c.pill === 'string' ? c.pill : stateClass(pillText);
+      const sp = el('span', 'pill ' + pv, enumWord(pillText));
+      if (enumCode(pillText) !== null) sp.title = pillText;
+      td.appendChild(sp);
       return td;
     }
     if (c && c.pill) return el('td', 'col-value', '');
     const text = (c && typeof c === 'object')
       ? (c.v === undefined || c.v === null ? '' : c.v)
       : (c === undefined || c === null ? '' : c);
-    return el('td', 'col-value', typeof text === 'object' ? '' : text);
+    if (typeof text === 'object') return el('td', 'col-value', '');
+    const td = el('td', 'col-value', enumWord(text));
+    if (enumCode(text) !== null) td.title = text;
+    return td;
   }
 
   // A stable signature of a cell's rendered content, used to decide whether a
@@ -3664,7 +3697,7 @@
   function openDetailDialog(s, title, pairs, sections) {
     const grid = (ps) => {
       const dl = el('dl', 'port-detail-grid');
-      for (const [k, v] of ps) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
+      for (const [k, v] of ps) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', enumWord(String(v)))); }
       return dl;
     };
     openTabbedPopout(s, title, [{ label: 'Details', fill: (pane) => {
@@ -3733,7 +3766,7 @@
     // ---- Port tab: identity fields + PoE, then physical settings below ----
     tabs.push({ label: 'Port', fill: (pane) => {
       const defs = el('dl', 'port-detail-grid');
-      const addField = (k, v) => { if (v === undefined || v === null || v === '') return; defs.appendChild(el('dt', '', k)); defs.appendChild(el('dd', '', String(v))); };
+      const addField = (k, v) => { if (v === undefined || v === null || v === '') return; defs.appendChild(el('dt', '', k)); defs.appendChild(el('dd', '', enumWord(String(v)))); };
       for (const k in (detail.fields || {})) addField(k, detail.fields[k]);
       if (detail.poe) { for (const k in detail.poe) addField('PoE ' + k, detail.poe[k]); }
       if (defs.children.length) pane.appendChild(defs);
@@ -4589,7 +4622,7 @@
     const d = detail.dot1x;
     // Current state, always shown.
     const dl = el('dl', 'port-detail-grid');
-    const row = (k, v) => { if (v) { dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', v)); } };
+    const row = (k, v) => { if (v) { dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', enumWord(v))); } };
     row('Port-control', d.control || '(not set)');
     row('Status', d.status || '(unknown)');
     row('Host-mode', d.hostMode || '(not set)');
@@ -4794,7 +4827,7 @@
       const val = vb.display !== undefined && vb.display !== null && vb.display !== String(vb.value)
         ? vb.display : vb.value;
       dlg.appendChild(el('dt', '', row[0]));
-      dlg.appendChild(el('dd', '', String(val === undefined || val === null ? '' : val)));
+      dlg.appendChild(el('dd', '', enumWord(String(val === undefined || val === null ? '' : val))));
     }
     if (dlg.children.length) {
       wrap.appendChild(dlg);
@@ -5837,7 +5870,7 @@
             ['Source', cur.source], ['Shared key', cur.key]]
           : [['Address', cur.addr], ['Port', cur.port], ['Connection', cur.status], ['Type', cur.type],
             ['Priority', cur.priority], ['Timeout (s)', cur.timeout], ['Shared key', cur.key]];
-        for (const [k, v] of pairs) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
+        for (const [k, v] of pairs) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', enumWord(String(v)))); }
         pane.appendChild(dl);
       } });
     }
@@ -5849,7 +5882,7 @@
           const val = (v && typeof v === 'object') ? (v.display !== undefined ? v.display : v.value) : v;
           if (val === undefined || val === null || val === '') continue;
           dl.appendChild(el('dt', '', k.replace(/^radiusAuthClient/, '').replace(/^radiusAuthServer/, 'Server ').replace(/([A-Z])/g, ' $1').trim()));
-          dl.appendChild(el('dd', '', String(val)));
+          dl.appendChild(el('dd', '', enumWord(String(val))));
         }
         pane.appendChild(dl);
       } });
@@ -6551,7 +6584,7 @@
           if (value === null || value === undefined || value === '') return;
           const c = el('div', 'card');
           c.appendChild(el('div', 'card-label', label));
-          c.appendChild(el('div', 'card-value' + (cls ? ' ' + cls : ''), value));
+          c.appendChild(el('div', 'card-value' + (cls ? ' ' + cls : ''), enumWord(value)));
           if (sub) c.appendChild(el('div', 'card-sub', sub));
           if (trend) {
             const spark = sparkline(
@@ -7513,7 +7546,7 @@
             if (v === undefined || v === null || v === '') continue;
             const row = el('div', 'kv-row');
             row.appendChild(el('div', 'k', k));
-            row.appendChild(el('div', 'v', v));
+            row.appendChild(el('div', 'v', enumWord(v)));
             box.appendChild(row);
           }
         };

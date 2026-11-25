@@ -774,7 +774,7 @@
     const d = detail.dot1x;
     // Current state, always shown.
     const dl = el('dl', 'port-detail-grid');
-    const row = (k, v) => { if (v) { dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', v)); } };
+    const row = (k, v) => { if (v) { dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', enumWord(v))); } };
     row('Port-control', d.control || '(not set)');
     row('Status', d.status || '(unknown)');
     row('Host-mode', d.hostMode || '(not set)');
@@ -979,7 +979,7 @@
       const val = vb.display !== undefined && vb.display !== null && vb.display !== String(vb.value)
         ? vb.display : vb.value;
       dlg.appendChild(el('dt', '', row[0]));
-      dlg.appendChild(el('dd', '', String(val === undefined || val === null ? '' : val)));
+      dlg.appendChild(el('dd', '', enumWord(String(val === undefined || val === null ? '' : val))));
     }
     if (dlg.children.length) {
       wrap.appendChild(dlg);

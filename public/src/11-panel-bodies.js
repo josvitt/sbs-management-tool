@@ -168,7 +168,7 @@
           if (value === null || value === undefined || value === '') return;
           const c = el('div', 'card');
           c.appendChild(el('div', 'card-label', label));
-          c.appendChild(el('div', 'card-value' + (cls ? ' ' + cls : ''), value));
+          c.appendChild(el('div', 'card-value' + (cls ? ' ' + cls : ''), enumWord(value)));
           if (sub) c.appendChild(el('div', 'card-sub', sub));
           if (trend) {
             const spark = sparkline(
@@ -1130,7 +1130,7 @@
             if (v === undefined || v === null || v === '') continue;
             const row = el('div', 'kv-row');
             row.appendChild(el('div', 'k', k));
-            row.appendChild(el('div', 'v', v));
+            row.appendChild(el('div', 'v', enumWord(v)));
             box.appendChild(row);
           }
         };

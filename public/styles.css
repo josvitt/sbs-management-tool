@@ -144,14 +144,12 @@ main { flex: 1; min-height: 0; position: relative; display: flex; }
 .subtab .sdot.busy { background: var(--amber); }
 .subtab .sdot.err { background: var(--red); }
 
-/* The Health sub-tab carries the same verdict colour as the Overview
-   badge, so the state of the switch is legible without opening it. */
-.subtab.sev-ok { color: var(--green); border-color: rgba(126,200,143,0.45); }
-.subtab.sev-warning { color: var(--warn); border-color: rgba(230,207,74,0.5); }
-.subtab.sev-critical { color: var(--red); border-color: rgba(226,96,79,0.55); }
-.subtab.sev-ok.active { border-color: var(--green); }
-.subtab.sev-warning.active { border-color: var(--warn); }
-.subtab.sev-critical.active { border-color: var(--red); }
+/* The Overview sub-tab carries the same verdict colour as the Overview
+   badge, in its dot only: the underline belongs to the open tab, so an
+   alert never makes a second tab look selected. */
+.subtab.sev-ok .sdot { background: var(--green); }
+.subtab.sev-warning .sdot { background: var(--warn); box-shadow: 0 0 5px var(--warn); }
+.subtab.sev-critical .sdot { background: var(--red); box-shadow: 0 0 5px var(--red); }
 
 .subview { flex: 1; min-height: 0; min-width: 0; display: none; flex-direction: column; position: relative; }
 .subview.active { display: flex; }
