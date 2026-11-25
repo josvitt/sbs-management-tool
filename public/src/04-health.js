@@ -65,7 +65,10 @@
     { key: 'system', title: 'System', span: 12, h: 0, needs: () => true },
     // Port features: switch-wide LLDP/CDP/EEE, errdisable recovery, port
     // mirroring and a per-port overview (28-port-features.js).
-    { key: 'portfeatures', title: 'Port features', span: 12, h: 0, needs: () => true }
+    { key: 'portfeatures', title: 'Port features', span: 12, h: 0, needs: () => true },
+    // Spanning tree settings: on or off, mode, bridge priority and the
+    // per-port settings (29-stp-settings.js). Always offered.
+    { key: 'stpsettings', title: 'Spanning tree settings', span: 12, h: 0, needs: () => true }
   ];
 
   const builtinDef = (key) => BUILTIN.find((b) => b.key === key);
@@ -1176,7 +1179,8 @@
     system: [],
     // Port features has its own loader (28-port-features.js); its port names
     // come from the interfaces table.
-    portfeatures: ['interfaces']
+    portfeatures: ['interfaces'],
+    stpsettings: ['interfaces']
   };
   function panelDependsOn(key, changedTables) {
     const deps = PANEL_TABLE_DEPS[key];
@@ -1353,6 +1357,7 @@
     take('_maint', body.maint && !body.maint.error ? body.maint : (body.maint ? { error: body.maint.error } : undefined));
     take('_system', body.system && !body.system.error ? body.system : (body.system ? { error: body.system.error } : undefined));
     take('_ports', body.ports && !body.ports.error ? body.ports : (body.ports ? { error: body.ports.error } : undefined));
+    take('_stpSet', body.stp && !body.stp.error ? body.stp : (body.stp ? { error: body.stp.error } : undefined));
   }
 
   // Viewer sync: show the server's latest snapshot WITHOUT the browser walking
@@ -1473,7 +1478,7 @@
     if (p.key === 'auth') { loadSessions(s); }
     // SNMP configuration, Flash files and Packet capture re-run their own
     // loaders (server endpoints, not health tables) and reconcile in place.
-    const ownLoader = { snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad, maint: maintLoad, system: systemLoad, portfeatures: portsLoad }[p.key];
+    const ownLoader = { snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad, maint: maintLoad, system: systemLoad, portfeatures: portsLoad, stpsettings: stpSetLoad }[p.key];
     if (ownLoader) {
       if (btn) { btn.disabled = true; btn.classList.add('spin'); }
       ownLoader(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });

@@ -147,7 +147,127 @@ async function readStp(session) {
   };
 }
 
+// ---- writes ----------------------------------------------------------------
+// Each is encoded from the rows the switch made (docs/SWITCH-NOTES.md,
+// "Spanning tree"). Nothing here saves the configuration.
+
+function setVarbinds(session, varbinds) {
+  return new Promise((resolve, reject) => {
+    session.set(varbinds, (error, result) => {
+      if (error) return reject(error);
+      const bad = (result || []).find((vb) => snmp.isVarbindError(vb));
+      if (bad) return reject(new Error(snmp.varbindError(bad)));
+      resolve(result);
+    });
+  });
+}
+
+const I = (oid, value) => ({ oid, type: snmp.ObjectType.Integer, value });
+const TV = (on) => (on ? 1 : 2);
+
+function checkPort(port) {
+  const n = Number(port);
+  if (!Number.isInteger(n) || n < 1 || n > 4096) throw new Error('port must be a bridge port number.');
+  return n;
+}
+
+function checkBridgePriority(priority) {
+  const n = Number(priority);
+  if (!Number.isInteger(n) || n < 0 || n > 61440 || n % 4096) throw new Error('The bridge priority is 0 to 61440, in steps of 4096.');
+  return n;
+}
+
+function checkPortPriority(priority) {
+  const n = Number(priority);
+  if (!Number.isInteger(n) || n < 0 || n > 240 || n % 16) throw new Error('The port priority is 0 to 240, in steps of 16.');
+  return n;
+}
+
+function checkCost(cost) {
+  const n = Number(cost);
+  if (!Number.isInteger(n) || n < 0 || n > 200000000) throw new Error('The cost is 0 (automatic) to 200000000.');
+  return n;
+}
+
+/** Spanning tree on or off for the whole switch. */
+async function setEnabled(session, on) {
+  await setVarbinds(session, [I(SCALARS.enable, TV(on))]);
+  return { enabled: !!on };
+}
+
+/** The mode: 'stp', 'rstp', 'mstp', 'pvst' or 'rapid-pvst'. */
+async function setMode(session, mode) {
+  const v = Object.keys(MODE).find((k) => MODE[k] === mode);
+  if (v == null) throw new Error('mode must be stp, rstp, mstp, pvst or rapid-pvst.');
+  await setVarbinds(session, [I(SCALARS.version, Number(v))]);
+  return { mode };
+}
+
+/**
+ * The bridge priority: for the whole switch (STP, RSTP and the MSTP
+ * common instance), for one VLAN (`where.vlan`, PVST) or for one MSTP
+ * instance (`where.instance`).
+ */
+async function setBridgePriority(session, priority, where) {
+  const n = checkBridgePriority(priority);
+  const w = where || {};
+  let oid;
+  if (w.vlan != null) {
+    const vlan = Number(w.vlan);
+    if (!Number.isInteger(vlan) || vlan < 1 || vlan > 4094) throw new Error('vlan is 1 to 4094.');
+    oid = PVST_VLAN + '.5.' + vlan;
+  } else if (w.instance != null) {
+    const inst = Number(w.instance);
+    if (!Number.isInteger(inst) || inst < 0 || inst > 4094) throw new Error('instance is 0 to 4094.');
+    oid = MSTP_INST + '.12.' + inst;
+  } else oid = SCALARS.priority;
+  await setVarbinds(session, [I(oid, n)]);
+  return Object.assign({ priority: n }, w);
+}
+
+/**
+ * One port's settings, by bridge port: any of enabled, priority, cost
+ * (0 = automatic), edge (PortFast), autoEdge and bpduGuard.
+ */
+async function setPort(session, port, p) {
+  const n = checkPort(port);
+  const vbs = [];
+  if (p.enabled != null) vbs.push(I(STP_PORT + '.4.' + n, p.enabled ? 1 : 2));
+  if (p.priority != null) vbs.push(I(STP_PORT + '.2.' + n, checkPortPriority(p.priority)));
+  if (p.cost != null) vbs.push(I(STP_EXT + '.6.' + n, checkCost(p.cost)));
+  if (p.edge != null) vbs.push(I(STP_EXT + '.2.' + n, TV(p.edge)));
+  if (p.autoEdge != null) vbs.push(I(RL_PORT + '.10.' + n, TV(p.autoEdge)));
+  if (p.bpduGuard != null) vbs.push(I(BPDU_GUARD + '.1.' + n, TV(p.bpduGuard)));
+  if (!vbs.length) throw new Error('Nothing to change.');
+  // One SET each: a refused column then names itself and leaves the others.
+  const done = [];
+  for (const vb of vbs) {
+    try { await setVarbinds(session, [vb]); done.push(vb.oid); }
+    catch (e) { e.message = e.message + ' (' + vb.oid + (done.length ? '; already set: ' + done.join(', ') : '') + ')'; throw e; }
+  }
+  return { port: n, set: p };
+}
+
+/** One port's priority or cost in one VLAN (PVST) or MSTP instance. */
+async function setPortIn(session, where, port, p) {
+  const n = checkPort(port);
+  const w = where || {};
+  const vbs = [];
+  if (w.vlan != null) {
+    const idx = Number(w.vlan) + '.' + n;
+    if (p.cost != null) vbs.push(I(PVST_PORT + '.3.' + idx, checkCost(p.cost)));
+    if (p.priority != null) vbs.push(I(PVST_PORT + '.4.' + idx, checkPortPriority(p.priority)));
+  } else if (w.instance != null) {
+    const idx = Number(w.instance) + '.' + n;
+    if (p.priority != null) vbs.push(I(MSTP_PORT + '.3.' + idx, checkPortPriority(p.priority)));
+    if (p.cost != null) vbs.push(I(MSTP_PORT + '.12.' + idx, checkCost(p.cost)));
+  } else throw new Error('Name a vlan or an instance.');
+  if (!vbs.length) throw new Error('Nothing to change.');
+  await setVarbinds(session, vbs);
+  return Object.assign({ port: n, set: p }, w);
+}
+
 module.exports = {
-  readStp, SCALARS, MODE, DOT1D, STP_PORT, STP_EXT, BASE_PORT, RL_STP, RL_PORT, BPDU_GUARD,
+  readStp, setEnabled, setMode, setBridgePriority, setPort, setPortIn, SCALARS, MODE, DOT1D, STP_PORT, STP_EXT, BASE_PORT, RL_STP, RL_PORT, BPDU_GUARD,
   PVST_VLAN, PVST_PORT, MSTP_INST, MSTP_PORT
 };
