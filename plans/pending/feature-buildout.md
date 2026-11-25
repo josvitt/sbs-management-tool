@@ -205,7 +205,7 @@ A new **QoS** panel.
 | 2 Design review | Done (v1.8.0): words not codes, warning color, button colors, focus ring, temperature fix |
 | 3 Restore, reboot, firmware | Reboot, next boot image and image list proven on .253. Restore held back: the switch drops an `aaa` block from a config copied into startup. Firmware install proven (65.7 MB in 121 s). Shipped in v1.9.0. |
 | 4 System | Shipped in v1.10.0: clock, time zone, SNTP on/off, management services, user privilege and delete, proven on .253. Held back (no SNMP form taken, see SWITCH-NOTES): adding SNTP servers, adding users, setting passwords. Summer time and the management access list read-only. SNMPv3 users (4.4) moved to fog. |
-| 5 Ports and PoE | Not started |
+| 5 Ports and PoE | Shipped in v1.11.0: PoE admin, priority and limit; port security; storm control (kb/s); errdisable recovery; LLDP, CDP and EEE per port; CDP for the switch; port mirroring sessions; cable test. Switch test 27/27 on .253. One Port features panel holds the switch-wide settings and mirroring (rather than a separate Port mirroring panel), plus a Features tab on each port. LLDP and EEE for the whole switch are offered but were not switched in the test, since they touch every link. |
 | 6 Spanning tree | Not started |
 | 7 Access lists | Not started |
 | 8 Switching security | Not started |

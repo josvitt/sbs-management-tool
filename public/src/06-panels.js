@@ -8,7 +8,7 @@
   // has no mounted keyed tables yet (caller should fall back to a full repaint).
   // panelIsConverted lists the keys that use keyed tables for every table they
   // render; a converted panel is safe to reconcile without a full repaint.
-  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg', 'stp', 'flash', 'capture', 'maint', 'system']);
+  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg', 'stp', 'flash', 'capture', 'maint', 'system', 'portfeatures']);
   // A converted panel may still have sections built on a full paint only (auth's
   // 802.1X editor). When a refresh changes a table those read, full-repaint
   // instead of reconciling.
@@ -610,6 +610,10 @@
           .catch((e) => { clear(wrap); wrap.appendChild(el('div', 'sw-err', 'Could not read Voice VLAN settings: ' + e.message)); });
       } });
     }
+
+    // ---- Features tab: PoE, port security, storm control, discovery, cable
+    // test (28-port-features.js). Front-panel ports only. ----
+    if (hasIf && Number(detail.ifIndex) < 1000) tabs.push(portFeaturesTab(s, Number(detail.ifIndex)));
 
     // ---- ACL tab: ACLs bound to this interface (input/output + default) ----
     if (hasIf) {

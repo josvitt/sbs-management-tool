@@ -262,6 +262,45 @@ Read from a C1300 (25 Nov 2026, firmware 4.1.9.92):
   presses. The app reads switches over SNMP and leaves typing config to a
   person watching the output.
 
+## Port features (`switch-ports.js`, `28-port-features.js`)
+
+Proven on a C1300-24MGP-4X (4.1.9.92), with `scripts/switch-test-ports.js`
+on an empty port, each change put back.
+
+- **Most per-port tables carry a row for all 416 possible ifIndexes**
+  (swIfTable, lldpPortConfigTable, cdpInterfaceTable, rlEeePortTable). A
+  walk of five swIfTable columns took 523 requests and 25 s. The present
+  front-panel ports come from `rlifPresentType` (type 6, ifIndex under 1000;
+  1800 is the out-of-band port) and their rows are read by GET.
+- **Storm control lives in `rlStormCtrlRateLimCfgTable` (V.77.12),** indexed
+  ifIndex.traffic (broadcast 1, multicast all 4, unknown unicast 5). The
+  older `rlStormCtrlTable` (V.77.8) is empty. Every switch-made row reads
+  rate 0, unit 1, action 1. A rate of 10000 written to the rate column
+  (Unsigned32) shows on the switch's web page as "10000 kbits/sec", so unit 1
+  is kb/s. Only the rate is written; 0 turns it off.
+- **PoE:** `pethPsePortAdminEnable`, `pethPsePortPowerPriority` and
+  `rlPethPsePortPowerLimit` (mW) take a SET together.
+- **Port security:** `swIfLockLimitationMode`, `swIfLockMaxMacAddresses` and
+  `swIfLockAdminStatus` take a SET together.
+- **LLDP, CDP and EEE per port, CDP for the switch, errdisable recovery
+  causes and interval:** plain SETs of the column, proven.
+- **Cable test:** `rlPhyTestSetType` = 2 (cable status, TDR) on a port with
+  no link gave a result in about 30 s (`cableStatus`, units alaskaPhyStatus).
+  On a linked gigabit port the results table also holds a VCT length
+  (`cableLength`, units alaskaPhyLength, 0 to 4 meaning under 50 m to over
+  140 m) and pair results that read `failed`, from earlier tests.
+- **Mirroring:** the switch-made destination row reads ifIndex, span(1),
+  monitor-only(1), RSPAN VLAN 1, active; its sources are indexed session,
+  port(1), ifIndex with direction both(3). A new destination row (session 2)
+  was refused with InconsistentValue on the row status in createAndGo and in
+  createAndWait on the first run. On the second run `addMirror`, which now
+  tries five forms in turn, made session 2 (port 5 to port 4), and it read
+  back as the switch-made row does (RSPAN VLAN 1). Which form the switch
+  took was not logged on that run; `addMirror` now returns it as `via`, with
+  the refusals before it. Adding a port to an existing session (createAndGo
+  on the source row with its direction) and taking it out (destroy) are
+  proven, as is removing a session (sources, then the destination).
+
 ## Port actions (`routes/ports.js`)
 
 - **A PoE bounce makes the config "unsaved".** The bounce is two writes to
