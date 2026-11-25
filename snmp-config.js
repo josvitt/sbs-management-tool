@@ -4,8 +4,8 @@
  * The dashboard's other SNMP code reads the switch; this module is the
  * write side and the config-specific reads that go with it: notification
  * recipients, SNMP communities, SNMPv3 groups (VACM) and users (USM),
- * system identity, and an access/connectivity diagnostic. It is a port of
- * a standalone Python tool, so the hard-won details about this firmware
+ * system identity changes, an access check and a target-row integrity check.
+ * It is a port of a standalone Python tool, so the hard-won details about this firmware
  * (the "TR-"/"InR-"/"SNR-" internal naming, the address-mask that makes a
  * community pollable, the fact that creating v3 users over SNMP is blocked)
  * live here.
@@ -16,9 +16,8 @@
  * built from the app's existing net-snmp session, so session lifecycle,
  * v3 crypto and redaction stay in server.js where they already are.
  *
- * Every change-producing call returns a plan of SET steps for preview; a
- * matching apply call runs them. Nothing is written without the caller
- * asking twice.
+ * Every change-producing call builds a plan of SET steps, and applyPlan runs
+ * it in order, stopping at the first required step that fails.
  */
 
 'use strict';
@@ -28,11 +27,9 @@ const TARGET_ADDR = '1.3.6.1.6.3.12.1.2.1';       // snmpTargetAddrEntry
 const TARGET_ADDR_EXT = '1.3.6.1.6.3.18.1.2.1';   // snmpTargetAddrExtEntry
 const TARGET_PARAMS = '1.3.6.1.6.3.12.1.3.1';     // snmpTargetParamsEntry
 const NOTIFY = '1.3.6.1.6.3.13.1.1.1';            // snmpNotifyEntry
-const NOTIFY_FILTER_PROFILE = '1.3.6.1.6.3.13.1.2.1';
 const COMMUNITY = '1.3.6.1.6.3.18.1.1.1';         // snmpCommunityEntry
 const RND_COMM_INET = '1.3.6.1.4.1.9.6.1.101.98.5.1';
 const RND_COMM_V4 = '1.3.6.1.4.1.9.6.1.101.2.7.2.1';
-const RL_TARGET_ADDR_EXT = '1.3.6.1.4.1.9.6.1.101.98.1.5.1';
 const AUTH_TRAPS = '1.3.6.1.2.1.11.30.0';         // snmpEnableAuthenTraps
 const VACM_VIEWS = '1.3.6.1.6.3.16.1.5.2.1';      // vacmViewTreeFamilyEntry
 const VACM_S2G = '1.3.6.1.6.3.16.1.2.1';          // vacmSecurityToGroupEntry
@@ -60,22 +57,6 @@ const SEC_LEVEL = { 1: 'noAuthNoPriv', 2: 'authNoPriv', 3: 'authPriv' };
 const SEC_LEVEL_SET = { noAuthNoPriv: 1, authNoPriv: 2, authPriv: 3 };
 const NOTIFY_TYPE = { 1: 'trap', 2: 'inform' };
 const SNMP_UDP_DOMAIN = '1.3.6.1.6.1.1';
-
-const DIAG_TABLES = [
-  ['snmpTargetAddrTable', TARGET_ADDR],
-  ['snmpTargetAddrExtTable', TARGET_ADDR_EXT],
-  ['rlTargetAddrExtTable (CISCOSB)', RL_TARGET_ADDR_EXT],
-  ['snmpTargetParamsTable', TARGET_PARAMS],
-  ['snmpNotifyTable', NOTIFY],
-  ['snmpNotifyFilterProfileTable', NOTIFY_FILTER_PROFILE],
-  ['snmpCommunityTable', COMMUNITY],
-  ['rndCommunityInetTable (CISCOSB)', RND_COMM_INET],
-  ['vacmSecurityToGroupTable', VACM_S2G],
-  ['vacmAccessTable', VACM_ACCESS],
-  ['vacmViewTreeFamilyTable', VACM_VIEWS],
-  ['usmUserTable', USM_USER],
-  ['rlUsmUserExtTable (CISCOSB)', RL_USM_EXT]
-];
 
 // ------------------------------------------------------------- helpers
 
@@ -151,39 +132,7 @@ function ipPort6(buf) {
   return '0x' + b.toString('hex');
 }
 
-function fmtTimeticks(t) {
-  if (t == null || Number.isNaN(t)) return String(t);
-  let secs = Math.floor(t / 100);
-  const days = Math.floor(secs / 86400); secs -= days * 86400;
-  const h = Math.floor(secs / 3600); secs -= h * 3600;
-  const m = Math.floor(secs / 60); secs -= m * 60;
-  const hms = [h, m, secs].map((x) => String(x).padStart(2, '0')).join(':');
-  return days ? `${days}d ${hms}` : hms;
-}
-
 // ------------------------------------------------------------- reads
-
-// System identity, plus which fields are writable (sysName/Location/Contact).
-async function systemStatus(snmp) {
-  const items = [
-    ['System name', SYS.name, 'str', true],
-    ['Description', SYS.descr, 'str', false],
-    ['Uptime', SYS.uptime, 'ticks', false],
-    ['Location', SYS.location, 'str', true],
-    ['Contact', SYS.contact, 'str', true]
-  ];
-  const out = [];
-  for (const [label, oid, kind, writable] of items) {
-    let v = null;
-    try { const r = await snmp.get([oid]); v = r && r[0] ? r[0].value : null; } catch (e) { v = null; }
-    let value, raw = '';
-    if (v == null) value = '(no value)';
-    else if (kind === 'ticks') value = fmtTimeticks(valInt(v));
-    else { value = bytesToStr(v).replace(/\0+$/, '').trim() || '(empty)'; if (value !== '(empty)') raw = value; }
-    out.push({ label, oid, value, writable, raw });
-  }
-  return { items: out };
-}
 
 const SYS_WRITABLE = { [SYS.name]: 'System name', [SYS.location]: 'Location', [SYS.contact]: 'Contact' };
 
@@ -191,9 +140,8 @@ module.exports = {
   // constants/helpers are exported for tests and for server.js glue
   OIDS: { TARGET_ADDR, TARGET_ADDR_EXT, TARGET_PARAMS, NOTIFY, COMMUNITY, VACM_VIEWS,
     VACM_S2G, VACM_ACCESS, USM_USER, RL_USM_EXT, ENGINE_ID, AUTH_TRAPS, SYS },
-  SYS_WRITABLE, DIAG_TABLES,
-  _helpers: { valBytes, valInt, valOidStr, bytesToStr, hexOf, showName, tableRows, ipPort6, fmtTimeticks },
-  systemStatus
+  SYS_WRITABLE,
+  _helpers: { valBytes, valInt, valOidStr, bytesToStr, hexOf, showName, tableRows, ipPort6 }
   // further functions are attached below
 };
 
@@ -913,7 +861,6 @@ async function writeViewFor(snmp, meta) {
   return [false, `group '${showName(candidates[0])}' has an empty write view — reads work but writes fail`];
 }
 
-// Full table dump, decoded, for the diagnostics panel and PDF.
 // Check snmpTargetAddrTable for rows the switch cannot turn into a UDP
 // address. A row with a transport domain (col 2) but a TAddress (col 3) that
 // is not exactly 6 bytes for snmpUDPDomain (or 18 for UDP/IPv6) is malformed:
@@ -953,40 +900,6 @@ async function checkTargetRows(snmp) {
 }
 module.exports.checkTargetRows = checkTargetRows;
 
-async function diagnostics(snmp, opts) {
-  opts = opts || {};
-  const out = { tables: [], gets: [] };
-  if (opts.status !== false) {
-    const st = await systemStatus(snmp);
-    out.status = st.items;
-  }
-  if (opts.access !== false) {
-    out.access = await accessCheck(snmp, opts.meta);
-  }
-  // Always run the target-row integrity check: a malformed row is the thing
-  // that triggers %SNMP-F-BADTDOMAIN, so surfacing it is the whole point.
-  try { out.targetCheck = await checkTargetRows(snmp); } catch (e) { out.targetCheck = { bad: [], error: e.message }; }
-  if (opts.tables !== false) {
-    for (const [name, base] of DIAG_TABLES) {
-      let rows;
-      try { rows = tableRows(await snmp.walk(base), base); }
-      catch (e) { out.tables.push({ name, oid: base, error: e.message, values: [] }); continue; }
-      const values = [];
-      for (const [, row] of rows) {
-        for (const col of Object.keys(row.cols)) {
-          const v = row.cols[col];
-          let raw, decoded;
-          if (Buffer.isBuffer(v)) { raw = hexOf(v); decoded = isPrintable(v) ? v.toString('latin1') : showName(v); }
-          else { raw = String(v); decoded = ''; }
-          values.push({ oid: `${base}.${col}.${row.idx.join('.')}`, object: `col ${col}`, type: '', raw, decoded });
-        }
-      }
-      out.tables.push({ name, oid: base, values });
-    }
-  }
-  return out;
-}
-module.exports.diagnostics = diagnostics;
 module.exports.writeViewFor = writeViewFor;
 
 // ============================================================ more writes

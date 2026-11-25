@@ -241,6 +241,21 @@
     f.appendChild(control);
     return f;
   }
+  // A text input, optionally pre-filled, with a placeholder.
+  function textInput(value, placeholder) {
+    const i = el('input'); i.type = 'text'; if (value != null) i.value = value; if (placeholder) i.placeholder = placeholder;
+    return i;
+  }
+  // A <select> from [{ label, value }], with `value` selected.
+  function selectInput(options, value) {
+    const sel = el('select');
+    for (const o of options) {
+      const opt = el('option', '', o.label); opt.value = o.value;
+      if (o.value === value) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    return sel;
+  }
 
   // One place that knows how to POST JSON to the local API and parse the reply.
   // Returns { ok, body } (never throws on HTTP status); throws only on a network

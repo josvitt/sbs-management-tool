@@ -1075,29 +1075,13 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
   pointer-events: none; white-space: nowrap; box-shadow: 0 6px 18px rgba(0,0,0,.5);
 }
 
-/* ---- SNMP configuration module ---- */
-.snmp-cfg { display: flex; flex-direction: column; gap: 14px; }
-.snmp-cfg-bar { display: flex; gap: 8px; }
+/* ---- SNMP configuration module: access banner ---- */
 .btn-small { width: auto; display: inline-block; padding: 4px 12px; font-size: 11px; }
 .snmp-access-banner { display: flex; align-items: flex-start; gap: 8px; padding: 9px 12px;
   border-radius: 7px; font-size: 13px; line-height: 1.4; }
 .snmp-access-banner.warn { background: rgba(232,163,61,0.12); border: 1px solid var(--amber); color: var(--text); }
 .snmp-access-banner.info { background: rgba(95,179,232,0.10); border: 1px solid var(--blue); color: var(--text); }
 .snmp-access-icon { font-size: 15px; line-height: 1.2; }
-.snmp-sections { display: flex; flex-direction: column; gap: 18px; }
-.snmp-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; }
-.snmp-section-title { margin: 0; font-size: 14px; color: var(--text); font-weight: 600; }
-.snmp-subnote { font-size: 12px; color: var(--muted); margin-bottom: 7px; }
-/* Unified with the preferred .data-table look: bottom-border rows, amber
-   headers, no full cell boxing. */
-.snmp-table { width: 100%; border-collapse: collapse; }
-.snmp-table th, .snmp-table td { padding: 4px 7px; border-bottom: 1px solid #17211c;
-  text-align: left; vertical-align: top; font-size: 11.5px; }
-.snmp-table th { color: var(--amber); font-weight: 600; font-size: 10px; letter-spacing: 0.03em; }
-.snmp-table td { color: var(--text); }
-.snmp-link { background: none; border: 0; padding: 0; color: var(--blue); cursor: pointer; font-size: 13px; }
-.snmp-link.danger { color: var(--red); margin-left: 8px; }
-.snmp-link:hover { text-decoration: underline; }
 
 /* ---- Details identity edit ---- */
 .hero-name-row { display: flex; align-items: center; gap: 8px; }
@@ -1116,28 +1100,19 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
 .snmp-field input, .snmp-field select { padding: 6px 8px; background: var(--panel); color: var(--text);
   border: 1px solid var(--panel-border); border-radius: 5px; font-size: 13px; font-family: inherit; }
 .snmp-form-actions { display: flex; gap: 8px; }
-.snmp-view-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
-.snmp-view-table th, .snmp-view-table td { padding: 4px 7px; text-align: left; border-bottom: 1px solid #17211c; }
-.snmp-view-table th { color: var(--amber); font-weight: 600; font-size: 10px; letter-spacing: 0.03em; }
-.snmp-view-table select { width: 100%; padding: 4px 6px; background: var(--panel); color: var(--text);
-  border: 1px solid var(--panel-border); border-radius: 4px; font-size: 12px; }
-.snmp-lvl-label { color: var(--text); }
-.snmp-lvl-sub { color: var(--muted); font-size: 11px; }
-.snmp-plan { border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; margin: 10px 0;
-  background: var(--panel-2); display: flex; flex-direction: column; gap: 10px; }
-.snmp-plan h5 { margin: 0; font-size: 13px; color: var(--text); }
-.snmp-plan ol { margin: 0; padding-left: 20px; font-size: 13px; color: var(--text); line-height: 1.6; }
-.snmp-plan .warn-line { font-size: 12px; color: var(--amber); }
+.snmp-levels { display: flex; flex-direction: column; gap: 6px; }
+.snmp-lvl-label { color: var(--text); font-size: 12px; margin-top: 4px; }
+.snmp-lvl-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.acl-fsec-body .snmp-lvl-row .snmp-field select { padding: 6px 6px; }
 .snmp-msg { font-size: 13px; padding: 8px 11px; border-radius: 6px; }
 .snmp-msg.ok { background: rgba(102,187,106,0.12); border: 1px solid var(--green); color: var(--text); }
 .snmp-msg.bad { background: rgba(229,115,115,0.12); border: 1px solid var(--red); color: var(--text); }
 .snmp-field-check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
 
-/* ---- SNMP inline editors (row-level and section add hosts) ---- */
+/* ---- Inline row editor (AAA server edit) ---- */
 .snmp-edit-row > td { padding: 0 !important; background: var(--panel-2); }
 .snmp-edit-host { padding: 12px; border-top: 2px solid var(--blue); }
-.snmp-edit-host .snmp-form, .snmp-edit-host .snmp-plan { margin: 0; border: 0; background: transparent; padding: 0; }
-.snmp-add-host:not(:empty) { margin-top: 10px; }
+.snmp-edit-host .snmp-form { margin: 0; border: 0; background: transparent; padding: 0; }
 
 /* ---- Details identity edit form ---- */
 #sysid-form { max-width: 520px; }

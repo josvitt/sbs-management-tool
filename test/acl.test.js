@@ -228,3 +228,43 @@ test('a bound or switch-created list is refused, and nothing is written', async 
   assert.match((await api.deleteQosAcl(s, '2')).error, /created by the switch \(system\)/);
   assert.equal(sw.sets.length, 0);
 });
+
+// The ACL tables are "raw" in health.js (rows are not pivoted), which is not
+// the shared walk's own raw option (bare varbinds, no index or column). With
+// the two mixed up every row lost its index and column, the panel showed no
+// lists, and a new list was given an index already in use. Run the real
+// collection path against a fake agent and check the rows keep both.
+test('ACL tables come back from a health read with index and column', async () => {
+  const snmp = require('net-snmp');
+  const health = require('../health');
+  const { boundedWalkPromise } = require('../collection');
+  const T = snmp.ObjectType;
+  const agent = [
+    ['1.3.6.1.4.1.9.6.1.101.88.7.1.2.1', T.OctetString, Buffer.from('Example')],
+    ['1.3.6.1.4.1.9.6.1.101.88.7.1.3.1', T.Integer, 2],
+    ['1.3.6.1.4.1.9.6.1.101.88.31.1.3.1.1', T.Integer, 1],
+    ['1.3.6.1.4.1.9.6.1.101.88.5.1.4.7', T.OctetString, Buffer.from([0x06, 0xff])]
+  ];
+  const cmp = (a, b) => { const x = a.split('.').map(Number), y = b.split('.').map(Number);
+    for (let i = 0; i < Math.max(x.length, y.length); i++) { if (x[i] === undefined) return -1; if (y[i] === undefined) return 1; if (x[i] !== y[i]) return x[i] - y[i]; } return 0; };
+  agent.sort((a, b) => cmp(a[0], b[0]));
+  const after = (oid) => agent.find(([o]) => cmp(o, oid) > 0);
+  const session = {
+    version: snmp.Version2c,
+    getBulk: (oids, nr, max, cb) => { const n = after(oids[0]); setImmediate(() => cb(null, n ? [{ oid: n[0], type: n[1], value: n[2] }] : [{ oid: oids[0], type: T.EndOfMibView }])); },
+    getNext: (oids, cb) => { const n = after(oids[0]); setImmediate(() => cb(null, n ? [{ oid: n[0], type: n[1], value: n[2] }] : [{ oid: oids[0], type: T.EndOfMibView }])); }
+  };
+  const out = await health.collect({ only: ['aclNames', 'aclAces', 'aclTuples'], get: async () => [],
+    walk: (oid, spec) => boundedWalkPromise(session, oid, undefined, spec) });
+  const name = out.aclNames.find((r) => r.column === 'rlQosAclName');
+  assert.ok(name, 'the name row is recognised');
+  assert.equal(name.index, '1');
+  assert.equal(name.value, 'Example');
+  assert.equal(out.aclAces[0].column, 'rlQosAceTidxAction');
+  assert.equal(out.aclAces[0].index, '1.1');
+  assert.equal(out.aclTuples[0].column, 'rlQosTupleValue2');
+  // And the panel's join sees the list.
+  const { api } = load({ set: () => ({}), health: () => ({}) });
+  const model = api.aclModel({ aclNames: plain(out.aclNames), aclAces: plain(out.aclAces), aclTuples: plain(out.aclTuples) });
+  assert.deepEqual(plain(model.acls.map((a) => [a.idx, a.name, a.type, a.aceList.length])), [['1', 'Example', 2, 1]]);
+});
