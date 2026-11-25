@@ -3,8 +3,10 @@
 /**
  * System settings over SNMP: clock, time zone, summer time and SNTP
  * servers; local user accounts; and which management services are on.
- * This file reads only. Writes are added once the switch-made rows are
- * recorded (MODULE-STANDARD rule 5).
+ * The writes are encoded from the rows the switch itself made, recorded
+ * from a C1300 on 4.1.9.92 (MODULE-STANDARD rule 5, docs/SWITCH-NOTES.md).
+ * Summer time is read-only: its 14-byte start and end encoding is not yet
+ * known.
  *
  * Objects (CISCOSB MIBs, vendor root 1.3.6.1.4.1.9.6.1.101):
  *   rlTimeSyncMethodMode 92.1: .4 rndTimeSyncManagedDateTime (ddmmyyhhmmss),
@@ -14,9 +16,9 @@
  *   rlSntpConfig 92.2.2: .2 rlSntpUnicastAdminState, .5 rlSntpUnicastPollState,
  *     .8 rlSntpAuthenticationState, .14 rlSntpPort, .20 rlSntpTimeSinceLastSync,
  *     .17 rlSntpConfigServerInetTable (index: address type, length, address)
- *   rlAAALocalUserTable 79.17.1: .1 name, .3 privilege, .5 locked, .6 failed
- *     logins. The password (.2), salt (.10) and hash method (.11) columns
- *     are never read.
+ *   rlAAALocalUserTable 79.17.1: .1 name, .3 privilege, .5 locked(0)/usable(1),
+ *     .6 failed logins. The password (.2), salt (.10) and hash method (.11)
+ *     columns are never asked for (see readUsers).
  *   rlAAALocalUserEnabled 79.5
  *   rlTelnetEnable 58.7; rlSshServerPort 78.2.101, rlSshServerEnable 78.2.102,
  *     rlSshServerEnablePublicKeyAuthentication 78.2.103,
@@ -92,9 +94,9 @@ async function getScalars(session) {
   return out;
 }
 
-async function walkSubtree(session, base) {
+async function walkSubtree(session, base, mode) {
   const { boundedWalkPromise } = require('./collection');
-  const rows = await boundedWalkPromise(session, base, 'getbulk', { maxRows: 400 });
+  const rows = await boundedWalkPromise(session, base, mode || 'getbulk', { maxRows: 400 });
   return rows.filter((vb) => !snmp.isVarbindError(vb) && String(vb.oid).indexOf(base + '.') === 0);
 }
 
@@ -181,23 +183,22 @@ async function readServers(session) {
 }
 
 async function readUsers(session) {
-  // One column at a time, so the password, salt and hash columns are never asked for.
-  const byIndex = new Map();
-  for (const col of [1, 3, 5, 6]) {
-    const base = USERS + '.' + col;
-    for (const vb of await walkSubtree(session, base)) {
-      const idx = vb.oid.slice(base.length + 1);
-      if (!byIndex.has(idx)) byIndex.set(idx, {});
-      byIndex.get(idx)[col] = vb.value;
-    }
-  }
+  // The privilege column is walked one GETNEXT at a time: a GETBULK runs on
+  // past the end of a column, and the columns after it are the password
+  // hash (.2) and its salt (.10). The step past the last privilege lands on
+  // the row status column (.4), which is harmless. The name, lock state and
+  // failed logins are then read with a GET per user.
+  const privs = await walkSubtree(session, USERS + '.3', 'next');
   const out = [];
-  for (const [index, c] of byIndex) {
+  for (const vb of privs) {
+    const idx = vb.oid.slice(USERS.length + 3);
+    const [nameVb, lockVb, failVb] = await getChunk(session, [1, 5, 6].map((c) => USERS + '.' + c + '.' + idx));
+    const ok = (x) => x && !snmp.isVarbindError(x);
     out.push({
-      name: c[1] != null ? text(c[1]) : (takeString(index.split('.').map(Number)) || {}).value || index,
-      privilege: num(c[3]),
-      locked: c[5] == null ? null : Number(c[5]) === 0,
-      failedLogins: num(c[6])
+      name: ok(nameVb) ? text(nameVb.value) : ((takeString(idx.split('.').map(Number)) || {}).value || idx),
+      privilege: num(vb.value),
+      locked: ok(lockVb) ? Number(lockVb.value) === 0 : null,
+      failedLogins: ok(failVb) ? num(failVb.value) : null
     });
   }
   return out.sort((a, b) => a.name.localeCompare(b.name));
@@ -274,4 +275,192 @@ async function readSystem(session) {
   };
 }
 
-module.exports = { readSystem, switchDateTime, takeInet, inetText, SCALARS, SNTP_SERVERS, USERS, MNG_RULES };
+// ---- writes ----------------------------------------------------------------
+
+function setVarbinds(session, varbinds) {
+  return new Promise((resolve, reject) => {
+    session.set(varbinds, (error, result) => {
+      if (error) return reject(error);
+      const bad = (result || []).find((vb) => snmp.isVarbindError(vb));
+      if (bad) return reject(new Error(snmp.varbindError(bad)));
+      resolve(result);
+    });
+  });
+}
+
+const I = (oid, value) => ({ oid, type: snmp.ObjectType.Integer, value });
+const OS = (oid, value) => ({ oid, type: snmp.ObjectType.OctetString, value: Buffer.from(String(value), 'utf8') });
+const ROW = { active: 1, createAndGo: 4, destroy: 6 };
+
+/** Arcs for a length-prefixed string index. */
+function stringIndex(str) {
+  const b = Buffer.from(String(str), 'utf8');
+  return b.length + '.' + Array.from(b).join('.');
+}
+
+/** "+hh:mm" or "-hh:mm" (the switch also accepts and shows "hh:mm" for +). */
+function normaliseOffset(offset) {
+  const m = /^([+-]?)(\d{1,2}):?(\d{2})$/.exec(String(offset || '').trim());
+  if (!m) throw new Error('The time zone offset must look like +01:00 or -07:00.');
+  const h = Number(m[2]), min = Number(m[3]);
+  if (h > 14 || min > 59 || (min % 15)) throw new Error('The time zone offset must be between -12:00 and +14:00, in steps of 15 minutes.');
+  const sign = m[1] === '-' ? '-' : '+';
+  if (sign === '-' && h > 12) throw new Error('The time zone offset must be between -12:00 and +14:00.');
+  return sign + String(h).padStart(2, '0') + ':' + String(min).padStart(2, '0');
+}
+
+/** Set the UTC offset and, optionally, its short name (up to 4 letters). */
+async function setTimeZone(session, offset, code) {
+  const off = normaliseOffset(offset);
+  const vbs = [OS(SCALARS.zoneOffset, off)];
+  if (code != null) {
+    const c = String(code).trim();
+    if (c && !/^[A-Za-z]{1,4}$/.test(c)) throw new Error('The time zone name must be 1 to 4 letters, such as MST.');
+    vbs.push(OS(SCALARS.zoneCode, c));
+  }
+  await setVarbinds(session, vbs);
+  return { zoneOffset: off, zoneCode: code == null ? undefined : String(code).trim() };
+}
+
+/** Turn SNTP (unicast) on or off. */
+async function setSntp(session, on) {
+  await setVarbinds(session, [I(SCALARS.sntpUnicast, on ? 1 : 2)]);
+  return { unicast: !!on };
+}
+
+/** The InetAddress index arcs for an SNTP server: type.len.bytes. */
+function serverIndex(address) {
+  const a = String(address || '').trim();
+  if (!a || a.length > 158) throw new Error('Enter a server address or host name.');
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(a)) {
+    const parts = a.split('.').map(Number);
+    if (parts.some((n) => n > 255)) throw new Error(a + ' is not an IPv4 address.');
+    return { kind: 'ipv4', index: '1.4.' + parts.join('.') };
+  }
+  if (a.includes(':')) throw new Error('IPv6 SNTP servers are not supported yet.');
+  if (!/^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/.test(a)) {
+    throw new Error(a + ' is not a valid host name.');
+  }
+  return { kind: 'name', index: '16.' + stringIndex(a.toLowerCase()) };
+}
+
+/** Add an SNTP server, polled. */
+async function addSntpServer(session, address) {
+  const { index, kind } = serverIndex(address);
+  await setVarbinds(session, [
+    I(SNTP_SERVERS + '.3.' + index, 1),
+    I(SNTP_SERVERS + '.10.' + index, ROW.createAndGo)
+  ]);
+  return { added: String(address).trim(), kind };
+}
+
+async function removeSntpServer(session, address) {
+  const { index } = serverIndex(address);
+  await setVarbinds(session, [I(SNTP_SERVERS + '.10.' + index, ROW.destroy)]);
+  return { removed: String(address).trim() };
+}
+
+/** Set the clock. `local` is the switch's local time as "YYYY-MM-DD hh:mm:ss". */
+async function setClock(session, local) {
+  const m = /^20(\d\d)-(\d\d)-(\d\d)[ T](\d\d):(\d\d)(?::(\d\d))?$/.exec(String(local || '').trim());
+  if (!m) throw new Error('The time must look like 2026-11-25 15:30:00.');
+  const v = m[3] + m[2] + m[1] + m[4] + m[5] + (m[6] || '00');
+  await setVarbinds(session, [OS(SCALARS.dateTime, v)]);
+  return { set: switchDateTime(v) };
+}
+
+// ---- local users ----
+
+function checkUserName(name) {
+  const n = String(name || '');
+  if (!/^[A-Za-z0-9._@-]{1,20}$/.test(n)) throw new Error('A user name is 1 to 20 letters, digits, dots, dashes, underscores or @.');
+  return n;
+}
+
+function checkPassword(pw) {
+  const p = String(pw == null ? '' : pw);
+  if (p.length < 8 || p.length > 64) throw new Error('A password must be 8 to 64 characters.');
+  if (/[\s"?]/.test(p)) throw new Error('A password cannot contain spaces, quotes or question marks.');
+  return p;
+}
+
+function checkPrivilege(priv) {
+  const n = Number(priv);
+  if (!(n === 1 || n === 7 || n === 15)) throw new Error('The privilege must be 1 (read-only), 7 (limited) or 15 (admin).');
+  return n;
+}
+
+const userOid = (col, name) => USERS + '.' + col + '.' + stringIndex(name);
+
+// The last admin (privilege 15) cannot be removed or demoted: without one,
+// nobody can sign in to the switch's CLI or web pages to manage it.
+async function guardLastAdmin(session, name) {
+  const admins = (await readUsers(session)).filter((u) => u.privilege === 15);
+  if (admins.length === 1 && admins[0].name === name) {
+    throw new Error(name + ' is the only admin (privilege 15). Add another admin first.');
+  }
+}
+
+/** Add a user. The password goes as clear text ("$" prefix, per the MIB). */
+async function addUser(session, name, password, privilege) {
+  const n = checkUserName(name), p = checkPassword(password), pr = checkPrivilege(privilege);
+  const existing = await readUsers(session);
+  if (existing.some((u) => u.name === n)) throw new Error('There is already a user called ' + n + '.');
+  await setVarbinds(session, [
+    OS(userOid(2, n), '$' + p),
+    I(userOid(3, n), pr),
+    I(userOid(4, n), ROW.createAndGo)
+  ]);
+  return { added: n, privilege: pr };
+}
+
+async function setUserPassword(session, name, password) {
+  const n = checkUserName(name), p = checkPassword(password);
+  await setVarbinds(session, [OS(userOid(2, n), '$' + p)]);
+  return { user: n };
+}
+
+async function setUserPrivilege(session, name, privilege) {
+  const n = checkUserName(name), pr = checkPrivilege(privilege);
+  if (pr !== 15) await guardLastAdmin(session, n);
+  await setVarbinds(session, [I(userOid(3, n), pr)]);
+  return { user: n, privilege: pr };
+}
+
+async function deleteUser(session, name) {
+  const n = checkUserName(name);
+  await guardLastAdmin(session, n);
+  await setVarbinds(session, [I(userOid(4, n), ROW.destroy)]);
+  return { deleted: n };
+}
+
+// ---- management services ----
+
+// value(on) for each service's object: TruthValue true(1)/false(2), or the
+// SSH server's enable(1)/disable(2).
+const SERVICES = {
+  ssh: { oid: SCALARS.ssh, label: 'SSH' },
+  telnet: { oid: SCALARS.telnet, label: 'Telnet' },
+  https: { oid: SCALARS.https, label: 'HTTPS' },
+  http: { oid: SCALARS.http, label: 'HTTP' }
+};
+
+/**
+ * Turn a management service on or off. Turning off the last of SSH, Telnet,
+ * HTTPS and HTTP is refused: the switch could then only be managed from its
+ * console port and over SNMP.
+ */
+async function setService(session, service, on) {
+  const svc = SERVICES[service];
+  if (!svc) throw new Error('service must be ssh, telnet, https or http.');
+  if (!on) {
+    const now = await getScalars(session);
+    const stillOn = Object.keys(SERVICES).filter((k) => k !== service && Number(now[k]) === 1);
+    if (!stillOn.length) throw new Error('Turning off ' + svc.label + ' would leave no way to sign in except the console port. Turn on another service first.');
+  }
+  await setVarbinds(session, [I(svc.oid, on ? 1 : 2)]);
+  return { service, on: !!on };
+}
+
+module.exports = { readSystem, setTimeZone, setSntp, addSntpServer, removeSntpServer, setClock,
+  addUser, setUserPassword, setUserPrivilege, deleteUser, setService, normaliseOffset, serverIndex, stringIndex, switchDateTime, takeInet, inetText, SCALARS, SNTP_SERVERS, USERS, MNG_RULES };
