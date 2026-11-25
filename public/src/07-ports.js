@@ -452,27 +452,50 @@
   }
 
   // The switchport mode/VLAN editor inside the port dialog. Shows the current
-  // configuration and, on "Edit", an inline form: mode (access/trunk), the
+  // configuration and an inline form: mode (access / trunk / routed), the
   // access VLAN, or the trunk native + tagged VLANs — all chosen from VLANs
   // that already exist on the switch. Writes use the SNMP SET sequence proven
   // against this firmware (VlanIndex objects as Gauge, native folded into the
   // allowed bitmap, mode flipped last).
-  function buildSwitchportEditor(s, detail) {
+  //
+  // "routed" is the port's L2/L3 category, not a switchport mode: CISCOSB-vlan
+  // vlanSwitchPortModeCategory (read-write, 1 = l2 "switchport", 2 = l3 "no
+  // switchport"). It is offered only where the switch reports that category
+  // for the port. A routed port has no VLANs; its IPv4 address is set on the
+  // popout's IPv4 tab, which opts.onL3Change reveals or hides.
+  function buildSwitchportEditor(s, detail, opts) {
+    opts = opts || {};
     const sw = detail.sw;
     const box = el('div', 'sw-editor');
+    const knowsCategory = sw.l2l3 === 'L2' || sw.l2l3 === 'L3';
+    const wasRouted = sw.l2l3 === 'L3';
 
-    // Routed (L3) ports have no switchport mode to set.
-    if (sw.l2l3 === 'L3') {
-      box.appendChild(el('div', 'card-sub', 'This is a routed (L3) port — it has no switchport mode.'));
-      return box;
-    }
+    // Management protection (MODULE-STANDARD B6): a routed port that holds the
+    // address this app talks to the switch on cannot go back to a switchport
+    // (that removes the address), and a port flagged as the uplink cannot be
+    // made routed (that takes it out of the VLAN the app reaches the switch
+    // through). Both are locked with the reason, not just cautioned.
+    const holdsMgmtIp = wasRouted && isManagementIf(s, detail.ifIndex);
+    const lockReason = holdsMgmtIp
+      ? 'This routed port holds ' + s.target.host + ', the address this app uses to reach the switch. Turning it back into a switchport would remove that address and cut off access, so it is locked.'
+      : (!wasRouted && sw.uplink)
+        ? 'Routed is locked: this port is ' + sw.uplink + ', so it likely carries this app’s connection to the switch. Making it routed would take it out of that VLAN.'
+        : '';
 
     const vlans = sw.allVlans.length ? sw.allVlans : [1];
     const grid = el('div', 'snmp-form-grid');
 
     // Mode selector — shown immediately, no edit button.
     const modeSel = el('select');
-    for (const m of ['access', 'trunk']) { const o = el('option', '', m); o.value = m; if (m === sw.mode) o.selected = true; modeSel.appendChild(o); }
+    const MODES = [['access', 'access'], ['trunk', 'trunk']].concat(knowsCategory ? [['routed', 'routed (no switchport)']] : []);
+    const curMode = wasRouted ? 'routed' : sw.mode;
+    for (const [v, label] of MODES) {
+      const o = el('option', '', label); o.value = v;
+      if (v === curMode) o.selected = true;
+      // Lock whichever direction would cut the management path.
+      if (lockReason && (holdsMgmtIp ? v !== 'routed' : v === 'routed')) o.disabled = true;
+      modeSel.appendChild(o);
+    }
     grid.appendChild(field('Mode', modeSel));
 
     // Access VLAN (single).
@@ -501,16 +524,26 @@
 
     box.appendChild(grid);
 
+    // What the chosen mode means, in one line, shown under the fields.
+    const modeNote = el('div', 'card-sub');
+    box.appendChild(modeNote);
+
     const syncMode = () => {
-      const trunk = modeSel.value === 'trunk';
-      accField.style.display = trunk ? 'none' : '';
-      natField.style.display = trunk ? '' : 'none';
-      tagField.style.display = trunk ? '' : 'none';
+      const m = modeSel.value;
+      accField.style.display = m === 'access' ? '' : 'none';
+      natField.style.display = m === 'trunk' ? '' : 'none';
+      tagField.style.display = m === 'trunk' ? '' : 'none';
+      modeNote.textContent = m === 'routed'
+        ? (wasRouted ? 'Routed port: it has no VLANs. Set its address on the IPv4 tab.'
+          : 'Applying makes this a routed port (no switchport): it leaves its VLANs, and its address is then set on the IPv4 tab.')
+        : (wasRouted ? 'Applying makes this a switchport again and removes the port’s IPv4 address.' : '');
+      modeNote.style.display = modeNote.textContent ? '' : 'none';
     };
     modeSel.addEventListener('change', syncMode); syncMode();
 
+    if (lockReason) box.appendChild(el('div', 'sw-warn', lockReason));
     // Inline, non-blocking uplink caution (no browser prompt).
-    if (sw.uplink) {
+    else if (sw.uplink) {
       box.appendChild(el('div', 'sw-warn',
         'Caution: this port is ' + sw.uplink + '. Changing its mode or VLANs may cut your management connection to the switch.'));
     }
@@ -519,17 +552,27 @@
     box.appendChild(actions);
     box.appendChild(msg);
 
-    save.addEventListener('click', (ev) => {
-      const cfg = { ifIndex: detail.ifIndex, mode: modeSel.value };
+    // A change of category (switchport <-> routed) takes something away, so
+    // Apply asks first and names what goes; an ordinary mode/VLAN change
+    // applies on the first tap, as before.
+    const categoryChanges = () => (modeSel.value === 'routed') !== (sw.l2l3 === 'L3');
+    const confirmText = () => {
+      if (modeSel.value !== 'routed') return 'Make switchport: removes its IPv4 address';
+      const vl = Array.from(new Set([].concat(sw.untagged || [], sw.tagged || []).map(String))).filter(Boolean);
+      return 'Make routed: removes ' + detail.name + (vl.length ? ' from VLAN ' + vl.join(', ') : ' from its VLANs');
+    };
+    withConfirm(save, (ev) => {
+      const cfg = { ifIndex: detail.ifIndex, mode: modeSel.value, wasRouted: sw.l2l3 === 'L3' };
+      clear(msg);
+      if (cfg.mode === 'routed' && cfg.wasRouted) { msg.appendChild(el('div', 'card-sub', 'No changes.')); return; }
       if (cfg.mode === 'trunk') {
         cfg.native = parseInt(natSel.value, 10);
         cfg.tagged = Array.from(tagSel.selectedOptions).map((o) => parseInt(o.value, 10)).filter(Number.isFinite);
-      } else {
+      } else if (cfg.mode === 'access') {
         cfg.access = parseInt(accSel.value, 10);
       }
-      clear(msg);
       runButtonAction(ev.currentTarget, {
-        failLabel: 'Save switchport', spinLabel: 'Saving\u2026',
+        failLabel: 'Save switchport', spinLabel: 'Saving…',
         run: () => applySwitchportConfig(s, cfg),
         ok: (res) => res && res.ok,
         error: (res) => {
@@ -540,7 +583,14 @@
           return 'some steps failed';
         },
         onApplied: () => {
-          markConfigDirty(s, [modeSel, cfg.mode === 'access' ? accSel : natSel]);
+          markConfigDirty(s, [modeSel].concat(cfg.mode === 'access' ? [accSel] : cfg.mode === 'trunk' ? [natSel] : []));
+          const nowRouted = cfg.mode === 'routed';
+          if (nowRouted !== cfg.wasRouted) {
+            sw.l2l3 = nowRouted ? 'L3' : 'L2';
+            if (opts.onL3Change) opts.onL3Change(nowRouted);
+            syncMode();
+          }
+          if (nowRouted) return;
           sw.mode = cfg.mode;
           if (cfg.mode === 'access') { sw.untagged = [cfg.access]; sw.tagged = []; }
           else {
@@ -551,9 +601,9 @@
           if (cfg.mode === 'access') { if (cfg.access) s._vlanFlashSet.add(Number(cfg.access)); }
           else { if (cfg.native) s._vlanFlashSet.add(Number(cfg.native)); for (const t of (cfg.tagged || [])) s._vlanFlashSet.add(Number(t)); }
         },
-        settle: () => new Promise((res) => setTimeout(() => refreshTables(s, ['interfaces', 'portModes', 'portL2L3', 'vlansCurrent', 'vlans', 'portAccessVlan', 'portNativeVlan']).then(res, res), 1200))
+        settle: () => new Promise((res) => setTimeout(() => refreshTables(s, ['interfaces', 'portModes', 'portL2L3', 'vlansCurrent', 'vlans', 'sviAddrs', 'portAccessVlan', 'portNativeVlan']).then(res, res), 1200))
       });
-    });
+    }, { when: categoryChanges, confirmText, danger: true });
 
     return box;
   }
@@ -562,6 +612,13 @@
   // against this firmware: VlanIndex as Gauge, native always in the allowed
   // bitmap, mode flipped last so a rejected VLAN write can't leave a port in a
   // new mode with no membership.
+  //
+  // Category changes (cfg.wasRouted vs cfg.mode === 'routed') go through
+  // vlanSwitchPortModeCategory: routed = 2 ("no switchport"), one SET; back to
+  // a switchport = first remove the port's IPv4 address and DHCP client
+  // (teardownSvi, the same teardown a VLAN delete uses), then 1 ("switchport"),
+  // then the usual access/trunk steps. If the category step fails the VLAN
+  // steps are not sent.
   async function applySwitchportConfig(s, cfg) {
     const log = [];
     if (!s.target) return { ok: false, log: ['Not connected.'] };
@@ -571,26 +628,42 @@
     if (ownsBusy) s.writeBusy = true;
     const if_ = cfg.ifIndex;
     const steps = [];
-    if (cfg.mode === 'trunk') {
-      steps.push(['native', [{ oid: 'vlanTrunkPortModeNativeVlanId.' + if_, type: 'Gauge', value: cfg.native }]]);
-      const allowed = Array.from(new Set([cfg.native].concat(cfg.tagged || []))).sort((a, b) => a - b);
-      for (const [name, hex] of vlanListBlocks(allowed)) {
-        steps.push([name, [{ oid: name + '.' + if_, type: 'OctetString', valueHex: hex }]]);
-      }
-      steps.push(['mode=trunk', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 12 }]]);
+    const CATEGORY = 'vlanSwitchPortModeCategory.' + if_;
+    if (cfg.mode === 'routed') {
+      steps.push(['no switchport', [{ oid: CATEGORY, type: 'Integer', value: 2 }], true]);
     } else {
-      steps.push(['access-vlan', [{ oid: 'vlanAccessPortModeVlanId.' + if_, type: 'Gauge', value: cfg.access }]]);
-      steps.push(['mode=access', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 11 }]]);
+      if (cfg.wasRouted) steps.push(['switchport', [{ oid: CATEGORY, type: 'Integer', value: 1 }], true]);
+      if (cfg.mode === 'trunk') {
+        steps.push(['native', [{ oid: 'vlanTrunkPortModeNativeVlanId.' + if_, type: 'Gauge', value: cfg.native }]]);
+        const allowed = Array.from(new Set([cfg.native].concat(cfg.tagged || []))).sort((a, b) => a - b);
+        for (const [name, hex] of vlanListBlocks(allowed)) {
+          steps.push([name, [{ oid: name + '.' + if_, type: 'OctetString', valueHex: hex }]]);
+        }
+        steps.push(['mode=trunk', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 12 }]]);
+      } else {
+        steps.push(['access-vlan', [{ oid: 'vlanAccessPortModeVlanId.' + if_, type: 'Gauge', value: cfg.access }]]);
+        steps.push(['mode=access', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 11 }]]);
+      }
     }
     let ok = true;
-    for (const [title, vbs] of steps) {
+    if (cfg.wasRouted && cfg.mode !== 'routed') {
+      // teardownSvi is best-effort per row and never throws; if an address
+      // survives it, the category step below is the one that reports it.
+      await teardownSvi(s, if_);
+      log.push('remove IPv4 address: sent');
+    }
+    for (const [title, vbs, gate] of steps) {
+      let stepOk = true;
       try {
         const { ok: rOk, status, body } = await snmpSetResult(s, vbs);
-        if (!rOk || (body && body.error)) { ok = false; log.push(title + ': ERROR ' + ((body && body.error) || ('HTTP ' + status))); continue; }
-        const bad = (body.results || []).find((v) => v.error);
-        if (bad) { ok = false; log.push(title + ': ' + bad.oid + ' ' + bad.error); }
-        else log.push(title + ': ok');
-      } catch (e) { ok = false; log.push(title + ': ' + e.message); }
+        if (!rOk || (body && body.error)) { stepOk = false; log.push(title + ': ERROR ' + ((body && body.error) || ('HTTP ' + status))); }
+        else {
+          const bad = (body.results || []).find((v) => v.error);
+          if (bad) { stepOk = false; log.push(title + ': ' + bad.oid + ' ' + bad.error); }
+          else log.push(title + ': ok');
+        }
+      } catch (e) { stepOk = false; log.push(title + ': ' + e.message); }
+      if (!stepOk) { ok = false; if (gate) break; }
     }
 
     if (ownsBusy) s.writeBusy = false;

@@ -338,10 +338,14 @@
   // (it morphs to "Confirm?" with a warning tint); a second click within a few
   // seconds runs the action; otherwise it disarms and returns to its label.
   // Wrap a click handler with this to require confirmation. `danger` tints red.
+  // opts.when (optional) decides per click whether this click needs the
+  // confirm at all: when it returns false the action runs on the first tap
+  // (an editor whose Apply only sometimes does something drastic). confirmText
+  // may be a function, so the armed label can name what the click will do.
   function withConfirm(btn, run, opts) {
     opts = opts || {};
     const label = opts.label || btn.textContent;
-    const confirmText = opts.confirmText || 'Confirm?';
+    const textOf = () => (typeof opts.confirmText === 'function' ? opts.confirmText() : opts.confirmText) || 'Confirm?';
     const danger = opts.danger;
     btn._armed = false;
     const disarm = () => {
@@ -352,10 +356,11 @@
     };
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (!btn._armed && opts.when && !opts.when()) { run(e); return; }
       if (!btn._armed) {
         btn._armed = true;
         btn.classList.add(danger ? 'is-arming-danger' : 'is-arming');
-        btn.textContent = confirmText;
+        btn.textContent = textOf();
         clearTimeout(btn._armTimer);
         btn._armTimer = setTimeout(disarm, 3500);
         return;
@@ -2438,7 +2443,7 @@
   // repaints only the panels that actually changed - avoids reflowing (and
   // visually jolting) unrelated panels on every small update.
   const PANEL_TABLE_DEPS = {
-    interfaces: ['interfaces', 'poe', 'lagAgg', 'lagMembers', 'lagCreation', 'lagPortKey', 'bridgePorts', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode', 'vlans', 'vlansCurrent', 'portModes', 'portL2L3', 'portAccessVlan', 'portNativeVlan'],
+    interfaces: ['interfaces', 'poe', 'lagAgg', 'lagMembers', 'lagCreation', 'lagPortKey', 'bridgePorts', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode', 'vlans', 'vlansCurrent', 'portModes', 'portL2L3', 'portAccessVlan', 'portNativeVlan', 'sviAddrs'],
     vlans: ['vlans', 'vlansCurrent', 'interfaces', 'sviAddrs', 'portModes', 'portL2L3', 'voiceOUI', 'voiceLocalSrc', 'scalars'],
     summary: ['vlans', 'interfaces', 'sviAddrs', 'scalars', 'poe'],
     auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs'],
@@ -3698,10 +3703,13 @@
     document.body.appendChild(back);
   }
 
-  // A popout with any number of tabs. tabs: [{ label, fill(pane, close), onShow }].
-  // Returns { close, showTab }. Panes are created lazily-filled up front but only
+  // A popout with any number of tabs. tabs: [{ label, fill(pane, close), onShow, hidden }].
+  // Returns { close, showTab, panes, setTabVisible }. Panes are created lazily-filled up front but only
   // the first is visible; onShow (optional) fires each time a tab is selected
-  // (used by the counters tab to know when it is visible).
+  // (used by the counters tab to know when it is visible). A tab marked
+  // `hidden` is built but its button is not shown until setTabVisible(tab, true)
+  // - used by a port's IPv4 tab, which exists only while the port is routed and
+  // appears the moment the Switchport tab turns the port routed.
   function openTabbedPopout(s, title, tabs, popTimers) {
     const prev = document.querySelector('.port-detail-back');
     if (prev) prev.remove();
@@ -3719,16 +3727,26 @@
     const strip = el('div', 'pd-tabs');
     const panes = [];
     const btns = [];
+    let current = 0;
     const show = (i) => {
+      current = i;
       panes.forEach((p, j) => { p.style.display = i === j ? '' : 'none'; });
       btns.forEach((b, j) => b.classList.toggle('active', i === j));
       const t = tabs[i]; if (t && t.onShow) t.onShow();
     };
     tabs.forEach((t, i) => {
       const b = el('button', 'pd-tab' + (i === 0 ? ' active' : ''), t.label); b.type = 'button';
+      if (t.hidden) b.style.display = 'none';
       b.addEventListener('click', () => show(i));
       strip.appendChild(b); btns.push(b);
     });
+    const setTabVisible = (tab, visible) => {
+      const i = tabs.indexOf(tab);
+      if (i < 0) return;
+      tab.hidden = !visible;
+      btns[i].style.display = visible ? '' : 'none';
+      if (!visible && current === i) show(0);
+    };
     pop.appendChild(strip);
     tabs.forEach((t, i) => {
       const pane = el('div', 'pd-pane'); if (i !== 0) pane.style.display = 'none';
@@ -3738,7 +3756,7 @@
     });
     back.appendChild(pop);
     document.body.appendChild(back);
-    return { close, showTab: show, panes };
+    return { close, showTab: show, panes, setTabVisible };
   }
 
   function openPortDetail(s, detail, opts) {
@@ -3770,8 +3788,36 @@
     } });
 
     // ---- Switchport tab ----
+    // ---- IPv4 tab: the address of a routed (no switchport) port ----
+    // Present for every port whose L2/L3 category the switch reports, but its
+    // button shows only while the port is routed; the Switchport editor reveals
+    // or hides it when it changes the port's category (onL3Change). Its content
+    // loads when first shown, and again after each category change, so a
+    // switchport never spends the address-table walks.
+    let pop = null;
+    let ipv4Tab = null;
+    if (hasIf && detail.sw && (detail.sw.l2l3 === 'L2' || detail.sw.l2l3 === 'L3')) {
+      let loaded = false;
+      const load = () => {
+        if (loaded || !ipv4Tab.pane) return;
+        loaded = true;
+        clear(ipv4Tab.pane);
+        buildSviEditor(s, { name: 'Port ' + detail.name, noun: 'port' }, detail.ifIndex, ipv4Tab.pane);
+      };
+      ipv4Tab = { label: 'IPv4', hidden: detail.sw.l2l3 !== 'L3', fill: () => {}, onShow: load,
+        reset: () => { loaded = false; } };
+    }
     if (hasIf && detail.sw) {
-      tabs.push({ label: 'Switchport', fill: (pane) => { pane.appendChild(buildSwitchportEditor(s, detail)); } });
+      tabs.push({ label: 'Switchport', fill: (pane) => {
+        pane.appendChild(buildSwitchportEditor(s, detail, {
+          onL3Change: (isL3) => {
+            if (!pop || !ipv4Tab) return;
+            ipv4Tab.reset();
+            pop.setTabVisible(ipv4Tab, isL3);
+          }
+        }));
+      } });
+      if (ipv4Tab) tabs.push(ipv4Tab);
     }
 
     // ---- 802.1X tab ----
@@ -3829,7 +3875,7 @@
       } });
     }
 
-    openTabbedPopout(s, (opts.title || ('Interface ' + detail.name)), tabs, popTimers);
+    pop = openTabbedPopout(s, (opts.title || ('Interface ' + detail.name)), tabs, popTimers);
   }
 
   // =================================================================
@@ -4286,27 +4332,50 @@
   }
 
   // The switchport mode/VLAN editor inside the port dialog. Shows the current
-  // configuration and, on "Edit", an inline form: mode (access/trunk), the
+  // configuration and an inline form: mode (access / trunk / routed), the
   // access VLAN, or the trunk native + tagged VLANs — all chosen from VLANs
   // that already exist on the switch. Writes use the SNMP SET sequence proven
   // against this firmware (VlanIndex objects as Gauge, native folded into the
   // allowed bitmap, mode flipped last).
-  function buildSwitchportEditor(s, detail) {
+  //
+  // "routed" is the port's L2/L3 category, not a switchport mode: CISCOSB-vlan
+  // vlanSwitchPortModeCategory (read-write, 1 = l2 "switchport", 2 = l3 "no
+  // switchport"). It is offered only where the switch reports that category
+  // for the port. A routed port has no VLANs; its IPv4 address is set on the
+  // popout's IPv4 tab, which opts.onL3Change reveals or hides.
+  function buildSwitchportEditor(s, detail, opts) {
+    opts = opts || {};
     const sw = detail.sw;
     const box = el('div', 'sw-editor');
+    const knowsCategory = sw.l2l3 === 'L2' || sw.l2l3 === 'L3';
+    const wasRouted = sw.l2l3 === 'L3';
 
-    // Routed (L3) ports have no switchport mode to set.
-    if (sw.l2l3 === 'L3') {
-      box.appendChild(el('div', 'card-sub', 'This is a routed (L3) port — it has no switchport mode.'));
-      return box;
-    }
+    // Management protection (MODULE-STANDARD B6): a routed port that holds the
+    // address this app talks to the switch on cannot go back to a switchport
+    // (that removes the address), and a port flagged as the uplink cannot be
+    // made routed (that takes it out of the VLAN the app reaches the switch
+    // through). Both are locked with the reason, not just cautioned.
+    const holdsMgmtIp = wasRouted && isManagementIf(s, detail.ifIndex);
+    const lockReason = holdsMgmtIp
+      ? 'This routed port holds ' + s.target.host + ', the address this app uses to reach the switch. Turning it back into a switchport would remove that address and cut off access, so it is locked.'
+      : (!wasRouted && sw.uplink)
+        ? 'Routed is locked: this port is ' + sw.uplink + ', so it likely carries this app’s connection to the switch. Making it routed would take it out of that VLAN.'
+        : '';
 
     const vlans = sw.allVlans.length ? sw.allVlans : [1];
     const grid = el('div', 'snmp-form-grid');
 
     // Mode selector — shown immediately, no edit button.
     const modeSel = el('select');
-    for (const m of ['access', 'trunk']) { const o = el('option', '', m); o.value = m; if (m === sw.mode) o.selected = true; modeSel.appendChild(o); }
+    const MODES = [['access', 'access'], ['trunk', 'trunk']].concat(knowsCategory ? [['routed', 'routed (no switchport)']] : []);
+    const curMode = wasRouted ? 'routed' : sw.mode;
+    for (const [v, label] of MODES) {
+      const o = el('option', '', label); o.value = v;
+      if (v === curMode) o.selected = true;
+      // Lock whichever direction would cut the management path.
+      if (lockReason && (holdsMgmtIp ? v !== 'routed' : v === 'routed')) o.disabled = true;
+      modeSel.appendChild(o);
+    }
     grid.appendChild(field('Mode', modeSel));
 
     // Access VLAN (single).
@@ -4335,16 +4404,26 @@
 
     box.appendChild(grid);
 
+    // What the chosen mode means, in one line, shown under the fields.
+    const modeNote = el('div', 'card-sub');
+    box.appendChild(modeNote);
+
     const syncMode = () => {
-      const trunk = modeSel.value === 'trunk';
-      accField.style.display = trunk ? 'none' : '';
-      natField.style.display = trunk ? '' : 'none';
-      tagField.style.display = trunk ? '' : 'none';
+      const m = modeSel.value;
+      accField.style.display = m === 'access' ? '' : 'none';
+      natField.style.display = m === 'trunk' ? '' : 'none';
+      tagField.style.display = m === 'trunk' ? '' : 'none';
+      modeNote.textContent = m === 'routed'
+        ? (wasRouted ? 'Routed port: it has no VLANs. Set its address on the IPv4 tab.'
+          : 'Applying makes this a routed port (no switchport): it leaves its VLANs, and its address is then set on the IPv4 tab.')
+        : (wasRouted ? 'Applying makes this a switchport again and removes the port’s IPv4 address.' : '');
+      modeNote.style.display = modeNote.textContent ? '' : 'none';
     };
     modeSel.addEventListener('change', syncMode); syncMode();
 
+    if (lockReason) box.appendChild(el('div', 'sw-warn', lockReason));
     // Inline, non-blocking uplink caution (no browser prompt).
-    if (sw.uplink) {
+    else if (sw.uplink) {
       box.appendChild(el('div', 'sw-warn',
         'Caution: this port is ' + sw.uplink + '. Changing its mode or VLANs may cut your management connection to the switch.'));
     }
@@ -4353,17 +4432,27 @@
     box.appendChild(actions);
     box.appendChild(msg);
 
-    save.addEventListener('click', (ev) => {
-      const cfg = { ifIndex: detail.ifIndex, mode: modeSel.value };
+    // A change of category (switchport <-> routed) takes something away, so
+    // Apply asks first and names what goes; an ordinary mode/VLAN change
+    // applies on the first tap, as before.
+    const categoryChanges = () => (modeSel.value === 'routed') !== (sw.l2l3 === 'L3');
+    const confirmText = () => {
+      if (modeSel.value !== 'routed') return 'Make switchport: removes its IPv4 address';
+      const vl = Array.from(new Set([].concat(sw.untagged || [], sw.tagged || []).map(String))).filter(Boolean);
+      return 'Make routed: removes ' + detail.name + (vl.length ? ' from VLAN ' + vl.join(', ') : ' from its VLANs');
+    };
+    withConfirm(save, (ev) => {
+      const cfg = { ifIndex: detail.ifIndex, mode: modeSel.value, wasRouted: sw.l2l3 === 'L3' };
+      clear(msg);
+      if (cfg.mode === 'routed' && cfg.wasRouted) { msg.appendChild(el('div', 'card-sub', 'No changes.')); return; }
       if (cfg.mode === 'trunk') {
         cfg.native = parseInt(natSel.value, 10);
         cfg.tagged = Array.from(tagSel.selectedOptions).map((o) => parseInt(o.value, 10)).filter(Number.isFinite);
-      } else {
+      } else if (cfg.mode === 'access') {
         cfg.access = parseInt(accSel.value, 10);
       }
-      clear(msg);
       runButtonAction(ev.currentTarget, {
-        failLabel: 'Save switchport', spinLabel: 'Saving\u2026',
+        failLabel: 'Save switchport', spinLabel: 'Saving…',
         run: () => applySwitchportConfig(s, cfg),
         ok: (res) => res && res.ok,
         error: (res) => {
@@ -4374,7 +4463,14 @@
           return 'some steps failed';
         },
         onApplied: () => {
-          markConfigDirty(s, [modeSel, cfg.mode === 'access' ? accSel : natSel]);
+          markConfigDirty(s, [modeSel].concat(cfg.mode === 'access' ? [accSel] : cfg.mode === 'trunk' ? [natSel] : []));
+          const nowRouted = cfg.mode === 'routed';
+          if (nowRouted !== cfg.wasRouted) {
+            sw.l2l3 = nowRouted ? 'L3' : 'L2';
+            if (opts.onL3Change) opts.onL3Change(nowRouted);
+            syncMode();
+          }
+          if (nowRouted) return;
           sw.mode = cfg.mode;
           if (cfg.mode === 'access') { sw.untagged = [cfg.access]; sw.tagged = []; }
           else {
@@ -4385,9 +4481,9 @@
           if (cfg.mode === 'access') { if (cfg.access) s._vlanFlashSet.add(Number(cfg.access)); }
           else { if (cfg.native) s._vlanFlashSet.add(Number(cfg.native)); for (const t of (cfg.tagged || [])) s._vlanFlashSet.add(Number(t)); }
         },
-        settle: () => new Promise((res) => setTimeout(() => refreshTables(s, ['interfaces', 'portModes', 'portL2L3', 'vlansCurrent', 'vlans', 'portAccessVlan', 'portNativeVlan']).then(res, res), 1200))
+        settle: () => new Promise((res) => setTimeout(() => refreshTables(s, ['interfaces', 'portModes', 'portL2L3', 'vlansCurrent', 'vlans', 'sviAddrs', 'portAccessVlan', 'portNativeVlan']).then(res, res), 1200))
       });
-    });
+    }, { when: categoryChanges, confirmText, danger: true });
 
     return box;
   }
@@ -4396,6 +4492,13 @@
   // against this firmware: VlanIndex as Gauge, native always in the allowed
   // bitmap, mode flipped last so a rejected VLAN write can't leave a port in a
   // new mode with no membership.
+  //
+  // Category changes (cfg.wasRouted vs cfg.mode === 'routed') go through
+  // vlanSwitchPortModeCategory: routed = 2 ("no switchport"), one SET; back to
+  // a switchport = first remove the port's IPv4 address and DHCP client
+  // (teardownSvi, the same teardown a VLAN delete uses), then 1 ("switchport"),
+  // then the usual access/trunk steps. If the category step fails the VLAN
+  // steps are not sent.
   async function applySwitchportConfig(s, cfg) {
     const log = [];
     if (!s.target) return { ok: false, log: ['Not connected.'] };
@@ -4405,26 +4508,42 @@
     if (ownsBusy) s.writeBusy = true;
     const if_ = cfg.ifIndex;
     const steps = [];
-    if (cfg.mode === 'trunk') {
-      steps.push(['native', [{ oid: 'vlanTrunkPortModeNativeVlanId.' + if_, type: 'Gauge', value: cfg.native }]]);
-      const allowed = Array.from(new Set([cfg.native].concat(cfg.tagged || []))).sort((a, b) => a - b);
-      for (const [name, hex] of vlanListBlocks(allowed)) {
-        steps.push([name, [{ oid: name + '.' + if_, type: 'OctetString', valueHex: hex }]]);
-      }
-      steps.push(['mode=trunk', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 12 }]]);
+    const CATEGORY = 'vlanSwitchPortModeCategory.' + if_;
+    if (cfg.mode === 'routed') {
+      steps.push(['no switchport', [{ oid: CATEGORY, type: 'Integer', value: 2 }], true]);
     } else {
-      steps.push(['access-vlan', [{ oid: 'vlanAccessPortModeVlanId.' + if_, type: 'Gauge', value: cfg.access }]]);
-      steps.push(['mode=access', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 11 }]]);
+      if (cfg.wasRouted) steps.push(['switchport', [{ oid: CATEGORY, type: 'Integer', value: 1 }], true]);
+      if (cfg.mode === 'trunk') {
+        steps.push(['native', [{ oid: 'vlanTrunkPortModeNativeVlanId.' + if_, type: 'Gauge', value: cfg.native }]]);
+        const allowed = Array.from(new Set([cfg.native].concat(cfg.tagged || []))).sort((a, b) => a - b);
+        for (const [name, hex] of vlanListBlocks(allowed)) {
+          steps.push([name, [{ oid: name + '.' + if_, type: 'OctetString', valueHex: hex }]]);
+        }
+        steps.push(['mode=trunk', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 12 }]]);
+      } else {
+        steps.push(['access-vlan', [{ oid: 'vlanAccessPortModeVlanId.' + if_, type: 'Gauge', value: cfg.access }]]);
+        steps.push(['mode=access', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 11 }]]);
+      }
     }
     let ok = true;
-    for (const [title, vbs] of steps) {
+    if (cfg.wasRouted && cfg.mode !== 'routed') {
+      // teardownSvi is best-effort per row and never throws; if an address
+      // survives it, the category step below is the one that reports it.
+      await teardownSvi(s, if_);
+      log.push('remove IPv4 address: sent');
+    }
+    for (const [title, vbs, gate] of steps) {
+      let stepOk = true;
       try {
         const { ok: rOk, status, body } = await snmpSetResult(s, vbs);
-        if (!rOk || (body && body.error)) { ok = false; log.push(title + ': ERROR ' + ((body && body.error) || ('HTTP ' + status))); continue; }
-        const bad = (body.results || []).find((v) => v.error);
-        if (bad) { ok = false; log.push(title + ': ' + bad.oid + ' ' + bad.error); }
-        else log.push(title + ': ok');
-      } catch (e) { ok = false; log.push(title + ': ' + e.message); }
+        if (!rOk || (body && body.error)) { stepOk = false; log.push(title + ': ERROR ' + ((body && body.error) || ('HTTP ' + status))); }
+        else {
+          const bad = (body.results || []).find((v) => v.error);
+          if (bad) { stepOk = false; log.push(title + ': ' + bad.oid + ' ' + bad.error); }
+          else log.push(title + ': ok');
+        }
+      } catch (e) { stepOk = false; log.push(title + ': ' + e.message); }
+      if (!stepOk) { ok = false; if (gate) break; }
     }
 
     if (ownsBusy) s.writeBusy = false;
@@ -4934,7 +5053,7 @@
       pane.appendChild(el('div', 'card-sub', 'Reading IPv4 interface\u2026'));
       const ifx = await vlanSviIfIndex(s, vlan.id);
       clear(pane);
-      buildSviEditor(s, vlan, ifx, pane);
+      buildSviEditor(s, vlanIface(vlan), ifx, pane);
     } });
 
     // ---- ACL tab: bind an ACL to the VLAN (default action only, no direction) ----
@@ -4957,7 +5076,14 @@
   // are system addresses and must be ignored, which is what produced the bogus
   // "0.193.134.170"), and offers Static or DHCP. When the VLAN has no SVI yet it
   // shows an "Add IPv4 SVI" button rather than a pre-filled form.
-  async function buildSviEditor(s, vlan, sviIfIndex, pane) {
+  //
+  // The same editor serves a routed (no switchport) port: an L3 port carries its
+  // address on its own ifIndex in the same rsIpAddrTable, exactly as an SVI
+  // does, so only the wording differs. `iface` says what is being edited:
+  // { name, noun, vlanId? } - see vlanIface() and the port's IPv4 tab
+  // (07-ports.js). The management lock below applies to both.
+  function vlanIface(vlan) { return { name: 'VLAN ' + vlan.id, noun: 'VLAN', vlanId: vlan.id, addLabel: 'Add IPv4 SVI' }; }
+  async function buildSviEditor(s, iface, sviIfIndex, pane) {
     // The management SVI (carrying this app's connection) is read-only: changing
     // or removing its address would cut off access to the switch.
     if (isManagementIf(s, sviIfIndex)) {
@@ -4965,7 +5091,7 @@
       let ipLine = s.target.host;
       for (const a of ((s.health && s.health.sviAddrs) || [])) { if (String(a.index) === String(s.target.host)) { const m = String(cv(a.rsIpAdEntNetMask) || ''); const p = m ? m.split('.').reduce((n, o) => n + ((parseInt(o, 10) || 0).toString(2).match(/1/g) || []).length, 0) : null; ipLine = s.target.host + (p ? '/' + p : ''); break; } }
       pane.appendChild(el('div', 'aaa-sub', 'Management interface'));
-      pane.appendChild(el('div', 'card-sub', 'This VLAN\u2019s IPv4 interface (' + ipLine + ') carries this app\u2019s connection to the switch. It is locked to prevent accidentally cutting off access.'));
+      pane.appendChild(el('div', 'card-sub', 'This ' + iface.noun + '\u2019s IPv4 interface (' + ipLine + ') carries this app\u2019s connection to the switch. It is locked to prevent accidentally cutting off access.'));
       return;
     }
     pane.appendChild(el('div', 'card-sub', 'Reading IPv4 interface\u2026'));
@@ -5001,22 +5127,22 @@
 
     // No SVI yet: offer an explicit "Add IPv4 SVI" button.
     if (!cur && !dhcpOn) {
-      pane.appendChild(el('div', 'card-sub', 'VLAN ' + vlan.id + ' has no IPv4 interface configured.'));
-      if (sviIfIndex == null) pane.appendChild(el('div', 'sw-err', 'Could not resolve this VLAN\u2019s L3 ifIndex (needed to add an address).'));
+      pane.appendChild(el('div', 'card-sub', iface.name + ' has no IPv4 interface configured.'));
+      if (sviIfIndex == null) pane.appendChild(el('div', 'sw-err', 'Could not resolve this ' + iface.noun + '\u2019s L3 ifIndex (needed to add an address).'));
       const addRow = el('div', 'snmp-form-actions'); addRow.style.marginTop = '10px';
-      const addBtn = el('button', 'btn btn-small btn-blue', 'Add IPv4 SVI'); addBtn.type = 'button';
+      const addBtn = el('button', 'btn btn-small btn-blue', iface.addLabel || 'Add IPv4 address'); addBtn.type = 'button';
       addBtn.disabled = sviIfIndex == null;
-      addBtn.addEventListener('click', () => { clear(pane); sviConfigForm(s, vlan, sviIfIndex, pane, null, false); });
+      addBtn.addEventListener('click', () => { clear(pane); sviConfigForm(s, iface, sviIfIndex, pane, null, false); });
       addRow.appendChild(addBtn); pane.appendChild(addRow);
       return;
     }
     // Existing SVI: show the config form pre-filled.
-    sviConfigForm(s, vlan, sviIfIndex, pane, cur, dhcpOn);
+    sviConfigForm(s, iface, sviIfIndex, pane, cur, dhcpOn);
   }
 
 
   // The SVI configuration form - Static (IP + prefix) or DHCP.
-  function sviConfigForm(s, vlan, sviIfIndex, pane, cur, dhcpOn) {
+  function sviConfigForm(s, iface, sviIfIndex, pane, cur, dhcpOn) {
     const form = el('div', 'snmp-form acl-form');
     const sec = formSection('IPv4 interface');
     if (cur) sec.body.appendChild(el('div', 'card-sub', 'Current: ' + cur.ip + ' / ' + (cur.mask || '?') + ' (' + (SVI_OWNER[cur.owner] || 'static') + ')'));
@@ -5063,7 +5189,7 @@
         },
         ok: (r) => r && r.ok,
         error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not set the IPv4 interface \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
-        onApplied: () => { markConfigDirty(s, [modeSel, ipIn, prefIn]); s._vlanFlash = vlan.id; },
+        onApplied: () => { markConfigDirty(s, [modeSel, ipIn, prefIn]); if (iface.vlanId != null) s._vlanFlash = iface.vlanId; },
         settle: () => refreshSvi(s)
       });
     });
@@ -5086,7 +5212,7 @@
           onApplied: () => markConfigDirty(s),
           settle: () => refreshSvi(s).then(() => { const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove(); })
         });
-      }, 'danger', 'Remove this VLAN\u2019s IPv4 interface');
+      }, 'danger', 'Remove this ' + iface.noun + '\u2019s IPv4 interface');
       const rmRow = el('div', 'snmp-form-actions'); rmRow.style.marginTop = '8px'; rmRow.appendChild(rm);
       form.appendChild(rmRow);
     }
@@ -7166,6 +7292,21 @@
           if (!Number.isNaN(n)) l2l3ByIf.set(String(r.index), L2L3[n] || ('cat ' + n));
         }
         const hasL2L3 = l2l3ByIf.size > 0;
+        // A routed port's own IPv4 address(es), shown in place of its (empty)
+        // VLAN cells. Same source and filter as the VLAN table's IPv4 column:
+        // rsIpAddrTable rows owned static(1)/dhcp(2) - internal/default are
+        // the switch's system addresses.
+        const ipByIf = new Map();
+        const cvv = (cell) => cell && (cell.value !== undefined ? cell.value : cell.display);
+        for (const a of (h.sviAddrs || [])) {
+          const owner = parseInt(cvv(a.rsIpAdEntOwner), 10);
+          if ((owner !== 1 && owner !== 2) || !isRealIp(String(a.index))) continue;
+          const ifx = String(cvv(a.rsIpAdEntIfIndex));
+          const mask = String(cvv(a.rsIpAdEntNetMask) || '');
+          const pref = mask ? maskToPref(mask) : null;
+          const text = String(a.index) + (pref != null ? '/' + pref : '');
+          ipByIf.set(ifx, ipByIf.has(ifx) ? ipByIf.get(ifx) + ', ' + text : text);
+        }
 
         // 802.1X per-port config: port-control (force-unauth/auto/force-auth),
         // authorized status, and host-mode (single/multiple/multiple-auth).
@@ -7286,7 +7427,10 @@
             { v: dv(r.rlifPresentHighSpeed) }
           ];
           const withL2 = hasL2L3 ? base.concat([{ v: l2l3ByIf.get(String(r.index)) || '' }]) : base;
-          const withMode = hasModes ? withL2.concat([{ v: modeByIf.get(String(r.index)) || '' }]) : withL2;
+          // A routed (L3) port has no switchport mode; say so rather than show
+          // the leftover vlanPortModeState value the switch still reports.
+          const modeText = l2l3ByIf.get(String(r.index)) === 'L3' ? 'routed' : (modeByIf.get(String(r.index)) || '');
+          const withMode = hasModes ? withL2.concat([{ v: modeText }]) : withL2;
           // 802.1X cell: "control · status", e.g. "auto · authorized".
           let d1xText = '';
           if (d1x || hm) {
@@ -7300,7 +7444,11 @@
             { pill: true, v: poe ? dv(poe.pethPsePortDetectionStatus) : '' }
           ]) : withDot1x;
           const vl = portVlans.get(String(r.index)) || { untagged: [], tagged: [] };
-          const withVlans = hasVlans ? withPoe.concat([
+          const routed = l2l3ByIf.get(String(r.index)) === 'L3';
+          const withVlans = hasVlans ? withPoe.concat(routed ? [
+            { v: ipByIf.get(String(r.index)) || '' },
+            { v: '' }
+          ] : [
             { v: vl.untagged.join(', ') },
             { v: rangeOf(vl.tagged) }
           ]) : withPoe;
