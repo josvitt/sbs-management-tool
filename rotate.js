@@ -121,4 +121,27 @@ function writeFileAtomic(file, data, opts) {
   }
 }
 
-module.exports = { appendLine, readLines, rotateIfNeeded, writeFileAtomic, DEFAULT_MAX_BYTES, DEFAULT_KEEP };
+/**
+ * Move a store written in an old place to where it belongs now, once. A file
+ * moves when nothing is at the new path yet; a folder's files move one by
+ * one, each only if the new folder has no file of that name (so nothing is
+ * ever overwritten). Best-effort: returns how many entries moved and never
+ * throws. Used when a store's path is corrected, e.g. the stores that sat
+ * under routes/ after the route split.
+ */
+function adoptLegacy(from, to) {
+  let moved = 0;
+  let st;
+  try { st = fs.statSync(from); } catch (e) { return 0; }
+  try {
+    if (!st.isDirectory()) {
+      if (!fs.existsSync(to)) { fs.mkdirSync(path.dirname(to), { recursive: true }); fs.renameSync(from, to); moved++; }
+      return moved;
+    }
+    for (const name of fs.readdirSync(from)) moved += adoptLegacy(path.join(from, name), path.join(to, name));
+    try { fs.rmdirSync(from); } catch (e) { /* something stayed behind */ }
+  } catch (e) { /* best effort */ }
+  return moved;
+}
+
+module.exports = { appendLine, readLines, rotateIfNeeded, writeFileAtomic, adoptLegacy, DEFAULT_MAX_BYTES, DEFAULT_KEEP };
