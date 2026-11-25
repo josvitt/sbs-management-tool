@@ -4,7 +4,23 @@
 // not only that the modules behave in isolation.
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const http = require('http');
 const app = require('../web');
+
+// node:http with a fresh connection per request, rather than fetch: on
+// Windows (Node 24), exiting while fetch's pooled sockets are closing trips
+// a libuv assertion (src\win\async.c) after every test has passed.
+function request(url, opts) {
+  const o = opts || {};
+  return new Promise((resolve, reject) => {
+    const req = http.request(url, { method: o.method || 'GET', headers: o.headers || {}, agent: false }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ status: res.statusCode, headers: { get: (k) => res.headers[k.toLowerCase()] } }));
+    });
+    req.on('error', reject);
+    req.end(o.body);
+  });
+}
 
 let server, base;
 test.before(async () => {
@@ -20,7 +36,7 @@ test.after(async () => {
 });
 
 test('a normal page load is served with the security headers', async () => {
-  const res = await fetch(base + '/');
+  const res = await request(base + '/');
   assert.equal(res.status, 200);
   const csp = res.headers.get('content-security-policy');
   assert.match(csp, /script-src 'self'(;|$)/);
@@ -31,7 +47,7 @@ test('a normal page load is served with the security headers', async () => {
 });
 
 test('the guard runs before any route: a cross-site API call is refused', async () => {
-  const res = await fetch(base + '/api/log', {
+  const res = await request(base + '/api/log', {
     method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example' },
     body: JSON.stringify({ level: 'info', message: 'x' })
   });
@@ -39,7 +55,7 @@ test('the guard runs before any route: a cross-site API call is refused', async 
 });
 
 test('the same call from the page itself is accepted', async () => {
-  const res = await fetch(base + '/api/log', {
+  const res = await request(base + '/api/log', {
     method: 'POST', headers: { 'Content-Type': 'application/json', Origin: base },
     body: JSON.stringify({ level: 'info', message: 'web.test same-origin' })
   });
