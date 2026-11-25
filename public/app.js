@@ -15089,11 +15089,31 @@
       p._mDst = selectInput([], '');
       const add = el('button', 'btn', 'Start mirroring'); add.type = 'button';
       add.addEventListener('click', (e) => {
-        const used = sessions;
-        const id = [1, 2, 3, 4].find((n) => used.indexOf(n) < 0);
-        if (!id) { toast('All four mirroring sessions are in use.', 'error'); return; }
+        const m = (s._ports.data && s._ports.data.mirror) || { destinations: [], sources: [] };
+        const dest = Number(p._mDst.value);
         const src = Array.from(p._mSrc.selectedOptions).map((o) => ({ ifIndex: Number(o.value), direction: p._mDir.value }));
-        portsWrite(e.currentTarget, s, '/api/ports/mirror/add', { session: id, dest: Number(p._mDst.value), sources: src }, 'Start mirroring');
+        if (!src.length) { toast('Choose at least one port to copy.'); return; }
+        // To a port that already receives copies: add the ports to its session.
+        const existing = m.destinations.find((x) => x.ifIndex === dest);
+        if (existing) {
+          runButtonAction(e.currentTarget, {
+            failLabel: 'Start mirroring',
+            run: async () => {
+              for (const x of src) {
+                const r = await sidePost('/api/ports/mirror/source/add', Object.assign({ target: s.target, session: existing.session }, x));
+                if (!r || !r.ok) return r;
+              }
+              return { ok: true };
+            },
+            ok: (r) => r && r.ok, error: (r) => (r && r.error) || 'unknown error',
+            onApplied: () => markConfigDirty(s), settle: () => portsLoad(s)
+          });
+          return;
+        }
+        const used = m.destinations.map((x) => x.session).concat(m.sources.map((x) => x.session));
+        const id = [1, 2, 3, 4].find((n) => used.indexOf(n) < 0);
+        if (!id) { toast('All four mirroring sessions are in use.'); return; }
+        portsWrite(e.currentTarget, s, '/api/ports/mirror/add', { session: id, dest, sources: src }, 'Start mirroring');
       });
       row.appendChild(field('Copy these ports', p._mSrc));
       row.appendChild(field('Traffic', p._mDir));

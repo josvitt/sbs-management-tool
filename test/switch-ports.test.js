@@ -129,7 +129,7 @@ test('addMirror makes the destination as the switch does, then each source; remo
   await assert.rejects(ports.addMirror(s, 1, 12, [{ ifIndex: 3 }]), /in use/);
   await assert.rejects(ports.addMirror(s, 2, 24, [{ ifIndex: 24 }]), /already a mirroring destination|itself/);
   const r = await ports.addMirror(s, 2, 12, [{ ifIndex: 3, direction: 'rx' }, { ifIndex: 4 }]);
-  assert.deepEqual(r, { session: 2, dest: 12, sources: [{ ifIndex: 3, direction: 'rx' }, { ifIndex: 4, direction: 'both' }] });
+  assert.deepEqual(r, { session: 2, dest: 12, via: 'createAndGo with ifIndex, reflector, port type', refused: [], sources: [{ ifIndex: 3, direction: 'rx' }, { ifIndex: 4, direction: 'both' }] });
   const D = ports.SPAN_DEST, SR = ports.SPAN_SRC;
   assert.deepEqual(s.sets.map((x) => x.map((y) => y.oid + '=' + y.value)), [
     [D + '.6.2=4', D + '.2.2=12', D + '.3.2=1', D + '.4.2=1'],

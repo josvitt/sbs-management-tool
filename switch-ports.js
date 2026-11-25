@@ -420,12 +420,14 @@ async function addMirror(session, sessionId, dest, sources) {
   ];
   const tried = [];
   let ok = false;
+  let via = '';
   for (const [name, steps] of forms) {
     try {
       for (const step of steps) await setVarbinds(session, step);
       const back = (await readMirror(session)).destinations.find((x) => x.session === id);
       if (!back || back.ifIndex !== d) throw new Error('the row does not read back');
       ok = true;
+      via = name;
       break;
     } catch (e) {
       tried.push(name + ': ' + e.message);
@@ -445,7 +447,7 @@ async function addMirror(session, sessionId, dest, sources) {
     await setVarbinds(session, [I(SPAN_DEST + '.6.' + id, ROW.destroy)]).catch(() => {});
     throw new Error('The switch refused a mirrored port, so the session was removed again (' + e.message + ').');
   }
-  return { session: id, dest: d, sources: src.map((x) => ({ ifIndex: x.ifx, direction: DIRECTION[x.dir] })) };
+  return { session: id, dest: d, via, refused: tried, sources: src.map((x) => ({ ifIndex: x.ifx, direction: DIRECTION[x.dir] })) };
 }
 
 /** Add one port to an existing session's sources. */

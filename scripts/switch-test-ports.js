@@ -214,6 +214,7 @@ async function main() {
       check('mirror port ' + src + ' to port ' + ifx + ' in session ' + id, r.httpOk && dst && dst.ifIndex === ifx && s1 && s1.direction === 'both',
         r.error || JSON.stringify({ dst, s1 }));
       if (dst) say('  the destination row reads ' + JSON.stringify(dst));
+      if (r.via) say('  made by: ' + r.via + (r.refused && r.refused.length ? '; refused first: ' + r.refused.join('; ') : ''));
       r = await post('/api/ports/mirror/remove', { session: id });
       m = (await status()).mirror;
       check('remove session ' + id, r.httpOk && !find(m.destinations, 'session', id) && !m.sources.some((x) => x.session === id), r.error || JSON.stringify(m));
