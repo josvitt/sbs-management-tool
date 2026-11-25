@@ -692,22 +692,17 @@
     return '';
   }
 
-  // DNS write diagnostic. Every DNS write path (domain add, host add, nameserver
-  // delete) is failing with a different SNMP error (NotWritable / NoCreation /
-  // CommitFailed) even though the OIDs match the MIB, so rather than keep
-  // inferring index structure we dump what the switch actually HAS: walk each DNS
-  // subtree and print every raw OID suffix and value. The report shows the exact
-  // index the switch uses for each existing row, which is what a create/delete
-  // must match. Reuses /api/snmp/walk and the download() helper (no new endpoint).
-
-  // Nameserver DELETE probe. The MIB says sbelt rows ARE deletable via SNMP
-  // (confirmed by reading CISCOSB-dnscl.mib and rfc1612.mib), and the host-map
-  // delete works on this firmware - yet destroy(6) on the sbelt row returns
-  // CommitFailed. Rather than guess the right teardown, this tries each documented
-  // variant in order, stops at the first that succeeds, and reports every result,
-  // so the next run tells us exactly which delete path the switch accepts. It
-  // targets ONE nameserver by address; if a variant succeeds the server is removed
-  // (the desired outcome), if all fail the row is left intact.
+  // The SET that adds a static route (rlIpStaticRouteTable, base 26.17).
+  // Index = dest.mask.tos(0).nextHop; type remote(4), the metric, and
+  // RowStatus createAndGo(4), in one PDU.
+  function staticRouteVarbinds(dest, mask, nh, metric) {
+    const suffix = ipToOidIndex(dest) + '.' + ipToOidIndex(mask) + '.0.' + ipToOidIndex(nh);
+    return [
+      { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.6.' + suffix, type: 'Integer', value: 4 },
+      { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.5.' + suffix, type: 'Integer', value: metric },
+      { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.9.' + suffix, type: 'Integer', value: 4 }
+    ];
+  }
 
   function openStaticRouteForm(s) {
     const tabs = [{ label: 'Add static route', fill: (pane, close) => {
@@ -730,15 +725,9 @@
         if (!/^\d+\.\d+\.\d+\.\d+$/.test(dest) || !/^\d+\.\d+\.\d+\.\d+$/.test(mask) || !/^\d+\.\d+\.\d+\.\d+$/.test(nh)) {
           clear(msg); msg.appendChild(el('div', 'sw-err', 'Destination, mask and next hop must all be valid IPv4 addresses.')); return;
         }
-        // Index = dest.mask.tos(0).nextHop; createAndGo(4) with type remote(4).
-        const suffix = ipToOidIndex(dest) + '.' + ipToOidIndex(mask) + '.0.' + ipToOidIndex(nh);
         runButtonAction(e.currentTarget, {
           failLabel: 'Add route',
-          run: () => snmpSetResult(s, [
-            { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.6.' + suffix, type: 'Integer', value: 4 },   // type=remote
-            { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.5.' + suffix, type: 'Integer', value: metric },
-            { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.9.' + suffix, type: 'Integer', value: 4 }    // RowStatus createAndGo
-          ]),
+          run: () => snmpSetResult(s, staticRouteVarbinds(dest, mask, nh, metric)),
           ok: (res) => res && res.ok && !(res.body && res.body.error),
           onApplied: () => markConfigDirty(s),
           settle: () => routingRefresh(s).then(() => close())
