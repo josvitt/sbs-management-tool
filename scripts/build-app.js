@@ -40,14 +40,15 @@ const EPILOGUE = '\n})();\n';
 function build() {
   const files = fs.readdirSync(SRC_DIR).filter((f) => /^\d\d-[a-z0-9-]+\.js$/.test(f)).sort();
   if (!files.length) throw new Error('No source files in ' + SRC_DIR);
-  const parts = files.map((f) => '\n\n' + fs.readFileSync(path.join(SRC_DIR, f), 'utf8').replace(/\s+$/, ''));
+  // LF regardless of how the files were checked out (see .gitattributes).
+  const parts = files.map((f) => '\n\n' + fs.readFileSync(path.join(SRC_DIR, f), 'utf8').replace(/\r\n/g, '\n').replace(/\s+$/, ''));
   return PROLOGUE + parts.join('') + EPILOGUE;
 }
 
 if (require.main === module) {
   const text = build();
   if (process.argv.includes('--check')) {
-    const current = fs.existsSync(OUT) ? fs.readFileSync(OUT, 'utf8') : '';
+    const current = fs.existsSync(OUT) ? fs.readFileSync(OUT, 'utf8').replace(/\r\n/g, '\n') : '';
     if (current !== text) {
       console.error('public/app.js does not match public/src/. Run: npm run build');
       process.exit(1);

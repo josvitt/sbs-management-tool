@@ -1,0 +1,5 @@
+# Keep source files LF on every platform. public/app.js is generated from
+# public/src/ and checked byte for byte (test/app-build.test.js), and git on
+# Windows would otherwise check files out with CRLF line endings.
+* text=auto eol=lf
+*.bat text eol=crlf

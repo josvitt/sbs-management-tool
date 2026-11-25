@@ -9,6 +9,7 @@ const path = require('path');
 const { build } = require('../scripts/build-app');
 
 test('public/app.js matches what public/src/ builds', () => {
-  const current = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  // Line endings aside: a CRLF checkout is the same file.
+  const current = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8').replace(/\r\n/g, '\n');
   assert.ok(current === build(), 'public/app.js is out of date: run npm run build');
 });

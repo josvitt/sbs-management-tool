@@ -12,7 +12,12 @@ test.before(async () => {
   await new Promise((r) => server.once('listening', r));
   base = 'http://127.0.0.1:' + server.address().port;
 });
-test.after(() => server.close());
+// Close keep-alive sockets before the server, and wait for it: on Windows,
+// exiting with a handle still closing trips a libuv assertion.
+test.after(async () => {
+  server.closeAllConnections();
+  await new Promise((r) => server.close(r));
+});
 
 test('a normal page load is served with the security headers', async () => {
   const res = await fetch(base + '/');
