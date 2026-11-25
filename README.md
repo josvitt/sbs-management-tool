@@ -18,6 +18,16 @@ while it runs — close it (or Ctrl+C) to stop.
 Not on Windows? `npm install && npm start`, then open
 `http://localhost:3000`.
 
+The browser code lives in `public/src/`, one file per feature; `npm run
+build` joins them into `public/app.js`, which is what the page loads (see
+docs/MODULE-STANDARD.md). `npm test` runs the tests. They include a replay of a real
+C1300-24MGP-4X (`test/fixtures/live/`, scrubbed of communities, addresses,
+MACs, names and secrets), so a change to what a real switch's dashboard
+shows fails a test. GitHub runs them too, on Node 22 and 24, with an
+`npm audit` of the shipped dependencies, on every push and pull request
+(`.github/workflows/ci.yml`); Dependabot proposes dependency and Action
+updates weekly.
+
 ### Run it unattended (as a service)
 
 `start.bat` is the interactive way to run it. To have it collect from your
@@ -30,8 +40,11 @@ anyone logs in — install it as a background service instead:
   `http://localhost:3000`) and add your switches there — the service stores them
   encrypted and keeps collecting across reboots. Remove it with
   **`uninstall-service.bat`**.
+  The service runs as Windows' built-in **LocalService** account, which can
+  write only to the app's folder, rather than LocalSystem.
 - **Linux:** use the included `sbs-management-tool.service` systemd unit (see the
-  comments at the top of that file).
+  comments at the top of that file). It runs as its own `sbs` account with
+  only the right to bind the receivers' ports.
 
 The server does the health collection, alerting, and trap/syslog capture itself,
 so the browser is only a viewer — closing it never stops collection. See
@@ -390,6 +403,25 @@ like the save was abandoned, and the operator cannot tell that it was not -
 the worst thing to be unsure about after pressing a button that overwrites
 a configuration. The close returns when there is an answer to show.
 
+### History
+
+The **History** chip lists earlier running configurations of the switch,
+newest first, with **View** and **Compare** on each. Compare shows what
+changed from that version to the running configuration fetched on this
+page, or to the newest stored version when none has been fetched.
+
+A version is kept each time the running configuration's text changes,
+starting with the first one the app sees. Copies come from the server's
+background change check, which pulls the running config when the switch's
+saved/unsaved flag flips, after a reboot and after a change made from this
+app, and from fetching the running config here. So the history costs no
+extra pull from the switch. A change made and saved entirely within one
+30-second probe gap can be missed (docs/SERVER-STANDARD.md §5). Each
+version is a file under `config-history/<switch>/`, encrypted with the same
+key and passphrase rule as the saved state (`state.enc`). The newest 50 per
+switch are kept; `SBS_CONFIG_HISTORY_KEEP` changes that and
+`SBS_CONFIG_HISTORY_DIR` moves the folder.
+
 ### How it works
 
 No MIB object returns configuration text, so the app drives `rlCopyTable`
@@ -409,8 +441,9 @@ Requirements and caveats, none of which the app can paper over:
   binding port 69 needs elevated privileges; `TFTP_PORT` can move it, though
   the switch will still try 69 unless it can be told otherwise.
 - **TFTP is unauthenticated and cleartext**, and a running-config contains
-  credentials and community strings. Received files are held in memory and
-  never written to disk - saving one is a deliberate act.
+  credentials and community strings. A received file reaches disk only
+  encrypted, as a config history version (below); saving a readable copy
+  is a deliberate act.
 
 The **Compare** diff uses a longest-common-subsequence pass rather than a
 line-by-line compare, so an inserted line does not report everything after
@@ -805,7 +838,7 @@ produce the remaining repetitions, so it keeps generating successors
 key = IP_Applications.DNS_client.maximum_number_of_pending_msgs
 ```
 
-The bounded walk in `server.js` keeps GETBULK's speed but enforces the
+The bounded walk in `snmp-core.js` keeps GETBULK's speed but enforces the
 subtree boundary locally: anything outside the base OID is discarded and
 the walk stops rather than asking for more. It also lowers
 `maxRepetitions` to 10, caps total rows, guards against OID depth blowing
@@ -1447,21 +1480,40 @@ in one file.
 
 ## Security
 
-The dashboard is meant to be opened from any PC on the network, so the
-server listens on every interface. **It has no sign-in and no TLS.** Anyone
-who can reach port 3000 can use it, read the saved switch credentials
-(`/api/state`) and change switch configuration. Keep it on a trusted
-management network or behind a firewall or VPN.
+**The dashboard can only be opened on the PC the app runs on**
+(`http://localhost:3000`). The web server listens on the loopback address
+only; other machines on the network cannot connect to it. The receivers the
+switches send to (TFTP, syslog, traps) still listen on every interface, as
+they must.
+
+To open the dashboard to other PCs again, set `SBS_BIND=0.0.0.0` (or one of
+this PC's addresses). Be aware that **it has no sign-in and no TLS**: anyone
+who can reach port 3000 could then use it, read the saved switch credentials
+and change switch configuration.
 
 What it does protect against:
 
-- **Other websites.** A web page open in a browser on the LAN cannot call
+- **Other websites.** A web page open in a browser on this PC cannot call
   the API or open the SSH/console WebSocket: a request whose `Origin` is a
   different site is refused (`request-guard.js`).
+- **Browser hardening.** Every response carries a Content-Security-Policy
+  (scripts only from this server, nothing inline), refuses to be framed by
+  another page, and sends no referrer (`security-headers.js`).
 - **DNS rebinding.** Requests must be addressed to an IP address,
   `localhost`, or this computer's own name. If you open the dashboard
   through another DNS name (an alias), add it to `SBS_ALLOWED_HOSTS`,
   comma-separated, e.g. `SBS_ALLOWED_HOSTS=sbs.example.lan`.
+- **Saved passwords stay on the server.** Once a switch is saved, the page
+  never receives its community string, SNMPv3 keys or SSH password again:
+  Settings shows those fields as *saved — leave blank to keep*, and the
+  server fills them in when it talks to the switch. Typing a new value
+  replaces the saved one.
+- **SSH host keys.** The first time the app connects to a switch over SSH it
+  remembers the switch's host key (`known-hosts.json`). If a later
+  connection presents a different key, it is refused and Settings shows the
+  old and new fingerprints with a **Trust the new key** button: expected
+  after replacing a switch or regenerating its key, and otherwise a sign
+  that something is impersonating it.
 - **Secrets in logs and responses.** Passwords, community strings, SNMPv3
   keys and RADIUS/TACACS keys are redacted at any depth in `logs/app.log`,
   SET values are not logged, and collector snapshots never return
@@ -1478,7 +1530,7 @@ What it does protect against:
 - Saved switches and their credentials are kept encrypted in `state.enc`
   (see `vault.js` and `docs/SERVER-STANDARD.md` §7). They are never stored
   in the browser.
-- `server.js` offers modern SSH algorithms first and keeps legacy key
+- `routes/terminal.js` offers modern SSH algorithms first and keeps legacy key
   exchange and cipher suites as fallbacks, since Cisco small-business
   switches may not support modern-only sets. See `LEGACY_ALGORITHMS`.
 - SNMP uses [net-snmp](https://www.npmjs.com/package/net-snmp). Each

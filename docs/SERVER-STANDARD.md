@@ -11,7 +11,7 @@ reconcile after; an error is not evidence of impossibility; read what the
 system actually has). This document is their application to the server, and,
 like the module standard, it is **derived from the code that already exists** —
 `collector.js`, `events.js`, `rotate.js`, the shared collection/probe paths in
-`server.js`, and `history.js`. Nothing here is aspirational.
+`collection.js`, `snmp-core.js`, the routes under `routes/`, and `history.js`. Nothing here is aspirational.
 
 ---
 
@@ -30,7 +30,7 @@ a browser-driven collection loop is a regression against this principle.
 
 ---
 
-## 1. The one collection path — `collectHealthFor` (server.js)
+## 1. The one collection path — `collectHealthFor` (collection.js)
 
 There is exactly **one** function that builds an SNMP session, walks a switch,
 and keeps the per-switch rate baseline: `collectHealthFor(target, { mode, only })`.
@@ -39,13 +39,18 @@ it. This is governing rule 4 (survey/reconcile) made concrete: there is no
 second, parallel poller. A change to how collection works is made in this one
 place and both callers inherit it.
 
-- It throws on a session-build failure; it does **not** throw merely because a
-  switch is unreachable — `health.collect` is resilient and returns a partial
-  result with empty tables (see §3). The session is always closed (`finally`).
+- It throws on a session-build failure, and when the switch does not answer
+  one cheap read (`sysUpTime.0`) made before anything else: the §2 rule,
+  probe first, applied to this path too. Without it, a switch filtering SNMP
+  or a wrong community cost minutes of per-table timeouts and came back as a
+  "complete" collection with nothing in it (seen live: about 9 minutes). Once
+  that read answers, it does **not** throw because individual tables fail —
+  `health.collect` is resilient and returns a partial result with those tables
+  empty (see §3). The session is always closed (`finally`).
 - `previous` (the per-switch `lastCollection` cache) turns error counters into
   rates; it is keyed by `host:port`.
 
-## 2. The reachability probe — `probeSwitch` (server.js)
+## 2. The reachability probe — `probeSwitch` (collection.js)
 
 `probeSwitch(target)` is a single-PDU GET of sysUpTime, CPU, PoE, the
 config-saved flag, and cpu-pps. It never rejects; it resolves
@@ -159,7 +164,7 @@ Event types the collector emits:
 | `reachability` | probe fails / recovers | `state: down\|up`, `error?` |
 | `reboot` | sysUpTime went backwards | `fromTicks`, `toTicks` |
 | `alert` | a `buildAlerts` alert appears / disappears | `state: raised\|cleared`, `severity`, `area`, `message` |
-| `config-change` | gated running-config content diff (see §5) | `hash`, `previousHash`, `bytes` |
+| `config-change` | gated running-config content diff (see §5) | `hash`, `previousHash`, `bytes`, `version` (the config-history id, when stored) |
 
 **Alert identity must be churn-free.** Alert messages carry live numbers
 ("CPU at 85%"), so raised/cleared is diffed on a **signature** that blanks the
@@ -205,6 +210,13 @@ the save-within-30s case would need either a genuine config-change trap (absent
 here) or distinguishing the app's own copy traps from an external
 running→startup save by the copy index — a possible future enhancement.
 
+**Every pull is also a history version.** `maybeConfigDiff` offers each pulled
+text, the first baseline included, to `config-history.js` (injected as
+`deps.configHistory`), and a hand fetch of the running-config through
+`/api/config/fetch` does the same. The history stores a version only when the
+text differs from its newest one, so it costs no extra pull: it rides on the
+gate above and inherits its blind spot.
+
 ## 6. Persistence helpers
 
 - **`rotate.writeFileAtomic(file, data, { mode })`** — the ONE way a
@@ -217,6 +229,15 @@ running→startup save by the copy index — a possible future enhancement.
   rolls to `<file>.1` … `<file>.<keep>` at `maxBytes`. Every on-disk store uses
   it; nothing re-implements rotation (§0.3). Appends are synchronous and
   best-effort — a logging store must never crash the app.
+- **`config-history.js`** — encrypted running-config versions, one file per
+  version under `config-history/<host>/<time>-<hash>.enc`
+  (`SBS_CONFIG_HISTORY_DIR` moves it), written through `writeFileAtomic` and
+  encrypted with the vault's own `encrypt`/`decrypt` (a config holds
+  community strings and password hashes). `record(host, text)` skips a text
+  equal to the newest version; only the newest `SBS_CONFIG_HISTORY_KEEP`
+  (default 50) are kept per switch. `get` accepts only ids it listed itself.
+  Read by `GET /api/config/history?host=` and
+  `GET /api/config/history/version?host=&id=`; nothing there talks to a switch.
 - **`logger.js`** — redacts credential fields (`SECRET_KEY`: passwords,
   passphrases, `community`, `key`, `authKey`/`privKey`, secrets, tokens) at
   **any depth** before a line is written, so a caller can log a whole target.
@@ -231,7 +252,7 @@ running→startup save by the copy index — a possible future enhancement.
   memory and the per-host files below against spoofed UDP.
 - **traps / syslog** — received notifications are persisted to rotating per-host
   stores under `logs/traps/<host>.log` and `logs/syslog/<host>.log` by an
-  always-on subscriber in `server.js`, in addition to the in-memory ring buffers
+  always-on subscriber in `routes/streams.js`, in addition to the in-memory ring buffers
   and SSE streams (which are unchanged).
 - **`history.js`** — the time-series gained `temp` (max sensor °C, from
   `summary.maxTempC`) and `fan` (worst fan-state code: 0 unknown · 1 ok ·
@@ -280,10 +301,16 @@ app installs as a service.
 
 **Windows** (`install-service.bat` → `service-install.js`, via `node-windows`):
 
-- Runs `server.js` headless under **LocalSystem**, auto-starts on boot, and
-  restarts on failure. LocalSystem can bind the privileged UDP ports the
-  receivers use (traps 162, syslog 514, TFTP 69) and 3000 — the same privilege
-  the interactive run had.
+- Runs `server.js` headless under **LocalService**, auto-starts on boot, and
+  restarts on failure. Windows has no privileged ports, so LocalService binds
+  the receivers' UDP ports (traps 162, syslog 514, TFTP 69) and 3000 like any
+  account; what it lacks is LocalSystem's control of the whole machine.
+  `service-install.js` grants LocalService modify rights on the install
+  folder (`icacls`, by SID `*S-1-5-19`, so existing vault/state/log files are
+  covered) and then moves the service to it with `sc.exe config` (node-windows
+  always creates LocalSystem services). If either step fails it says so and
+  the service stays LocalSystem; `SBS_SERVICE_ACCOUNT=LocalSystem` chooses
+  that on purpose. **Not yet run on a real Windows install.**
 - `node-windows` is installed **on demand** by `install-service.bat`, not
   carried in `package.json`, so a normal interactive install (`start.bat`) stays
   lean. It is needed only to create/remove the service; the running service does
@@ -293,12 +320,17 @@ app installs as a service.
   dashboard (the service has no window of its own).
 
 **Linux**: `sbs-management-tool.service` (systemd) is the equivalent — headless,
-boot-start, restart-on-failure, with documented options for the privileged
-receiver ports (root, `CAP_NET_BIND_SERVICE`, or high ports).
+boot-start, restart-on-failure — running as a dedicated `sbs` system account
+with only `CAP_NET_BIND_SERVICE` (ambient and bounding set), `NoNewPrivileges`,
+`ProtectSystem=strict` with the app directory as its one writable path, and
+`dialout` for USB-serial consoles. Checked: as `sbs` with only that
+capability, the receivers bind UDP 69/162/514 and the vault writes its 0600
+files; without it, binding 69 fails with EACCES. The unit's comments give the
+`useradd`/`chown` steps, and the high-port alternative.
 
 **Credentials workflow (important).** Credentials are entered through the **web
 UI against the running service**, never by editing files. The service process
-(LocalSystem on Windows) then owns the vault key and `state.enc` in the install
+(LocalService on Windows, `sbs` on Linux) then owns the vault key and `state.enc` in the install
 directory, so there is no file-ownership split between an interactive user run
 and the service. Combined with on-disk key mode (§7), this is what lets
 collection start automatically after a reboot with no human present. Pick one
@@ -381,16 +413,29 @@ so "C1300X supports OSPF/PTP; C1200/C1300 do not" is visible, not just internal.
 
 ## 11. Shared request and SNMP paths (the server's own helpers)
 
+**Where server code lives.** `server.js` only wires things together: it
+builds the app (`web.js`: the guard and every other middleware), registers
+the route modules under `routes/` (one per feature, each
+`module.exports = function register(app)`), attaches the terminal WebSocket
+(`routes/terminal.js`), starts the receivers and the collector, and listens.
+SNMP primitives live in `snmp-core.js`, the collection path in
+`collection.js`. A new feature's routes go in their own `routes/<feature>.js`
+and use those helpers; nothing new is added to `server.js` itself.
+
 The server-side counterparts of `MODULE-STANDARD §B8`. Each is the one place
 its concern lives; a new route or caller uses it rather than re-implementing it.
 
 | Concern | Helper | Why it exists |
 |---|---|---|
-| Who may call the server | `request-guard.js` (`middleware`, `verifyClient`) | Runs before every HTTP request and on the WebSocket upgrade. The dashboard is opened from any PC, so it does NOT restrict which machine connects; it refuses a browser request whose `Origin` is another site, and any `Host` that is not an IP, `localhost`, this computer's name, or a name in `SBS_ALLOWED_HOSTS` (DNS rebinding). |
-| JSON varbinds → net-snmp SET | `mapSetVarbinds(varbinds)` (server.js) | Every SET path (the `/api/snmp/set` route, snmp-config's bundle, the OPC/AAA/flash step runners) converts through it: numeric types, `valueHex` → Buffer with an even-length check, anything else unchanged. There were three copies, only some handling `valueHex`. |
-| Walking a subtree | `boundedWalk(session, base, opts, onDone)` (server.js) | The ONE walk: subtree boundary, advance check, pacing (§B5a), row/depth caps, and a per-request watchdog (`SNMP_STEP_WATCHDOG_MS`, 12 s) so a reply net-snmp never delivers ends the walk instead of hanging it. `raw: true` returns untouched varbinds for snmp-config (`boundedWalkRaw` is that, with its 4000-row / depth-64 limits). |
-| SNMPv3 security level | `v3SecurityOf(v3)` (server.js) | One derivation of auth/priv method and level, used to build the session and to judge whether a shared key would travel in cleartext, so the two cannot disagree. |
-| A snapshot leaving the server | `publicSnapshot(snap)` (server.js) | The collector keeps the full target to poll with; responses carry it through `redactTarget`. |
+| Where the dashboard listens | `SBS_BIND` in server.js | `127.0.0.1` by default: only the PC the app runs on can open it (the owner's choice, in place of a sign-in). `SBS_BIND=0.0.0.0` re-opens LAN access and logs a warning. The UDP receivers are separate sockets and always listen on every interface. |
+| Browser security headers | `security-headers.js` | Sets CSP (`script-src 'self'`, inline style attributes allowed, connections only back to the page's host), `frame-ancestors 'none'`/X-Frame-Options, nosniff, no referrer. A page change that needs an inline script or another origin changes this policy here, deliberately. |
+| Who may call the server | `request-guard.js` (`middleware`, `verifyClient`) | Runs before every HTTP request and on the WebSocket upgrade. It does NOT decide which machine connects (`SBS_BIND` does); it refuses a browser request whose `Origin` is another site, and any `Host` that is not an IP, `localhost`, this computer's name, or a name in `SBS_ALLOWED_HOSTS` (DNS rebinding). |
+| JSON varbinds → net-snmp SET | `mapSetVarbinds(varbinds)` (snmp-core.js) | Every SET path (the `/api/snmp/set` route, snmp-config's bundle, the OPC/AAA/flash step runners) converts through it: numeric types, `valueHex` → Buffer with an even-length check, anything else unchanged. There were three copies, only some handling `valueHex`. |
+| Walking a subtree | `boundedWalk(session, base, opts, onDone)` (snmp-core.js) | The ONE walk: subtree boundary, advance check, pacing (§B5a), row/depth caps, and a per-request watchdog (`SNMP_STEP_WATCHDOG_MS`, 12 s) so a reply net-snmp never delivers ends the walk instead of hanging it. `raw: true` returns untouched varbinds for snmp-config (`boundedWalkRaw` is that, with its 4000-row / depth-64 limits). |
+| SNMPv3 security level | `v3SecurityOf(v3)` (snmp-core.js) | One derivation of auth/priv method and level, used to build the session and to judge whether a shared key would travel in cleartext, so the two cannot disagree. |
+| Saved secrets | `credentials.js` (`publicState`, `mergeForSave`, `resolveTarget`, `resolveSsh`) | Community strings, v3 keys and SSH passwords of a saved switch never leave the server. `GET /api/state` returns them removed, with a `saved` flag and a switch `id`; `PUT /api/state` keeps a stored secret the browser sent back empty; a middleware in `web.js` fills a request's `target` from the saved switch (`target.ref` = id, else host:port) before any route sees it, and the terminal does the same for the SSH password. A secret the user types always wins. A new route that takes `req.body.target` inherits this; a new secret field is added here. |
+| SSH host keys | `known-hosts.js` (`check`, `trust`) | Trust on first use: the terminal's `hostVerifier` remembers a new switch's key (known-hosts.json), accepts it again, and refuses a different one; the page shows both fingerprints and the only way on is `POST /api/ssh/trust-key` behind a two-tap confirm. |
+| A snapshot leaving the server | `publicSnapshot(snap)` (routes/monitoring.js) | The collector keeps the full target to poll with; responses carry it through `redactTarget`. |
 
 Offline tests for these and the persistence helpers live in `test/` and run
 with `npm test` (node:test, no extra dependency). A new control gets a test

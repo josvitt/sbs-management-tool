@@ -11,6 +11,17 @@ modules (VLANs, Connected, Hardware, Auth, Interfaces) and `public/styles.css`.
 Nothing here is aspirational invention; it documents the real system and makes it
 the rule.
 
+**Where frontend code lives.** The browser loads one script, `public/app.js`,
+which is **generated**: `scripts/build-app.js` joins the feature files in
+`public/src/` (`01-core.js` … `24-init.js`, in name order) inside the single
+function scope they share, so every function still sees every other and nothing
+is global. Edit `public/src/`, then run `npm run build`; never edit `app.js` by
+hand (`npm test` fails when the two differ). A new module goes in its own
+numbered file, or the file of the feature it extends. Order matters only for
+top-level statements that run while the page loads (constants read at load,
+event wiring, start-up in `24-init.js`): a file may use at load time only what
+an earlier file, or an earlier line of its own, declares.
+
 ---
 
 ## 0. Governing rules (apply to every change, always)
@@ -611,7 +622,7 @@ on the periodic timer is a cost decision, not just a correctness one.
 
 1. `health.js`: add table walk(s); mark large ones `onDemand`; include any companion
    table needed to classify rows (e.g. an Owner table that says static vs dynamic).
-2. `app.js` panel list: `{ key, title, span, h, needs }`.
+2. `BUILTIN` panel list (`public/src/04-health.js`): `{ key, title, span, h, needs }`.
 3. `paintBuiltin`: `if (key === 'x') { paintXPanel(s, body, p); return; }`.
 4. `KEYED_PANELS.add('x')`.
 5. `PANEL_TABLE_DEPS.x = [ ...tables..., 'scalars'? ]`.
@@ -639,6 +650,8 @@ on the periodic timer is a cost decision, not just a correctness one.
 | Write SNMP (returns {ok,body}) | `snmpSetResult(s, vb)` |
 | Delete a RowStatus row (with fallback) | `rowStatusDelete(s, statusOid)` |
 | Button lifecycle (spinner→run→settle→done) | `runButtonAction(btn, spec)` |
+| Show a line diff (`diffLines` result) | `diffPre(diff)` → `<pre class="diff">` |
+| Read-only GET of an app API (throws on error) | `getJson(url)` |
 | Flash a changed value | `flashValue(node)` / `flashValues(nodes)` |
 | Mark running-config dirty | `markConfigDirty(s)` |
 | Section title + optional add-control | the module's `section()` (per §B2) |

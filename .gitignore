@@ -1,7 +1,9 @@
-node_modules/
+node_modules
 logs/
 state.enc
 state.enc.*
 .state-key
 history.json
 layouts.json
+known-hosts.json
+config-history/

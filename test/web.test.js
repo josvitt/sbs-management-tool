@@ -1,0 +1,63 @@
+'use strict';
+// The assembled Express app (web.js), over real HTTP on an ephemeral port:
+// pins that the request guard and the security headers are actually wired in,
+// not only that the modules behave in isolation.
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const http = require('http');
+const app = require('../web');
+
+// node:http with a fresh connection per request, rather than fetch: on
+// Windows (Node 24), exiting while fetch's pooled sockets are closing trips
+// a libuv assertion (src\win\async.c) after every test has passed.
+function request(url, opts) {
+  const o = opts || {};
+  return new Promise((resolve, reject) => {
+    const req = http.request(url, { method: o.method || 'GET', headers: o.headers || {}, agent: false }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ status: res.statusCode, headers: { get: (k) => res.headers[k.toLowerCase()] } }));
+    });
+    req.on('error', reject);
+    req.end(o.body);
+  });
+}
+
+let server, base;
+test.before(async () => {
+  server = app.listen(0, '127.0.0.1');
+  await new Promise((r) => server.once('listening', r));
+  base = 'http://127.0.0.1:' + server.address().port;
+});
+// Close keep-alive sockets before the server, and wait for it: on Windows,
+// exiting with a handle still closing trips a libuv assertion.
+test.after(async () => {
+  server.closeAllConnections();
+  await new Promise((r) => server.close(r));
+});
+
+test('a normal page load is served with the security headers', async () => {
+  const res = await request(base + '/');
+  assert.equal(res.status, 200);
+  const csp = res.headers.get('content-security-policy');
+  assert.match(csp, /script-src 'self'(;|$)/);
+  assert.doesNotMatch(csp, /script-src[^;]*unsafe-inline/);
+  assert.match(csp, /frame-ancestors 'none'/);
+  assert.equal(res.headers.get('x-frame-options'), 'DENY');
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+});
+
+test('the guard runs before any route: a cross-site API call is refused', async () => {
+  const res = await request(base + '/api/log', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example' },
+    body: JSON.stringify({ level: 'info', message: 'x' })
+  });
+  assert.equal(res.status, 403);
+});
+
+test('the same call from the page itself is accepted', async () => {
+  const res = await request(base + '/api/log', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Origin: base },
+    body: JSON.stringify({ level: 'info', message: 'web.test same-origin' })
+  });
+  assert.equal(res.status, 204);
+});

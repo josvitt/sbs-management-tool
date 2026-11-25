@@ -211,7 +211,8 @@ function onMessage(msg, rinfo) {
 /** Start listening. Resolves with the port actually in use. */
 function start(port) {
   if (listening) return Promise.resolve(listenPort);
-  const want = port || DEFAULT_PORT;
+  // 0 asks the OS for any free port (as in Node's own APIs); unset is 69.
+  const want = port === 0 ? 0 : (port || DEFAULT_PORT);
   return new Promise((resolve, reject) => {
     socket = dgram.createSocket('udp4');
     socket.on('error', (err) => {
