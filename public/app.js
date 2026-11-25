@@ -2458,12 +2458,16 @@
     summary: ['vlans', 'interfaces', 'sviAddrs', 'scalars', 'poe'],
     auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs', 'radiusServers', 'radiusStats', 'tacacsServers'],
     connected: ['macTable', 'interfaces', 'bridgePorts', 'dot1xHosts'],
-    stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts'],
+    stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts', 'mstpInstances',
+          'pvstPorts', 'pvstVlans', 'pvstInconsistencies', 'stpxInconsistencies'],
     routing: ['sviAddrs', 'interfaces', 'vlans', 'portL2L3', 'routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],
     acl: ['aclNames', 'aclAces', 'aclTuples'],
-    // SNMP configuration has its own loader (17-snmp-config.js); no health
-    // table feeds it, so a table refresh never repaints it.
-    snmpcfg: []
+    // SNMP configuration, Flash files and Packet capture have their own
+    // loaders (17-snmp-config.js, 16-flash-capture.js); no health table feeds
+    // them, so a table refresh never repaints them.
+    snmpcfg: [],
+    flash: [],
+    capture: []
   };
   function panelDependsOn(key, changedTables) {
     const deps = PANEL_TABLE_DEPS[key];
@@ -2497,35 +2501,6 @@
         try { rec.run(s); } catch (e) { /* a view error must not break the refresh */ }
       }
     }
-  }
-
-  // ---- Self-managed module refresh (standard B1 family (c), B5) ----
-  // The keyed-panel modules refresh through refreshTables, which preserves scroll
-  // for them. The self-managed config modules (capture, flash) own
-  // their own fetch + DOM rebuild, so each one used to hand-roll the same
-  // "capture scroll, clear, rebuild, restore scroll" dance - and each was a place
-  // the scroll-preservation fix had to be applied separately. These two helpers
-  // own that dance once:
-  //
-  //   selfManagedRender(s, renderFn)  - runs renderFn (which clears and rebuilds a
-  //     container) with scroll captured before and restored after, so a rebuild
-  //     never jumps the page. Use this to wrap the body of any render function
-  //     that does clear()+rebuild in a self-managed module.
-  //
-  //   selfManagedReload(s, loaderFn)  - awaits loaderFn (the module's async
-  //     fetch+render) and returns a promise, so a write's runButtonAction settle
-  //     can wait for the reload to finish before showing Done (spinner holds until
-  //     the UI reflects the change, exactly like refreshTables does for keyed
-  //     panels). loaderFn is expected to preserve its own scroll via
-  //     selfManagedRender at its render step.
-  function selfManagedRender(s, renderFn) {
-    const restore = scrollKeeper(s);
-    try { renderFn(); } finally { restore(); }
-  }
-  function selfManagedReload(s, loaderFn) {
-    if (typeof loaderFn !== 'function') return Promise.resolve();
-    try { return Promise.resolve(loaderFn()).catch(() => {}); }
-    catch (e) { return Promise.resolve(); }
   }
 
   function refreshTables(s, tables) {
@@ -2744,14 +2719,12 @@
     // Syslog comes from the receiver in this app, not from the switch.
     if (p.key === 'events') { loadEvents(s, p); return; }
     if (p.key === 'auth') { loadSessions(s); }
-    // Interactive, write-driven panels don't come from the health poll; a
-    // refresh just re-paints them rather than walking the whole switch.
-    if (p.key === 'capture' || p.key === 'flash') { if (p._body) paintPanelBody(s, p); return; }
-    // SNMP configuration re-runs its own loader (a server-computed view, not
-    // health tables) and reconciles in place.
-    if (p.key === 'snmpcfg') {
+    // SNMP configuration, Flash files and Packet capture re-run their own
+    // loaders (server endpoints, not health tables) and reconcile in place.
+    const ownLoader = { snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad }[p.key];
+    if (ownLoader) {
       if (btn) { btn.disabled = true; btn.classList.add('spin'); }
-      snmpLoad(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });
+      ownLoader(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });
       return;
     }
 
@@ -3143,10 +3116,8 @@
     return cellArrays.map((cells, i) => ({ key: String(keyFn(dataRows[i], i)), cells: cells }));
   }
 
-  // A one-shot keyed table for panels that manage their OWN container and
-  // rebuild it wholesale on their own refresh (SNMP config, ACL) - they don't
-  // participate in the panel reconcile system, so they just need the standard
-  // table markup. Rows are plain cell-arrays (cells may be values or DOM nodes,
+  // A one-shot keyed table outside the panels (the config history list): it is
+  // built once and never reconciled, so it just needs the standard markup. Rows are plain cell-arrays (cells may be values or DOM nodes,
   // the legacy snmpTable style). onRowClick(i, tr) is supported for edit rows.
   // Returns the node; keeps _tbody/_colspan/_rowByKey for editor anchoring.
   function plainTable(s, cols, rows, onRowClick) {
@@ -3165,7 +3136,7 @@
   // has no mounted keyed tables yet (caller should fall back to a full repaint).
   // panelIsConverted lists the keys that use keyed tables for every table they
   // render; a converted panel is safe to reconcile without a full repaint.
-  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg', 'stp']);
+  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg', 'stp', 'flash', 'capture']);
   // A converted panel may still have sections built on a full paint only (auth's
   // 802.1X editor). When a refresh changes a table those read, full-repaint
   // instead of reconciling.
@@ -6321,8 +6292,8 @@
     if (key === 'acl') { paintAclPanel(s, body, p); return; }
     if (key === 'routing') { paintRoutingPanel(s, body, p); return; }
     if (key === 'vlans') { paintVlanPanel(s, body, p); return; }
-    if (key === 'capture') { paintCapturePanel(s, body); return; }
-    if (key === 'flash') { paintFlashPanel(s, body); return; }
+    if (key === 'capture') { paintCapturePanel(s, body, p); return; }
+    if (key === 'flash') { paintFlashPanel(s, body, p); return; }
     const h = s.health;
     if (!h) { body.appendChild(el('div', 'card-sub', 'No SNMP data yet.')); return; }
     const sc = (k) => (h.scalars[k] ? h.scalars[k].display : null);
@@ -10564,386 +10535,334 @@
   // 16-flash-capture.js: Flash files and packet capture (OPC) panels.
   // =================================================================
 
-  // delete it (rlFileRowStatus destroy). Delete is suppressed for directory
-  // entries and anything the switch marks non-writable (system files).
-  function paintFlashPanel(s, body) {
-    clear(body);
-    if (!s.target) { body.appendChild(el('div', 'card-sub', 'Connect with SNMP to browse flash.')); return; }
+  // Both are keyed panels with their own loader (standard B1 family b2), like
+  // SNMP configuration: the rows come from a server endpoint read on demand
+  // (/api/flash/list, /api/opc/list), not from the health walk. The paint
+  // follows B2: scaffolding on a full paint, mountInto tables with stable
+  // keys, counts in stable nodes, and a load or a write reconciles in place.
+  //
+  // s._flash = { data, fetchedAt, loading, highlight }
+  // s._capture = { data, fetchedAt, loading }
+  // data is the endpoint's reply; data.error is set when it failed.
 
-    const fmtSize = (n) => {
-      const v = Number(n); if (!Number.isFinite(v)) return String(n);
-      if (v >= 1048576) return (v / 1048576).toFixed(1) + ' MB';
-      if (v >= 1024) return (v / 1024).toFixed(1) + ' KB';
-      return v + ' B';
-    };
-
-    const title = el('div', 'section-title', 'Flash files');
-    const note = el('span', 'st-note', ''); title.appendChild(note);
-    body.appendChild(title);
-
-    const listBody = el('div', 'flash-files'); listBody.style.marginTop = '8px'; body.appendChild(listBody);
-    const msg = el('div', 'sw-msg'); body.appendChild(msg);
-
-    // Download a flash file over TFTP (flash -> this app -> browser).
-    const download = (fileName) => {
-      clear(msg);
-      s.writeBusy = true;
-      return fetch('/api/opc/fetch-flash', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: s.target, flashFileName: fileName }) })
-        .then((r) => r.json().then((b) => ({ ok: r.ok, b })))
-        .then(({ ok, b }) => {
-          s.writeBusy = false;
-          if (ok && b.ok && b.pcapBase64) {
-            const bytes = atob(b.pcapBase64);
-            const arr = new Uint8Array(bytes.length);
-            for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-            const blob = new Blob([arr], { type: 'application/octet-stream' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url; a.download = String(fileName).replace(/^flash:\/\//i, '').replace(/^flash:/i, '');
-            document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
-            return true;
-          }
-          // Only surface a message on failure.
-          clear(msg); msg.appendChild(el('div', 'sw-err', 'Download failed: ' + (b.error || 'unknown error')));
-          return false;
-        })
-        .catch((e) => { s.writeBusy = false; clear(msg); msg.appendChild(el('div', 'sw-err', 'Download failed: ' + e.message)); return false; });
-    };
-
-    // The Delete button confirms itself (two-tap), so this acts directly.
-    const doDeleteFlash = (f) => {
-      clear(msg); s.writeBusy = true;
-      return fetch('/api/flash/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: s.target, fileName: f.name }) })
-        .then((r) => r.json().then((bb) => ({ ok: r.ok, bb })))
-        .then(({ ok, bb }) => {
-          s.writeBusy = false;
-          // No success text — the file just disappears from the reloaded list.
-          if (ok && bb.ok) { load(); return true; }
-          clear(msg); msg.appendChild(el('div', 'sw-err', 'Delete failed: ' + (bb.error || 'unknown error')));
-          return false;
-        })
-        .catch((e) => { s.writeBusy = false; clear(msg); msg.appendChild(el('div', 'sw-err', 'Delete failed: ' + e.message)); return false; });
-    };
-
-    const load = (highlightName) => {
-      clear(listBody); clear(msg);
-      listBody.appendChild(el('div', 'card-sub', 'Listing flash\u2026'));
-      fetch('/api/flash/list', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: s.target }) })
-        .then((r) => r.json())
-        .then((b) => {
-          clear(listBody);
-          // Normalise the name to highlight (strip any flash:// prefix so it
-          // matches the listing's bare names).
-          const hl = highlightName ? String(highlightName).replace(/^flash:\/\//i, '').replace(/^flash:/i, '') : null;
-          if (!b || b.error) { listBody.appendChild(el('div', 'card-sub', 'Could not list flash: ' + ((b && b.error) || 'error'))); return; }
-          const files = b.files || [];
-          note.textContent = files.length + ' entr' + (files.length === 1 ? 'y' : 'ies') +
-            (b.flash && b.flash.free != null ? '  \u00b7  ' + fmtSize(b.flash.free) + ' free of ' + fmtSize(b.flash.total) : '');
-          if (!files.length) { listBody.appendChild(el('div', 'card-sub', 'No files found.')); return; }
-          // Render the file list through plainTable (the keyed render helper) so
-          // it diffs cells and stays consistent with every other data table
-          // (standard A5/B3), instead of a hand-built <table>.
-          const cols = ['Name', 'Perm', 'Size', 'Modified', ''];
-          const rows = files.map((f) => {
-            const permKnown = (f.permByte !== undefined && f.permByte !== null);
-            const nameCell = el('span', '', f.isDir ? (f.name + '/') : f.name);
-            if (hl && String(f.name).replace(/^flash:\/\//i, '').replace(/^flash:/i, '') === hl) {
-              nameCell.className = 'flash-new';
-              setTimeout(() => { nameCell.classList.remove('flash-new'); }, 6000);
-            }
-            const btns = [];
-            // Download for anything that isn't a directory. Routed through
-            // runButtonAction (standard B6) so it spins until the TFTP copy +
-            // browser download resolves, then shows Done.
-            if (!f.isDir) btns.push(actBtn('Download', (e) => {
-              runButtonAction(e.currentTarget, {
-                failLabel: 'Download', spinLabel: 'Fetching\u2026',
-                run: () => download(f.name),
-                ok: (okFlag) => okFlag === true,
-                settle: () => Promise.resolve()
-              });
-            }, 'primary', 'Download this file'));
-            // Delete rules: never for directories or read-only (system) files;
-            // offered for writable or unknown-permission files.
-            let noteLabel = null;
-            if (f.isDir) { noteLabel = ' directory'; }
-            else if (permKnown && f.writable === false) { noteLabel = ' read-only'; }
-            else {
-              btns.push(actBtnConfirm('Delete', (e) => {
-                runButtonAction(e.currentTarget, {
-                  failLabel: 'Delete',
-                  run: () => doDeleteFlash(f),
-                  ok: (okFlag) => okFlag === true,
-                  settle: () => Promise.resolve()   // doDeleteFlash reloads the list itself
-                });
-              }, 'danger', 'Delete this file'));
-            }
-            // A span.tbl-acts (from actGroup) is detected by ktRenderCell as an
-            // action cell (clicks stopped); append the informational note, if any.
-            const actCell = actGroup(btns);
-            if (noteLabel) actCell.appendChild(el('span', 'card-sub', noteLabel));
-            return [
-              nameCell,
-              permKnown ? ('0x' + Number(f.permByte).toString(16).padStart(2, '0')) : '?',
-              f.isDir ? '' : (f.size !== undefined ? fmtSize(f.size) : ''),
-              [f.date, f.time].filter(Boolean).join(' '),
-              actCell
-            ];
-          });
-          listBody.appendChild(plainTable(s, cols, rows));
-        })
-        .catch((e) => { clear(listBody); listBody.appendChild(el('div', 'card-sub', 'Could not list flash: ' + e.message)); });
-    };
-
-    // Expose so the capture panel's Export can download a file and reload this
-    // list without the user switching panels.
-    s._flashDownload = download;
-    s._flashReload = load;
-    load();
+  // POST to the local server; resolves its reply, or { ok:false, error }.
+  async function sidePost(url, payload) {
+    try {
+      const { body } = await apiPost(url, payload);
+      return body || { ok: false, error: 'no reply from the local server' };
+    } catch (e) { return { ok: false, error: 'lost contact with the local server: ' + e.message }; }
   }
 
-  function paintCapturePanel(s, body) {
-    clear(body);
-    if (!s.target) {
-      body.appendChild(el('div', 'card-sub', 'Connect with SNMP to use packet capture.'));
-      return;
+  // Reconcile a b2 panel after its loader or a write, or repaint it when the
+  // pass is structural. Does nothing when the panel is closed or collapsed.
+  function sideRepaint(s, key) {
+    const p = s.panels && s.panels.find((x) => x.kind === 'builtin' && x.key === key);
+    if (!p || !p._body || p.collapsed) return;
+    if (!reconcilePanelInPlace(s, p)) repaintPanel(s, key);
+  }
+  // Load once per visit: on open, unless a load is running or ran in the last
+  // 30 s. `st` is the panel's state object, `load` its loader.
+  function sideEnsure(s, st, load) {
+    if (!s.target || !st) return;
+    if (st.loading || Date.now() - (st.fetchedAt || 0) < 30000) return;
+    load(s);
+  }
+  const fmtFlashSize = (n) => {
+    const v = Number(n); if (!Number.isFinite(v)) return String(n);
+    if (v >= 1048576) return (v / 1048576).toFixed(1) + ' MB';
+    if (v >= 1024) return (v / 1024).toFixed(1) + ' KB';
+    return v + ' B';
+  };
+  const bareFlashName = (n) => String(n || '').replace(/^flash:\/\//i, '').replace(/^flash:/i, '');
+
+  // ---- Flash files ----
+  // Lists the switch's flash; any file can be downloaded (TFTP to this app,
+  // then to the browser) and a writable one deleted (rlFileRowStatus destroy).
+  // Delete is not offered for directories or files the switch marks read-only.
+
+  // Read the listing and reconcile. highlight (a file name) flashes that row
+  // once, so a capture exported from the Packet capture panel is easy to spot.
+  function flashLoad(s, highlight) {
+    s._flash = s._flash || {};
+    const st = s._flash;
+    if (highlight) st.highlight = bareFlashName(highlight);
+    if (st.loading) return st.loading;
+    st.fetchedAt = Date.now();
+    st.loading = sidePost('/api/flash/list', { target: s.target })
+      .then((b) => { st.data = (b && !b.error) ? b : { error: (b && b.error) || 'no answer' }; })
+      .finally(() => { st.loading = null; sideRepaint(s, 'flash'); });
+    return st.loading;
+  }
+
+  // Copy a flash file to the browser. Resolves { ok, error }.
+  async function flashDownload(s, fileName) {
+    s.writeBusy = true;
+    try {
+      const b = await sidePost('/api/opc/fetch-flash', { target: s.target, flashFileName: fileName });
+      if (!(b && b.ok && b.pcapBase64)) return { ok: false, error: (b && b.error) || 'unknown error' };
+      const bytes = atob(b.pcapBase64);
+      const arr = new Uint8Array(bytes.length);
+      for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([arr], { type: 'application/octet-stream' }));
+      const a = document.createElement('a');
+      a.href = url; a.download = bareFlashName(fileName);
+      document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+      return { ok: true };
+    } finally { s.writeBusy = false; }
+  }
+
+  function paintFlashPanel(s, body, p) {
+    if (!s._ktReconcile) clear(body);
+    if (!s.target) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Connect with SNMP to browse flash.')); return; }
+    s._flash = s._flash || {};
+    if (!s._ktReconcile) sideEnsure(s, s._flash, flashLoad);
+    const d = s._flash.data;
+    // The shape: waiting, an error, no files, or the table.
+    const shape = !d ? 'wait' : (d.error ? 'error' : ((d.files || []).length ? 'files' : 'empty'));
+    if (s._ktReconcile && p._flashShape !== shape) { s._ktStructural = true; return; }
+    p._flashShape = shape;
+    if (shape === 'wait') { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Waiting for data\u2026')); return; }
+    if (shape === 'error') { if (!s._ktReconcile) body.appendChild(el('div', 'panel-err', 'Could not list flash: ' + d.error)); return; }
+
+    const files = d.files || [];
+    if (!s._ktReconcile) {
+      const st = el('div', 'section-title', 'Flash files');
+      p._flashNote = el('span', 'st-note', '');
+      st.appendChild(p._flashNote);
+      body.appendChild(st);
     }
-    // Existing captures on the switch, discovered by walking the capture table.
-    const existing = el('div', 'capture-existing'); existing.style.margin = '10px 0';
-    body.appendChild(existing);
+    p._flashNote.textContent = files.length + ' entr' + (files.length === 1 ? 'y' : 'ies') +
+      (d.flash && d.flash.free != null ? '  \u00b7  ' + fmtFlashSize(d.flash.free) + ' free of ' + fmtFlashSize(d.flash.total) : '');
+    if (shape === 'empty') { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'No files found.')); return; }
 
-    const grid = el('div', 'snmp-form-grid'); grid.style.marginTop = '10px';
+    const hl = s._flash.highlight; s._flash.highlight = null;
+    mountInto(body, s, p, 'flash:files', ['Name', 'Perm', 'Size', 'Modified', ''], files.map((f) => {
+      const permKnown = f.permByte !== undefined && f.permByte !== null;
+      const deletable = !f.isDir && !(permKnown && f.writable === false);
+      const btns = [];
+      if (!f.isDir) {
+        btns.push(actBtn('Download', (e) => runButtonAction(e.currentTarget, {
+          failLabel: 'Download', spinLabel: 'Fetching\u2026',
+          run: () => flashDownload(s, f.name),
+          ok: (r) => r && r.ok,
+          error: (r) => (r && r.error) || 'unknown error'
+        }), 'primary', 'Download this file'));
+      }
+      if (deletable) {
+        btns.push(actBtnConfirm('Delete', (e) => runButtonAction(e.currentTarget, {
+          failLabel: 'Delete',
+          run: async () => { s.writeBusy = true; try { return await sidePost('/api/flash/delete', { target: s.target, fileName: f.name }); } finally { s.writeBusy = false; } },
+          ok: (r) => r && r.ok,
+          error: (r) => (r && r.error) || 'unknown error',
+          settle: () => flashLoad(s)
+        }), 'danger', 'Delete this file'));
+      }
+      const actCell = actGroup(btns);
+      if (f.isDir) actCell.appendChild(el('span', 'card-sub', ' directory'));
+      else if (!deletable) actCell.appendChild(el('span', 'card-sub', ' read-only'));
+      return { key: 'file:' + f.name, cells: [
+        { v: f.isDir ? f.name + '/' : f.name, _flash: !!hl && bareFlashName(f.name) === hl },
+        { v: permKnown ? '0x' + Number(f.permByte).toString(16).padStart(2, '0') : '?' },
+        { v: f.isDir ? '' : (f.size !== undefined ? fmtFlashSize(f.size) : '') },
+        { v: [f.date, f.time].filter(Boolean).join(' ') },
+        { cellNode: actCell, sig: (f.isDir ? 'd' : 'f') + (deletable ? 'w' : 'r') }] };
+    }));
+  }
 
-    const nameIn = el('input'); nameIn.type = 'text'; nameIn.maxLength = 32; nameIn.value = s.captureName || 'capture1';
-    nameIn.addEventListener('input', () => { s._captureExisting = false; });
-    grid.appendChild(field('Capture name', nameIn));
+  // ---- Packet capture ----
+  // Lists the captures on the switch, each with Start/Stop, Export, Clear and
+  // Delete. + New capture, or a capture's name, opens the settings in the
+  // standard pop-out. While any capture is running the list re-reads every
+  // 15 s, so its packet counts move without a refresh.
 
-    const dirSel = el('select');
-    for (const d of ['both', 'in', 'out']) { const o = el('option', '', d); o.value = d; dirSel.appendChild(o); }
-    grid.appendChild(field('Control-plane direction', dirSel));
+  function captureLoad(s) {
+    s._capture = s._capture || {};
+    const st = s._capture;
+    if (st.loading) return st.loading;
+    st.fetchedAt = Date.now();
+    st.loading = sidePost('/api/opc/list', { target: s.target })
+      .then((b) => {
+        st.data = (b && !b.error) ? b : { error: (b && b.error) || 'no answer' };
+        st.anyActive = !st.data.error && (st.data.captures || []).some((c) => c.stateText === 'active');
+      })
+      .finally(() => { st.loading = null; sideRepaint(s, 'capture'); captureTimer(s); });
+    return st.loading;
+  }
 
-    const bufSel = el('select');
-    for (const b2 of ['linear', 'circular']) { const o = el('option', '', b2); o.value = b2; bufSel.appendChild(o); }
-    grid.appendChild(field('Buffer type', bufSel));
+  // The 15 s poll runs only while a capture is active and the panel is open,
+  // and skips a tick while a write is running. A capture's state does not
+  // change second to second, and each read walks the capture table.
+  function captureTimer(s) {
+    const st = s._capture || {};
+    const p = s.panels && s.panels.find((x) => x.kind === 'builtin' && x.key === 'capture');
+    const open = p && p._body && !p.collapsed && document.body.contains(p._body);
+    if (st.anyActive && open) {
+      if (!s._captureStatsTimer) {
+        s._captureStatsTimer = setInterval(() => {
+          if (!s.writeBusy && !(s._capture && s._capture.loading)) captureLoad(s);
+        }, 15000);
+      }
+    } else if (s._captureStatsTimer) { clearInterval(s._captureStatsTimer); s._captureStatsTimer = null; }
+  }
 
-    const sizeIn = el('input'); sizeIn.type = 'number'; sizeIn.min = '1'; sizeIn.placeholder = 'MB (optional)';
-    grid.appendChild(field('Buffer size (MB)', sizeIn));
+  // One capture action (start, stop, clear, delete, configure). Resolves
+  // { ok, error, body } for runButtonAction.
+  async function captureWrite(s, url, payload) {
+    s.writeBusy = true;
+    try {
+      const b = await sidePost(url, Object.assign({ target: s.target }, payload));
+      return { ok: !!(b && b.ok), error: (b && b.error) || 'unknown error', body: b };
+    } finally { s.writeBusy = false; }
+  }
 
-    const filterSel = el('select');
-    for (const f2 of ['any', 'acl']) { const o = el('option', '', f2 === 'any' ? 'match any' : 'match ACL'); o.value = f2; filterSel.appendChild(o); }
-    grid.appendChild(field('Filter', filterSel));
-
-    const aclIn = el('input'); aclIn.type = 'text'; aclIn.maxLength = 32; aclIn.placeholder = 'ACL name';
-    const aclField = field('ACL name', aclIn);
-    grid.appendChild(aclField);
-
-    const durIn = el('input'); durIn.type = 'number'; durIn.min = '0'; durIn.placeholder = 'seconds (0 = none)';
-    grid.appendChild(field('Limit: duration', durIn));
-
-    const pktIn = el('input'); pktIn.type = 'number'; pktIn.min = '0'; pktIn.placeholder = 'packets (0 = none)';
-    grid.appendChild(field('Limit: packets', pktIn));
-
-    body.appendChild(grid);
-    const syncFilter = () => { aclField.style.display = filterSel.value === 'acl' ? '' : 'none'; };
-    filterSel.addEventListener('change', syncFilter); syncFilter();
-
-    const msg = el('div', 'sw-msg');
-
-    // Per-capture status (state, packets, dropped, buffer) is shown inline in
-    // the captures list, so "refresh status" just reloads that list rather than
-    // maintaining a separate, redundant status block.
-    const readStatus = () => { if (s._captureListReload) s._captureListReload(); };
-
-    const cfg = () => ({
-      target: s.target, name: (nameIn.value || '').trim(), direction: dirSel.value,
-      bufferType: bufSel.value, bufferSizeMb: parseInt(sizeIn.value, 10),
-      filter: filterSel.value, aclName: (aclIn.value || '').trim(),
-      limitDurationSec: parseInt(durIn.value, 10), limitPackets: parseInt(pktIn.value, 10),
-      existing: !!s._captureExisting
-    });
-    const run = (label, url, payload, after) => {
-      clear(msg);
-      s.writeBusy = true;
-      return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
-        .then((r) => r.json().then((b) => ({ ok: r.ok, b })))
-        .then(({ ok, b }) => {
-          s.writeBusy = false;
-          // No success text — the list updates to reflect the new state. Only
-          // surface failures.
-          if (ok && b.ok) { if (after) after(b); readStatus(); if (s._captureListReload) s._captureListReload(); }
-          else { clear(msg); msg.appendChild(el('div', 'sw-err', label + ' failed: ' + (b.error || 'unknown error'))); }
-          return { ok: ok && b.ok, b };
-        })
-        .catch((e) => { s.writeBusy = false; clear(msg); msg.appendChild(el('div', 'sw-err', label + ' failed: ' + e.message)); return { ok: false }; });
-    };
-
-    const actions = el('div', 'snmp-form-actions'); actions.style.marginTop = '10px';
-    const applyBtn = el('button', 'btn btn-small btn-blue', 'Configure'); applyBtn.type = 'button';
-
-    const nameOf = () => (nameIn.value || '').trim();
-    const needName = () => { if (!nameOf()) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a capture name.')); return false; } return true; };
-
-    applyBtn.addEventListener('click', () => { if (needName()) { s.captureName = nameOf(); run('Configure', '/api/opc/configure', cfg()); } });
-    actions.appendChild(applyBtn);
-    body.appendChild(actions);
-
-    body.appendChild(msg);
-
-    // Export a stopped, non-empty capture to a flash .pcap via the rlCopyTable
-    // copy engine (sourceFileType=pcap -> capture://). This is the proven,
-    // non-crashing path. Exposed on s so the inline per-capture Export button
-    // (in the list above) can call it.
-    s._exportCapture = (captureName, btn) => {
-      clear(msg);
-      // The export button spins through the WHOLE operation - copying the capture
-      // to a flash file AND the TFTP download of that file - and only says Done
-      // once the file has actually downloaded. The copy result is carried from
-      // run() into settle() so the download targets the right flash file.
-      let copyResult = null;
-      runButtonAction(btn, {
-        failLabel: 'Export',
-        run: () => apiPost('/api/copy/capture-to-flash', { target: s.target, name: captureName, confirm: true })
-          .then((res) => { copyResult = res.body; return res; }),
-        // Success means the copy to flash genuinely finished (server waits for it).
-        ok: (res) => res && res.ok && res.body && res.body.ok && res.body.flashFileName,
-        error: (res) => {
-          const b = res && res.body;
-          if (b && b.finished === false && !b.failed) {
-            // Still being written (a very large capture beyond the server's wait):
-            // show the file in the Flash list so the user can grab it when ready.
-            if (b.flashFileName && s._flashReload) s._flashReload(b.flashFileName);
-            return 'still writing to flash - it will appear in the Flash files list shortly; download it from there once it finishes';
-          }
-          return (b && b.error) || 'unknown error';
-        },
-        // settle = the TFTP download. The button keeps spinning until it lands,
-        // and a failed download rejects so the helper reports it rather than
-        // showing a false Done.
-        settle: () => {
-          const fn = copyResult && copyResult.flashFileName;
-          if (!fn) return Promise.resolve();
-          if (s._flashReload) s._flashReload(fn);
-          if (!s._flashDownload) return Promise.resolve();
-          return Promise.resolve(s._flashDownload(fn)).then((okDl) => { if (okDl === false) throw new Error('download from flash failed'); });
+  // Export a stopped, non-empty capture: copy it to a flash .pcap through the
+  // rlCopyTable engine (sourceFileType=pcap -> capture://), the proven
+  // non-crashing path, then download that file. The button spins through both
+  // and says Done only once the file has downloaded.
+  function captureExport(s, btn, name) {
+    let copy = null;
+    return runButtonAction(btn, {
+      failLabel: 'Export',
+      run: () => apiPost('/api/copy/capture-to-flash', { target: s.target, name, confirm: true })
+        .then((res) => { copy = res.body; return res; }),
+      // Success means the copy to flash finished (the server waits for it).
+      ok: (res) => res && res.ok && res.body && res.body.ok && res.body.flashFileName,
+      error: (res) => {
+        const b = res && res.body;
+        if (b && b.finished === false && !b.failed) {
+          // Still being written (a capture larger than the server waits for):
+          // show it in Flash files so it can be fetched once it finishes.
+          if (b.flashFileName) flashLoad(s, b.flashFileName);
+          return 'still writing to flash - it will appear in the Flash files list shortly; download it from there once it finishes';
         }
-      }).catch(() => { /* toast already shown by the helper */ });
-    };
+        return (b && b.error) || 'unknown error';
+      },
+      settle: () => {
+        const fn = copy && copy.flashFileName;
+        if (!fn) return Promise.resolve();
+        flashLoad(s, fn);
+        return flashDownload(s, fn).then((r) => { if (!r.ok) throw new Error('download from flash failed: ' + r.error); });
+      }
+    }).catch(() => { /* the helper has shown the failure */ });
+  }
 
-    // Populate the config form from an existing capture object.
-    const loadIntoForm = (cap) => {
-      nameIn.value = cap.name || '';
-      s.captureName = cap.name;
-      s._captureExisting = true;
-      if (cap.bufferTypeText) bufSel.value = cap.bufferTypeText;
-      if (Number(cap.bufferSize) > 0) sizeIn.value = String(cap.bufferSize); else sizeIn.value = '';
-      if (cap.filterText === 'acl') { filterSel.value = 'acl'; aclIn.value = cap.aclName || ''; }
-      else filterSel.value = 'any';
-      syncFilter();
-      durIn.value = Number(cap.limitDuration) > 0 ? String(cap.limitDuration) : '';
-      pktIn.value = Number(cap.limitPackets) > 0 ? String(cap.limitPackets) : '';
-      readStatus();
-    };
+  function paintCapturePanel(s, body, p) {
+    if (!s._ktReconcile) clear(body);
+    if (!s.target) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Connect with SNMP to use packet capture.')); return; }
+    s._capture = s._capture || {};
+    if (!s._ktReconcile) { sideEnsure(s, s._capture, captureLoad); captureTimer(s); }
+    const d = s._capture.data;
+    const caps = (d && !d.error && d.captures) || [];
+    const shape = !d ? 'wait' : (d.error ? 'error' : (caps.length ? 'list' : 'empty'));
+    if (s._ktReconcile && p._capShape !== shape) { s._ktStructural = true; return; }
+    p._capShape = shape;
+    if (shape === 'wait') { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Waiting for data\u2026')); return; }
+    if (shape === 'error') { if (!s._ktReconcile) body.appendChild(el('div', 'panel-err', 'Could not list captures: ' + d.error)); return; }
 
-    // Discover and render existing captures.
-    const loadCaptureList = () => {
-      clear(existing);
-      existing.appendChild(el('div', 'card-sub', 'Looking for existing captures\u2026'));
-      fetch('/api/opc/list', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: s.target }) })
-        .then((r) => r.json())
-        .then((b) => {
-          const caps = (b && !b.error) ? (b.captures || []) : null;
-          if (caps) s._anyCaptureActive = caps.some((c) => c.stateText === 'active');
-          // Render with scroll preserved around the rebuild (standard B5), and
-          // through plainTable (the keyed render helper) like every other table.
-          selfManagedRender(s, () => {
-            clear(existing);
-            if (!caps) { existing.appendChild(el('div', 'card-sub', 'Could not list captures: ' + ((b && b.error) || 'error'))); return; }
-            // Nothing to show when there are no captures — the create form below
-            // is how one is made, so this section simply stays hidden.
-            if (!caps.length) return;
-            const title = el('div', 'section-title', 'Captures on the switch');
-            title.appendChild(el('span', 'st-note', caps.length + ' found'));
-            existing.appendChild(title);
-            const cols = ['Name', 'State', 'Buffer', 'Filter', 'Packets', 'Dropped', 'Used', 'Pkts/s', ''];
-            const rows = caps.map((cap) => {
-              const nm = cap.name;
-              const btns = [];
-              // Every capture action goes through runButtonAction: spinner on
-              // click, held until the switch state (and the capture list) actually
-              // reflect the change, then Done - consistent with the rest of the app.
-              const captureAction = (btn, label, url, payload) => runButtonAction(btn, {
-                failLabel: label,
-                run: () => apiPost(url, payload),
-                ok: (r) => r && r.ok && r.body && r.body.ok,
-                error: (r) => (r && r.body && r.body.error) || 'unknown error',
-                onApplied: () => { readStatus(); },
-                settle: () => selfManagedReload(s, s._captureListReload)
-              });
-              if (cap.stateText === 'active') {
-                btns.push(actBtn('Stop', (e) => captureAction(e.currentTarget, 'Stop', '/api/opc/action', { target: s.target, name: nm, action: 'stop' }), '', 'Stop capturing'));
-              } else {
-                btns.push(actBtn('Start', (e) => captureAction(e.currentTarget, 'Start', '/api/opc/action', { target: s.target, name: nm, action: 'start' }), '', 'Start capturing'));
-              }
-              btns.push(actBtn('Edit', () => loadIntoForm(cap), '', 'Load this capture into the form below to reconfigure'));
-              const exp = actBtn('Export', (e) => { if (s._exportCapture) s._exportCapture(nm, e.currentTarget); }, '', 'Export to a flash .pcap and download it');
-              const capPkts = Number(cap.packets) || 0;
-              if (cap.stateText === 'active' || capPkts <= 0) {
-                exp.disabled = true;
-                exp.title = cap.stateText === 'active' ? 'Stop the capture before exporting.' : 'Nothing to export yet — this capture has no packets.';
-              }
-              btns.push(exp);
-              // Clear empties the capture buffer so the same capture can be
-              // re-run without deleting and recreating it. Only meaningful when it
-              // is stopped and actually has captured packets.
-              const clr = actBtnConfirm('Clear', (e) => captureAction(e.currentTarget, 'Clear', '/api/opc/action', { target: s.target, name: nm, action: 'clear' }), '', 'Empty the capture buffer so you can capture again (keeps the capture configured)');
-              if (cap.stateText === 'active' || capPkts <= 0) {
-                clr.disabled = true;
-                clr.title = cap.stateText === 'active' ? 'Stop the capture before clearing.' : 'Nothing to clear \u2014 this capture has no packets.';
-              }
-              btns.push(clr);
-              btns.push(actBtnConfirm('Delete', (e) => captureAction(e.currentTarget, 'Delete', '/api/opc/delete', { target: s.target, name: nm }), 'danger', 'Delete this capture'));
-              return [
-                cap.name,
-                cap.stateText,
-                (cap.bufferTypeText || '') + (Number(cap.bufferSize) ? ' ' + cap.bufferSize + 'MB' : ''),
-                cap.filterText === 'acl' ? ('acl ' + (cap.aclName || '')) : (cap.filterText || ''),
-                cap.packets === undefined ? '' : String(cap.packets),
-                cap.dropped === undefined ? '' : String(cap.dropped),
-                cap.bufferUsed === undefined ? '' : String(cap.bufferUsed),
-                cap.pps === undefined ? '' : String(cap.pps),
-                actGroup(btns)
-              ];
-            });
-            existing.appendChild(plainTable(s, cols, rows));
-          });
-        })
-        .catch((e) => { clear(existing); existing.appendChild(el('div', 'card-sub', 'Could not list captures: ' + e.message)); });
-    };
-    // Expose so action handlers can refresh the list after changes.
-    s._captureListReload = loadCaptureList;
-    s._captureLoadIntoForm = loadIntoForm;
+    if (!s._ktReconcile) {
+      const st = el('div', 'section-title', 'Captures on the switch');
+      p._capNote = el('span', 'st-note', '');
+      st.appendChild(p._capNote);
+      body.appendChild(st);
+      body.appendChild(addControl('New capture', () => openCaptureForm(s, null)));
+    }
+    p._capNote.textContent = caps.length ? caps.length + ' found' : '';
+    if (shape === 'empty') { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'No captures on the switch.')); return; }
 
-    loadCaptureList();
+    // Every action spins until the list has been re-read (B6).
+    const act = (label, url, payload) => (e) => runButtonAction(e.currentTarget, {
+      failLabel: label,
+      run: () => captureWrite(s, url, payload),
+      ok: (r) => r && r.ok,
+      error: (r) => (r && r.error) || 'unknown error',
+      settle: () => captureLoad(s)
+    });
+    mountInto(body, s, p, 'capture:list', ['Name', 'State', 'Buffer', 'Filter', 'Packets', 'Dropped', 'Used', 'Pkts/s', ''], caps.map((cap) => {
+      const nm = cap.name;
+      const active = cap.stateText === 'active';
+      const empty = (Number(cap.packets) || 0) <= 0;
+      const btns = [active
+        ? actBtn('Stop', act('Stop', '/api/opc/action', { name: nm, action: 'stop' }), '', 'Stop capturing')
+        : actBtn('Start', act('Start', '/api/opc/action', { name: nm, action: 'start' }), '', 'Start capturing')];
+      const exp = actBtn('Export', (e) => captureExport(s, e.currentTarget, nm), '', 'Export to a flash .pcap and download it');
+      // Clear empties the buffer so the same capture can run again without
+      // being deleted and recreated; it needs a stopped capture with packets.
+      const clr = actBtnConfirm('Clear', act('Clear', '/api/opc/action', { name: nm, action: 'clear' }), '', 'Empty the capture buffer so you can capture again (keeps the capture configured)');
+      if (active || empty) {
+        exp.disabled = true; clr.disabled = true;
+        exp.title = active ? 'Stop the capture before exporting.' : 'Nothing to export yet \u2014 this capture has no packets.';
+        clr.title = active ? 'Stop the capture before clearing.' : 'Nothing to clear \u2014 this capture has no packets.';
+      }
+      btns.push(exp, clr, actBtnConfirm('Delete', act('Delete', '/api/opc/delete', { name: nm }), 'danger', 'Delete this capture'));
+      return { key: 'cap:' + nm, cells: [
+        { v: nm, click: { open: () => openCaptureForm(s, nm) } },
+        { pill: true, v: cap.stateText || '' },
+        { v: (cap.bufferTypeText || '') + (Number(cap.bufferSize) ? ' ' + cap.bufferSize + 'MB' : '') },
+        { v: cap.filterText === 'acl' ? 'acl ' + (cap.aclName || '') : (cap.filterText || '') },
+        { v: cap.packets === undefined ? '' : String(cap.packets) },
+        { v: cap.dropped === undefined ? '' : String(cap.dropped) },
+        { v: cap.bufferUsed === undefined ? '' : String(cap.bufferUsed) },
+        { v: cap.pps === undefined ? '' : String(cap.pps) },
+        { cellNode: actGroup(btns), sig: (active ? 'a' : 's') + (empty ? 'e' : 'p') }] };
+    }));
+  }
 
-    // Auto-update the capture stats every 3s while any capture is running, so
-    // packet counts update live without a refresh button. The timer is torn
-    // down when the panel is repainted (a fresh paint starts a new one) or when
-    // no capture is active, and pauses during writes.
-    if (s._captureStatsTimer) { clearInterval(s._captureStatsTimer); s._captureStatsTimer = null; }
-    // Capture status is walked from the switch each time, so poll gently - a
-    // packet capture's state does not change second-to-second, and a 3s loop was
-    // a constant SNMP drain whenever the capture panel sat open with an active
-    // capture. 15s is responsive enough for status while far lighter.
-    s._captureStatsTimer = setInterval(() => {
-      // Stop if this panel is gone from the DOM.
-      if (!document.body.contains(existing)) { clearInterval(s._captureStatsTimer); s._captureStatsTimer = null; return; }
-      if (s._anyCaptureActive && !s.writeBusy) loadCaptureList();
-    }, 15000);
-    readStatus();
+  // New or existing capture settings in the standard pop-out (A5): one tap to
+  // apply (B8), the failure as a red line under the button, Esc closes.
+  function openCaptureForm(s, name) {
+    const caps = (s._capture && s._capture.data && s._capture.data.captures) || [];
+    const cap = name ? caps.find((c) => c.name === name) : null;
+    if (name && !cap) return;
+    openTabbedPopout(s, cap ? 'Capture \u00b7 ' + cap.name : 'New packet capture', [{ label: 'Settings', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const sec = formSection('Capture');
+      sec.body.classList.add('acl-stack');
+      const nameIn = textInput(cap ? cap.name : (s.captureName || 'capture1')); nameIn.maxLength = 32;
+      if (cap) nameIn.disabled = true;
+      sec.body.appendChild(field('Capture name', nameIn));
+      const dirSel = selectInput(['both', 'in', 'out'].map((v) => ({ label: v, value: v })), 'both');
+      sec.body.appendChild(field('Control-plane direction', dirSel));
+      const bufSel = selectInput(['linear', 'circular'].map((v) => ({ label: v, value: v })), (cap && cap.bufferTypeText) || 'linear');
+      sec.body.appendChild(field('Buffer type', bufSel));
+      const num = (v, ph) => { const i = el('input'); i.type = 'number'; i.min = '0'; i.placeholder = ph; if (Number(v) > 0) i.value = String(v); return i; };
+      const sizeIn = num(cap && cap.bufferSize, 'MB (optional)');
+      sec.body.appendChild(field('Buffer size (MB)', sizeIn));
+      const filterSel = selectInput([{ label: 'match any', value: 'any' }, { label: 'match ACL', value: 'acl' }], cap && cap.filterText === 'acl' ? 'acl' : 'any');
+      sec.body.appendChild(field('Filter', filterSel));
+      const aclIn = textInput(cap && cap.filterText === 'acl' ? (cap.aclName || '') : '', 'ACL name'); aclIn.maxLength = 32;
+      const aclField = field('ACL name', aclIn);
+      sec.body.appendChild(aclField);
+      const syncFilter = () => { aclField.style.display = filterSel.value === 'acl' ? '' : 'none'; };
+      filterSel.addEventListener('change', syncFilter); syncFilter();
+      const durIn = num(cap && cap.limitDuration, 'seconds (0 = none)');
+      sec.body.appendChild(field('Limit: duration', durIn));
+      const pktIn = num(cap && cap.limitPackets, 'packets (0 = none)');
+      sec.body.appendChild(field('Limit: packets', pktIn));
+      form.appendChild(sec.sec);
+
+      const { actions, apply, msg } = applyActions(cap ? 'Save' : 'Create capture');
+      apply.addEventListener('click', (ev) => {
+        clear(msg);
+        const nm = (nameIn.value || '').trim();
+        if (!nm) { msg.appendChild(el('div', 'sw-err', 'Enter a capture name.')); return; }
+        if (!cap && caps.some((c) => c.name === nm)) { msg.appendChild(el('div', 'sw-err', 'A capture named \u201c' + nm + '\u201d already exists.')); return; }
+        if (filterSel.value === 'acl' && !(aclIn.value || '').trim()) { msg.appendChild(el('div', 'sw-err', 'Enter the ACL name to match.')); return; }
+        s.captureName = nm;
+        runButtonAction(ev.currentTarget, {
+          failLabel: cap ? 'Save capture' : 'Create capture', spinLabel: cap ? 'Saving\u2026' : 'Creating\u2026',
+          run: () => captureWrite(s, '/api/opc/configure', {
+            name: nm, direction: dirSel.value, bufferType: bufSel.value, bufferSizeMb: parseInt(sizeIn.value, 10),
+            filter: filterSel.value, aclName: (aclIn.value || '').trim(),
+            limitDurationSec: parseInt(durIn.value, 10), limitPackets: parseInt(pktIn.value, 10), existing: !!cap }),
+          ok: (r) => r && r.ok,
+          error: (r) => { const e = (r && r.error) || 'unknown error'; msg.appendChild(el('div', 'sw-err', (cap ? 'Save' : 'Create') + ' failed: ' + e)); return e; },
+          settle: () => captureLoad(s).then(() => close())
+        });
+      });
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+      if (!cap) nameIn.focus();
+    } }], []);
   }
 
   // =================================================================

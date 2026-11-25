@@ -1154,12 +1154,16 @@
     summary: ['vlans', 'interfaces', 'sviAddrs', 'scalars', 'poe'],
     auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs', 'radiusServers', 'radiusStats', 'tacacsServers'],
     connected: ['macTable', 'interfaces', 'bridgePorts', 'dot1xHosts'],
-    stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts'],
+    stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts', 'mstpInstances',
+          'pvstPorts', 'pvstVlans', 'pvstInconsistencies', 'stpxInconsistencies'],
     routing: ['sviAddrs', 'interfaces', 'vlans', 'portL2L3', 'routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],
     acl: ['aclNames', 'aclAces', 'aclTuples'],
-    // SNMP configuration has its own loader (17-snmp-config.js); no health
-    // table feeds it, so a table refresh never repaints it.
-    snmpcfg: []
+    // SNMP configuration, Flash files and Packet capture have their own
+    // loaders (17-snmp-config.js, 16-flash-capture.js); no health table feeds
+    // them, so a table refresh never repaints them.
+    snmpcfg: [],
+    flash: [],
+    capture: []
   };
   function panelDependsOn(key, changedTables) {
     const deps = PANEL_TABLE_DEPS[key];
@@ -1193,35 +1197,6 @@
         try { rec.run(s); } catch (e) { /* a view error must not break the refresh */ }
       }
     }
-  }
-
-  // ---- Self-managed module refresh (standard B1 family (c), B5) ----
-  // The keyed-panel modules refresh through refreshTables, which preserves scroll
-  // for them. The self-managed config modules (capture, flash) own
-  // their own fetch + DOM rebuild, so each one used to hand-roll the same
-  // "capture scroll, clear, rebuild, restore scroll" dance - and each was a place
-  // the scroll-preservation fix had to be applied separately. These two helpers
-  // own that dance once:
-  //
-  //   selfManagedRender(s, renderFn)  - runs renderFn (which clears and rebuilds a
-  //     container) with scroll captured before and restored after, so a rebuild
-  //     never jumps the page. Use this to wrap the body of any render function
-  //     that does clear()+rebuild in a self-managed module.
-  //
-  //   selfManagedReload(s, loaderFn)  - awaits loaderFn (the module's async
-  //     fetch+render) and returns a promise, so a write's runButtonAction settle
-  //     can wait for the reload to finish before showing Done (spinner holds until
-  //     the UI reflects the change, exactly like refreshTables does for keyed
-  //     panels). loaderFn is expected to preserve its own scroll via
-  //     selfManagedRender at its render step.
-  function selfManagedRender(s, renderFn) {
-    const restore = scrollKeeper(s);
-    try { renderFn(); } finally { restore(); }
-  }
-  function selfManagedReload(s, loaderFn) {
-    if (typeof loaderFn !== 'function') return Promise.resolve();
-    try { return Promise.resolve(loaderFn()).catch(() => {}); }
-    catch (e) { return Promise.resolve(); }
   }
 
   function refreshTables(s, tables) {
@@ -1440,14 +1415,12 @@
     // Syslog comes from the receiver in this app, not from the switch.
     if (p.key === 'events') { loadEvents(s, p); return; }
     if (p.key === 'auth') { loadSessions(s); }
-    // Interactive, write-driven panels don't come from the health poll; a
-    // refresh just re-paints them rather than walking the whole switch.
-    if (p.key === 'capture' || p.key === 'flash') { if (p._body) paintPanelBody(s, p); return; }
-    // SNMP configuration re-runs its own loader (a server-computed view, not
-    // health tables) and reconciles in place.
-    if (p.key === 'snmpcfg') {
+    // SNMP configuration, Flash files and Packet capture re-run their own
+    // loaders (server endpoints, not health tables) and reconcile in place.
+    const ownLoader = { snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad }[p.key];
+    if (ownLoader) {
       if (btn) { btn.disabled = true; btn.classList.add('spin'); }
-      snmpLoad(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });
+      ownLoader(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });
       return;
     }
 

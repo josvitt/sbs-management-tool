@@ -1178,13 +1178,6 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
 /* Space out action buttons in table action cells (flash files, captures). */
 .port-actions .btn + .btn { margin-left: 6px; }
 
-/* Newly added flash file — green outline that fades after a few seconds. */
-.data-table tr.flash-new td {
-  background: rgba(72, 187, 120, 0.14);
-  box-shadow: inset 0 0 0 1px var(--green, #48bb78);
-  transition: background 0.8s ease, box-shadow 0.8s ease;
-}
-
 /* Event source checkboxes in the Events tools bar. */
 .event-sources { display: inline-flex; align-items: center; gap: 12px; margin-right: 6px; }
 .event-sources .check-label { font-size: 12px; white-space: nowrap; }

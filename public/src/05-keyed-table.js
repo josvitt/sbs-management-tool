@@ -328,10 +328,8 @@
     return cellArrays.map((cells, i) => ({ key: String(keyFn(dataRows[i], i)), cells: cells }));
   }
 
-  // A one-shot keyed table for panels that manage their OWN container and
-  // rebuild it wholesale on their own refresh (SNMP config, ACL) - they don't
-  // participate in the panel reconcile system, so they just need the standard
-  // table markup. Rows are plain cell-arrays (cells may be values or DOM nodes,
+  // A one-shot keyed table outside the panels (the config history list): it is
+  // built once and never reconciled, so it just needs the standard markup. Rows are plain cell-arrays (cells may be values or DOM nodes,
   // the legacy snmpTable style). onRowClick(i, tr) is supported for edit rows.
   // Returns the node; keeps _tbody/_colspan/_rowByKey for editor anchoring.
   function plainTable(s, cols, rows, onRowClick) {
