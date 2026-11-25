@@ -1289,6 +1289,8 @@ tr.aaa-editing > td { background: var(--panel-2); vertical-align: middle; }
    Unified "+ Add ..." button — bottom-left, below the table it adds to.
    ============================================================ */
 .tbl-add { margin: 8px 0 14px; }
+/* A list-level action beside an add control (the ACL panel's Delete ACL). */
+.acl-list-acts { margin-left: 10px; }
 /* Compact inline-control row: a small amber-muted label beside a narrow input or
    select, for scalar config rows (e.g. Voice VLAN mode/VLAN/CoS). Reusable. */
 .sw-mini-label { font-size: 10px; color: var(--muted); letter-spacing: 0.04em; margin: 0 4px 0 10px; }

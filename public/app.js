@@ -9310,11 +9310,15 @@
     for (const r of (h.aclNames || [])) {
       if (!/QosAclName$/.test(r.column || '')) continue;
       const idx = String(r.index);
-      byIdx.set(idx, { idx, name: String(dvc(r)), type: null, aces: new Map() });
+      byIdx.set(idx, { idx, name: String(dvc(r)), type: null, bound: false, origin: null, aces: new Map() });
     }
     for (const r of (h.aclNames || [])) {
       const acl = byIdx.get(String(r.index));
-      if (acl && /QosAclType$/.test(r.column || '')) acl.type = parseInt(aclNum(r), 10);
+      if (!acl) continue;
+      const col = r.column || '';
+      if (/QosAclType$/.test(col)) acl.type = parseInt(aclNum(r), 10);
+      else if (/QosAclIsBoundToInterface$/.test(col)) acl.bound = parseInt(aclNum(r), 10) === 1;   // TruthValue true(1)
+      else if (/QosAclOriginType$/.test(col)) acl.origin = parseInt(aclNum(r), 10);              // static 1 / dynamic 2 / system 3
     }
     for (const r of (h.aclAces || [])) {
       const parts = String(r.index).split('.');
@@ -9341,17 +9345,27 @@
     const extra = [];
     const init = { action: ace.action, proto: 'ip', src: { any: true }, dst: { any: true } };
     if (ace.type === 2) init.proto = 'tcp'; else if (ace.type === 3) init.proto = 'udp';
+    // The rule form handles: action permit/deny (+log), IP/TCP/UDP, source and
+    // destination prefixes, and TCP flags. A rule that matches anything else
+    // (ports, ICMP, IPv6, a protocol on a plain-IP rule...) would lose that
+    // match if re-saved from the form, so it is shown but not edited here.
+    const unsupported = [];
+    if (!(ace.type === 1 || ace.type === 2 || ace.type === 3)) unsupported.push(ACE_TYPE[ace.type] || ('type ' + ace.type));
+    if ([1, 2, 4, 5].indexOf(ace.action) === -1) unsupported.push(action);
     for (const tp of ace.tuples) {
       const t = tupleMap.get(tp);
       const dec = decodeTuple(t);
-      if (!dec) continue;
+      if (!dec) { unsupported.push('tuple ' + tp); continue; }
       if (dec.field === 'src') { src = dec.text; init.src = parseCidr(dec.text); }
       else if (dec.field === 'dst') { dst = dec.text; init.dst = parseCidr(dec.text); }
-      else if (dec.field === 'proto') proto = dec.text;
-      else if (dec.field === 'flags') { extra.push(dec.text); init.flags = parseFlagsTuple(t); }
-      else extra.push(dec.text);
+      else if (dec.field === 'proto') {
+        proto = dec.text;
+        if (!((ace.type === 2 && proto === 'tcp') || (ace.type === 3 && proto === 'udp'))) unsupported.push(dec.text);
+      }
+      else if (dec.field === 'flags') { extra.push(dec.text); init.flags = parseFlagsTuple(t); if (ace.type !== 2) unsupported.push(dec.text); }
+      else { extra.push(dec.text); unsupported.push(dec.text); }
     }
-    return { action, isPermit: /permit/.test(action), proto, src, dst, extra, init };
+    return { action, isPermit: /permit/.test(action), proto, src, dst, extra, init, unsupported };
   }
 
   // The panel (standard B2): scaffolding on a full paint only, keyed tables
@@ -9385,13 +9399,22 @@
     section('Access lists', model.acls.length ? model.acls.length + ' list(s)' : '', 'New ACL', () => openAclRuleForm(s, { newAcl: true }));
     if (!model.acls.length) { emptyNote('No access lists configured.'); return; }
 
-    if (!s._ktReconcile) p._aclNotes = {};
+    if (!s._ktReconcile) { p._aclNotes = {}; p._aclDel = {}; }
     const cols = ['#', 'Action', 'Protocol', 'Source', 'Destination', 'Extra', ''];
     for (const acl of model.acls) {
       const noteEl = section('ACL \u00b7 ' + acl.name, '', 'Add rule', () => openAclRuleForm(s, { aclIdx: acl.idx, aclName: acl.name }));
-      if (noteEl) p._aclNotes[acl.idx] = noteEl;
+      if (noteEl) {
+        p._aclNotes[acl.idx] = noteEl;
+        // The list's own Delete sits beside its "+ Add rule": a stable slot,
+        // refreshed in place (B2) because its bound/unbound lock can change.
+        const slot = el('span', 'acl-list-acts');
+        body.lastChild.appendChild(slot);
+        p._aclDel[acl.idx] = { slot, state: null };
+      }
       const note = p._aclNotes && p._aclNotes[acl.idx];
-      if (note) note.textContent = acl.aceList.length + ' rule(s)';
+      if (note) note.textContent = acl.aceList.length + ' rule(s)' + (acl.bound ? ' \u00b7 bound to an interface' : '');
+      const delSlot = p._aclDel && p._aclDel[acl.idx];
+      if (delSlot) paintAclDelete(s, delSlot, acl);
       if (!acl.aceList.length) { emptyNote('No rules.'); continue; }
       const rows = acl.aceList.map((ace) => {
         const v = aclRuleView(ace, model.tupleMap);
@@ -9539,11 +9562,96 @@
     return m;
   }
 
+  // Tuple rows are separate from the ACEs that point at them, so removing an
+  // ACE leaves its tuples behind unless they are removed too. Only tuples that
+  // no remaining ACE points at are removed (a tuple may be shared).
+  function unusedTuples(model, tuples, goneKeys) {
+    const used = new Set();
+    for (const a of model.acls) {
+      for (const ace of a.aceList) {
+        if (goneKeys.has(a.idx + '.' + ace.idx)) continue;
+        for (const t of ace.tuples) used.add(t);
+      }
+    }
+    return Array.from(new Set(tuples)).filter((t) => !used.has(t));
+  }
+  // Best effort: a tuple that will not go is left, and logged. The rule change
+  // itself has already succeeded, so this never fails the action.
+  async function dropTuples(s, tuples) {
+    for (const t of tuples) {
+      let res;
+      try { res = interpretSet(await rowStatusDelete(s, QOS_ACL.tupStatus + '.' + t)); } catch (e) { res = { ok: false, error: e.message }; }
+      if (!res.ok) appLog('warn', 'ACL tuple not removed', { host: s.host, tuple: t, error: res.error });
+    }
+  }
+
   // Delete one ACE with the shared rowStatusDelete (destroy, falling back to
-  // notInService -> destroy). Returns { ok, error } for runButtonAction.
+  // notInService -> destroy), then the tuples only it used. Returns { ok, error }.
   async function deleteQosAce(s, aclIdx, aceIdx) {
-    try { return interpretSet(await rowStatusDelete(s, QOS_ACL.aceStatus + '.' + aclIdx + '.' + aceIdx)); }
+    const model = aclModel(s.health);
+    const acl = model.byIdx.get(String(aclIdx));
+    const ace = acl && acl.aces.get(String(aceIdx));
+    let res;
+    try { res = interpretSet(await rowStatusDelete(s, QOS_ACL.aceStatus + '.' + aclIdx + '.' + aceIdx)); }
     catch (e) { return { ok: false, error: e.message }; }
+    if (res.ok && ace) await dropTuples(s, unusedTuples(model, ace.tuples, new Set([aclIdx + '.' + aceIdx])));
+    return res;
+  }
+
+  // Why a list cannot be deleted from here, or '' when it can.
+  function aclDeleteLock(acl) {
+    if (acl.bound) return 'this list is bound to a port or VLAN. Unbind it on that port\u2019s or VLAN\u2019s ACL tab first, so deleting it cannot change what traffic passes.';
+    if (acl.origin != null && acl.origin !== 1) return 'this list was created by the switch (' + (acl.origin === 2 ? 'dynamic' : 'system') + '), not configured by hand, so it is not deleted from here.';
+    return '';
+  }
+  // Delete a whole access list: its rules first, then the tuples nothing else
+  // uses, then the list itself. A bound or switch-created list is locked in the
+  // panel and refused here too.
+  async function deleteQosAcl(s, aclIdx) {
+    const model = aclModel(s.health);
+    const acl = model.byIdx.get(String(aclIdx));
+    if (!acl) return { ok: false, error: 'the list is no longer on the switch' };
+    const lock = aclDeleteLock(acl);
+    if (lock) return { ok: false, error: lock };
+    const gone = new Set(acl.aceList.map((a) => acl.idx + '.' + a.idx));
+    const tuples = [];
+    for (const ace of acl.aceList) {
+      let res;
+      try { res = interpretSet(await rowStatusDelete(s, QOS_ACL.aceStatus + '.' + acl.idx + '.' + ace.idx)); }
+      catch (e) { res = { ok: false, error: e.message }; }
+      if (!res.ok) return { ok: false, error: 'removing rule ' + ace.idx + ': ' + res.error };
+      tuples.push(...ace.tuples);
+    }
+    await dropTuples(s, unusedTuples(model, tuples, gone));
+    let res;
+    try { res = interpretSet(await rowStatusDelete(s, QOS_ACL.aclStatus + '.' + acl.idx)); }
+    catch (e) { res = { ok: false, error: e.message }; }
+    return res.ok ? res : { ok: false, error: 'removing the list: ' + res.error };
+  }
+  // The list's Delete control: a two-tap Delete, or a lock with its reason.
+  // Rebuilt only when its state changes, so a reconcile does not disarm it.
+  function paintAclDelete(s, slotRec, acl) {
+    const lock = aclDeleteLock(acl);
+    const state = lock ? 'lock:' + lock : 'del';
+    if (slotRec.state === state) return;
+    slotRec.state = state;
+    clear(slotRec.slot);
+    if (lock) {
+      const locked = el('span', 'card-sub', '\uD83D\uDD12 Delete ACL');
+      locked.title = 'Locked: ' + lock;
+      slotRec.slot.appendChild(locked);
+      return;
+    }
+    slotRec.slot.appendChild(actBtnConfirm('Delete ACL', (e) => {
+      runButtonAction(e.currentTarget, {
+        failLabel: 'Delete ACL',
+        run: () => deleteQosAcl(s, acl.idx),
+        ok: (r) => r && r.ok,
+        error: (r) => (r && r.error) || 'the switch rejected it',
+        onApplied: () => markConfigDirty(s),
+        settle: () => aclRefresh(s)
+      });
+    }, 'danger', 'Delete ACL ' + acl.name + ' and all its rules'));
   }
 
   // Build the value||mask octet string for an ip-src/ip-dest tuple from a
@@ -9563,11 +9671,23 @@
   // Create a rule. cfg: { aclName, aclType(2 ip), action, aceType, srcAny, srcIp,
   // srcPref, dstAny, dstIp, dstPref, proto, tcpFlags }. Throws with the failing
   // step on error.
-  async function createQosAce(s, cfg) {
-    const h = s.health || {};
+  // cfg.aclIdx (optional) names the ACL directly; `at` (optional) places the
+  // ACE at that index instead of the next free one (a rule edit keeps its place
+  // in the list). Whatever this call created is removed again if a later step
+  // fails, so a failed add leaves no stray tuples or empty new list behind.
+  async function createQosAce(s, cfg, at) {
+    const made = { tuples: [], acl: null };
+    try { await createQosAceSteps(s, s.health || {}, cfg, at, made); }
+    catch (e) {
+      await dropTuples(s, made.tuples);
+      if (made.acl) { try { await rowStatusDelete(s, QOS_ACL.aclStatus + '.' + made.acl); } catch (x) { /* the error below is the one that matters */ } }
+      throw e;
+    }
+  }
+  async function createQosAceSteps(s, h, cfg, at, made) {
     // 1. Resolve or create the ACL by name.
-    let aclIdx = null;
-    for (const a of aclModel(h).acls) { if (a.name === cfg.aclName) aclIdx = a.idx; }
+    let aclIdx = cfg.aclIdx != null ? String(cfg.aclIdx) : null;
+    if (aclIdx === null) for (const a of aclModel(h).acls) { if (a.name === cfg.aclName) aclIdx = a.idx; }
     if (aclIdx === null) {
       aclIdx = String(maxIndex(h.aclNames) + 1);
       try {
@@ -9577,6 +9697,7 @@
           { oid: QOS_ACL.type + '.' + aclIdx, type: 'Integer', value: cfg.aclType || 2 } // ip
         ]);
       } catch (e) { throw new Error('creating ACL "' + cfg.aclName + '": ' + e.message); }
+      made.acl = aclIdx;
     }
 
     // 2. Create the tuple rows for each requested match field.
@@ -9591,6 +9712,7 @@
           { oid: QOS_ACL.tupVal2 + '.' + tIdx, type: 'OctetString', valueHex }
         ]);
       } catch (e) { throw new Error('creating tuple (type ' + typeVal + '): ' + e.message); }
+      made.tuples.push(tIdx);
       pointers.push(tIdx);
     };
     if (cfg.proto) await addTuple(TUPLE_TYPE_VAL.protocol, protoTupleHex(cfg.proto));
@@ -9606,7 +9728,7 @@
     // 3. Create the ACE under the ACL, pointing at the tuples.
     let maxAce = 0;
     for (const r of (h.aclAces || [])) { const parts = String(r.index).split('.'); if (parts[0] === aclIdx) { const a = parseInt(parts[1], 10); if (a > maxAce) maxAce = a; } }
-    const aceIdx = String(maxAce + 1);
+    const aceIdx = at != null ? String(at) : String(maxAce + 1);
     const suffix = aclIdx + '.' + aceIdx;
     const vbs = [
       { oid: QOS_ACL.aceStatus + '.' + suffix, type: 'Integer', value: 4 },  // createAndGo
@@ -9621,13 +9743,38 @@
 
   // Edit an ACE. The tuple model has no clean in-place "change the match fields"
   // operation (the ACE points at tuple rows; changing the match means different
-  // tuples), so editing is: remove the old ACE, re-read the tables through the
-  // panel's refresh, then create the replacement under the same ACL.
+  // tuples), so editing replaces the ACE row and keeps its index, so the rule
+  // keeps its place in the list:
+  //   1. remove the old ACE row only - its tuples stay, untouched;
+  //   2. create the replacement (new tuples + ACE) at the same index;
+  //   3. if that fails, put the old ACE back at its index, pointing at its
+  //      original tuples, and say so; if it worked, remove the old tuples that
+  //      nothing else uses.
   async function editQosAce(s, aclIdx, aceIdx, cfg) {
-    const del = await deleteQosAce(s, aclIdx, aceIdx);
+    const model = aclModel(s.health);
+    const acl = model.byIdx.get(String(aclIdx));
+    const old = acl && acl.aces.get(String(aceIdx));
+    if (!old) throw new Error('the rule is no longer on the switch');
+    const suffix = acl.idx + '.' + old.idx;
+    let del;
+    try { del = interpretSet(await rowStatusDelete(s, QOS_ACL.aceStatus + '.' + suffix)); }
+    catch (e) { del = { ok: false, error: e.message }; }
     if (!del.ok) throw new Error('removing the old rule: ' + del.error);
-    await aclRefresh(s);   // so createQosAce picks free indices after the delete
-    await createQosAce(s, cfg);
+    try {
+      await createQosAce(s, Object.assign({}, cfg, { aclIdx: acl.idx }), old.idx);
+    } catch (e) {
+      const vbs = [
+        { oid: QOS_ACL.aceStatus + '.' + suffix, type: 'Integer', value: 4 },   // createAndGo
+        { oid: QOS_ACL.aceAction + '.' + suffix, type: 'Integer', value: old.action },
+        { oid: QOS_ACL.aceType + '.' + suffix, type: 'Integer', value: old.type }
+      ];
+      old.tuples.forEach((t, i) => { if (i < ACE_TUPLE_COLS.length) vbs.push({ oid: QOS_ACL.aceTupleBase + ACE_TUPLE_COLS[i] + '.' + suffix, type: 'Integer', value: parseInt(t, 10) }); });
+      let back;
+      try { await snmpSet(s, vbs); back = ' The original rule was put back.'; }
+      catch (x) { back = ' The original rule could not be put back (' + x.message + '); add it again.'; }
+      throw new Error(e.message + '.' + back);
+    }
+    await dropTuples(s, unusedTuples(model, old.tuples, new Set([suffix])));
   }
   // An address group: "Any" toggle + IP + prefix, wired so the inputs enable
   // only when "Any" is off. init: { any, ip, pref }.
@@ -9672,7 +9819,15 @@
     const acl = model.byIdx.get(String(aclIdx));
     const ace = acl && acl.aces.get(String(aceIdx));
     if (!acl || !ace) return;
-    openAclRuleForm(s, { edit: { aclIdx: acl.idx, aceIdx: ace.idx, aclName: acl.name, init: aclRuleView(ace, model.tupleMap).init } });
+    const view = aclRuleView(ace, model.tupleMap);
+    if (view.unsupported.length) {
+      openTabbedPopout(s, 'ACL \u00b7 ' + acl.name + ' \u00b7 rule ' + ace.idx, [{ label: 'Rule', fill: (pane) => {
+        pane.appendChild(el('div', 'card-sub', view.action + ' ' + view.proto + ' from ' + view.src + ' to ' + view.dst + (view.extra.length ? ' (' + view.extra.join(', ') + ')' : '')));
+        pane.appendChild(el('div', 'card-sub', 'This rule also matches ' + view.unsupported.join(', ') + ', which this editor does not handle, so saving it here would drop that part of the match. Change it in the switch\u2019s web interface or CLI, or delete it and add it again.'));
+      } }], []);
+      return;
+    }
+    openAclRuleForm(s, { edit: { aclIdx: acl.idx, aceIdx: ace.idx, aclName: acl.name, init: view.init } });
   }
 
   function aclRuleForm(s, pane, close, opts) {
