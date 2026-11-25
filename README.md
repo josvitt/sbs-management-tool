@@ -30,8 +30,11 @@ anyone logs in — install it as a background service instead:
   `http://localhost:3000`) and add your switches there — the service stores them
   encrypted and keeps collecting across reboots. Remove it with
   **`uninstall-service.bat`**.
+  The service runs as Windows' built-in **LocalService** account, which can
+  write only to the app's folder, rather than LocalSystem.
 - **Linux:** use the included `sbs-management-tool.service` systemd unit (see the
-  comments at the top of that file).
+  comments at the top of that file). It runs as its own `sbs` account with
+  only the right to bind the receivers' ports.
 
 The server does the health collection, alerting, and trap/syslog capture itself,
 so the browser is only a viewer — closing it never stops collection. See

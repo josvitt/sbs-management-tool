@@ -1,18 +1,27 @@
 # systemd unit for SBS Management Tool (Linux equivalent of the Windows service).
 #
+# It runs as its own unprivileged account, "sbs", which can write only to the
+# app directory, and is given just one extra right: binding the privileged
+# UDP ports the receivers use (TFTP 69, traps 162, syslog 514).
+#
 # Install:
 #   1. Put the app somewhere stable, e.g. /opt/sbs-management-tool, and run
 #      `npm install` in it once.
-#   2. Edit WorkingDirectory and ExecStart below if your path or node differ
-#      (run `which node` to find node).
-#   3. sudo cp sbs-management-tool.service /etc/systemd/system/
+#   2. Create the account and give it the app directory:
+#        sudo useradd --system --home-dir /opt/sbs-management-tool --shell /usr/sbin/nologin sbs
+#        sudo chown -R sbs:sbs /opt/sbs-management-tool
+#      (Upgrading an install that ran as root? The same chown hands the
+#      existing vault key, state.enc, logs and history to the new account.)
+#   3. Edit WorkingDirectory, ExecStart and ReadWritePaths below if your path
+#      or node differ (run `which node` to find node).
+#   4. sudo cp sbs-management-tool.service /etc/systemd/system/
 #      sudo systemctl daemon-reload
 #      sudo systemctl enable --now sbs-management-tool
-#   4. Open http://localhost:3000 and add your switches there.
+#   5. Open http://localhost:3000 on this machine and add your switches there.
 #
 # Like the Windows service, this runs headless, starts on boot, restarts on
 # failure, and keeps collecting with no browser open. The vault key and state
-# live in the app directory and survive reboots (SERVER-STANDARD §7).
+# live in the app directory and survive reboots (SERVER-STANDARD §7, §9).
 
 [Unit]
 Description=SBS Management Tool (Cisco Catalyst 1200/1300 management over SNMP/SSH/serial)
@@ -21,26 +30,43 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=sbs
+Group=sbs
+# The serial console (USB-serial adapters) belongs to the dialout group.
+SupplementaryGroups=dialout
 WorkingDirectory=/opt/sbs-management-tool
 ExecStart=/usr/bin/node /opt/sbs-management-tool/server.js
 Restart=on-failure
 RestartSec=3
 Environment=PORT=3000
 
-# The SNMP trap (162), syslog (514) and TFTP (69) receivers bind privileged
-# UDP ports. Pick ONE of these approaches:
-#
-#  (a) Run as root - simplest, broadest privilege (default if no User= is set).
-#
-#  (b) Run as a dedicated unprivileged user and grant just the bind capability:
-#        User=sbs
-#        AmbientCapabilities=CAP_NET_BIND_SERVICE
-#
-#  (c) Avoid privileged ports entirely by moving the receivers high (the switch
-#      must then be told to send traps/syslog to these ports):
-#        Environment=TRAP_PORT=1162
-#        Environment=SYSLOG_PORT=1514
-#        Environment=TFTP_PORT=6969
+# The one privilege it needs beyond an ordinary user: binding UDP 69, 162 and
+# 514. Nothing else is granted, and nothing it starts can gain more.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# Read-only view of the system; it writes only to its own directory (vault
+# key, state.enc, logs/, config-history/, known-hosts.json, history.json,
+# layouts.json all live there).
+ProtectSystem=strict
+ReadWritePaths=/opt/sbs-management-tool
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+
+# Rather not bind privileged ports at all? Delete the two capability lines
+# above and move the receivers high (each switch must then be told to send
+# traps/syslog to these ports, and TFTP config pulls need port 69 or the
+# switch's own override):
+#   Environment=TRAP_PORT=1162
+#   Environment=SYSLOG_PORT=1514
+#   Environment=TFTP_PORT=6969
 
 [Install]
 WantedBy=multi-user.target

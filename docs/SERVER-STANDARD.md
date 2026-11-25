@@ -296,10 +296,16 @@ app installs as a service.
 
 **Windows** (`install-service.bat` → `service-install.js`, via `node-windows`):
 
-- Runs `server.js` headless under **LocalSystem**, auto-starts on boot, and
-  restarts on failure. LocalSystem can bind the privileged UDP ports the
-  receivers use (traps 162, syslog 514, TFTP 69) and 3000 — the same privilege
-  the interactive run had.
+- Runs `server.js` headless under **LocalService**, auto-starts on boot, and
+  restarts on failure. Windows has no privileged ports, so LocalService binds
+  the receivers' UDP ports (traps 162, syslog 514, TFTP 69) and 3000 like any
+  account; what it lacks is LocalSystem's control of the whole machine.
+  `service-install.js` grants LocalService modify rights on the install
+  folder (`icacls`, by SID `*S-1-5-19`, so existing vault/state/log files are
+  covered) and then moves the service to it with `sc.exe config` (node-windows
+  always creates LocalSystem services). If either step fails it says so and
+  the service stays LocalSystem; `SBS_SERVICE_ACCOUNT=LocalSystem` chooses
+  that on purpose. **Not yet run on a real Windows install.**
 - `node-windows` is installed **on demand** by `install-service.bat`, not
   carried in `package.json`, so a normal interactive install (`start.bat`) stays
   lean. It is needed only to create/remove the service; the running service does
@@ -309,12 +315,17 @@ app installs as a service.
   dashboard (the service has no window of its own).
 
 **Linux**: `sbs-management-tool.service` (systemd) is the equivalent — headless,
-boot-start, restart-on-failure, with documented options for the privileged
-receiver ports (root, `CAP_NET_BIND_SERVICE`, or high ports).
+boot-start, restart-on-failure — running as a dedicated `sbs` system account
+with only `CAP_NET_BIND_SERVICE` (ambient and bounding set), `NoNewPrivileges`,
+`ProtectSystem=strict` with the app directory as its one writable path, and
+`dialout` for USB-serial consoles. Checked: as `sbs` with only that
+capability, the receivers bind UDP 69/162/514 and the vault writes its 0600
+files; without it, binding 69 fails with EACCES. The unit's comments give the
+`useradd`/`chown` steps, and the high-port alternative.
 
 **Credentials workflow (important).** Credentials are entered through the **web
 UI against the running service**, never by editing files. The service process
-(LocalSystem on Windows) then owns the vault key and `state.enc` in the install
+(LocalService on Windows, `sbs` on Linux) then owns the vault key and `state.enc` in the install
 directory, so there is no file-ownership split between an interactive user run
 and the service. Combined with on-disk key mode (§7), this is what lets
 collection start automatically after a reboot with no human present. Pick one
