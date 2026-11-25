@@ -1,0 +1,200 @@
+# Switch Notes — How Catalyst 1200/1300 behaves, and what the code does about it
+
+These are facts about the switches (SNMP agent, MIBs, CLI) that the code relies
+on. Most were found on a real switch rather than a mock. Each one names the
+file that handles it, so you can check it before you change that code.
+
+How the server and the panels are built is in `SERVER-STANDARD.md` and
+`MODULE-STANDARD.md`. This document covers only switch behaviour.
+
+## SNMP walks
+
+- **Walks are bounded in our own code** (`boundedWalk`, `snmp-core.js`).
+  net-snmp's own walk asks GETBULK for 20 repetitions. At the end of a subtree
+  the agent keeps producing successors past it, into unrelated objects, and
+  Catalyst firmware can then log
+  `%SNMP-D-MAXOIDSINKEYREACHED: too many oids in key for variable NN`.
+  `boundedWalk` uses 10 repetitions, discards anything outside the base OID
+  and stops there. It also caps rows and OID depth, and stops an agent that
+  does not advance. Several columns can share one GETBULK stream, with the
+  boundary and caps applied to each column (`SERVER-STANDARD.md` §1a). `mode: 'next'` (on `/api/snmp/walk`) walks one GETNEXT at
+  a time, which never reads past the boundary.
+- **A walk returns a table column by column.** So a row cap cuts off whole
+  columns, not the last rows. This is why the spanning-tree per-port state is
+  fetched by exact instance and never walked (below).
+- **Counter64 arrives as a raw big-endian buffer** from net-snmp. It is always
+  decoded as a number. A "printable text" check would turn some counters
+  into strings like `2xY`.
+
+## Interfaces and VLANs
+
+- **Use `rlifPresentTable`, not `ifTable`.** Since firmware 4.1.9.85 it lists
+  only interfaces that are physically present. `ifTable` also lists stack
+  slots with no unit fitted. Interfaces reporting `notPresent(6)` are dropped
+  wherever they come from.
+- **A VLAN interface is listed among the ports,** named after its VLAN id.
+  It is folded into that VLAN's row rather than shown as a port.
+- **VLAN membership comes from `dot1qVlanCurrentTable`** (the operational
+  view). The static table is read only for names: switches fill Current even
+  when Static is sparse. Membership is a `PortList` bitmap per VLAN. It is
+  inverted into per-port Untagged and Tagged columns, and tagged is worked
+  out as egress minus untagged, which is what `show vlan` prints.
+- **Different tables use different indexes.** CDP is indexed by ifIndex,
+  LLDP by `timeMark.localPort.index`, and the forwarding database by
+  `vlan.mac` with a *bridge port* number. All are resolved to interface
+  names. A MAC in an index is read from its last six sub-identifiers, so it
+  works whether or not the agent puts a length prefix first.
+- **C1300X firmware may not fill the vendor per-port counters** its MIB
+  defines. The reader tries the vendor columns first and falls back to the
+  standard `ifXTable`/`ifTable` ones (`SERVER-STANDARD.md` §10).
+
+## Spanning tree (`health.js`)
+
+- **`dot1dStpVersion` can't be trusted on its own.** Firmware reports `rstp`
+  while actually running Rapid-PVST, and some builds don't implement the
+  object at all. So the small per-instance tables (`rlBrgPvstOperVlanTable`,
+  `rldot1sMstpInstanceTable`) are always walked. If they are populated, that
+  mode is in use, whatever the scalar says. The scalar only breaks ties and
+  names plain STP/RSTP. When the two disagree, the panel says so.
+- **Under Rapid-PVST, `dot1dStpPortTable` shows every port disabled.** It is
+  shown only when the switch runs plain STP or RSTP.
+- **Per-port state is fetched by exact instance in batched GETs, not walked.**
+  It is indexed by instance and bridge port. On one real switch that was
+  980 varbinds instead of 33,920. The fetch is capped at 1,200 instances, and
+  anything beyond that is reported as missing.
+- **Ghost ports.** A C1300 answers for every bridge port in its ifIndex space,
+  about 424 of them with roughly 50 real interfaces. Since v1.5.0, per-port
+  tables everywhere are read only for interfaces that exist, for the same
+  reason. Rows are kept only for
+  interfaces in `rlifPresentTable` that have a state or role.
+- **A port's role alone is not enough.** Disabled ports, and slots that don't
+  exist, can still report "designated". Whether a port is participating is
+  decided by its state.
+- **The two families of timers use different units.** BRIDGE-MIB timers are
+  in hundredths of a second (`Timeout`). The vendor per-VLAN and per-instance
+  timers are in whole seconds.
+- **Bridge IDs** are a 2-byte priority followed by the MAC. The low 12 bits of
+  the priority carry the VLAN or instance (`32769 = 32768 + 1`). To match a
+  root bridge to a neighbour's chassis id, compare only the last 6 bytes.
+
+## Fetching configuration (`config-fetch.js`, `tftp.js`)
+
+- **No MIB object returns the config as text.** The app creates an
+  `rlCopyTable` row that makes the switch upload the file to the app's
+  built-in TFTP server. This needs SNMP write access.
+- **Row creation differs by firmware.** Three RowStatus forms are tried in
+  order: single-PDU `createAndGo`, then `createAndGo` and populate, then
+  `createAndWait`, populate and `active`. The syslog collector write uses the
+  same forms.
+- **The address the switch uploads to is worked out per request** from the
+  route to that switch (`localAddressFor`). A fixed address is wrong on a PC
+  with more than one network.
+- **The switch always uses UDP 69.** `TFTP_PORT` moves the receiver, but the
+  switch can't be told to use another port. TFTP is cleartext and has no
+  authentication, and a config contains secrets. So a received file is only
+  written to disk encrypted, as a config-history version. File names can't
+  be guessed, and the size and number of uploads are capped.
+- **Diffs read from the saved config outwards.** `+` means running but not
+  saved, which a reload would lose. A change inside an indented block prints
+  the whole block, so you can see which interface it belongs to. The
+  longest-common-subsequence diff trims the common start and end first. On a
+  16,000-line pair that took it from 4.6 s to 5 ms.
+
+## Syslog collector setup (`syslog-config.js`)
+
+- **The firmware has three collector tables:** `snmpSyslogCollectorTable`
+  (IETF draft), `rlsnmpSyslogCollectorTable` and
+  `rlRegisteredLogsSyslogCollectorTable`. Which ones a build implements
+  varies. All three are read, and a write is tried against each in turn. If
+  you read only one, a switch that uses another looks unconfigured and then
+  refuses the write.
+- **The UDP port column is `Unsigned32`, not `INTEGER`.** Sending INTEGER
+  gets `WrongType` on that one OID, which looks like a permissions problem.
+  If a build refuses Unsigned32, the write is retried with INTEGER.
+- **A new row takes the lowest free index** (1 to 8) in that table, so an
+  existing row is never overwritten.
+
+## Traps (`traps.js`)
+
+- **Traps decide *when* to poll. They never replace polling.** Traps are UDP
+  with no retransmission, and they arrive only if the switch was set up to
+  send them, so a count kept from traps drifts. A trap triggers a re-read
+  instead. Refreshes are combined and kept at least 10 seconds apart, so a
+  flapping link can't cause a collection per flap.
+
+## SNMPv3 (`snmp-crypto.js`)
+
+- **net-snmp has no AES-192.** `snmp-crypto.js` adds it to the library's
+  algorithm table at startup, and fails loudly if a library update changes
+  those internals.
+- **AES-192 and AES-256 need a longer key than SHA-1 produces, and there are
+  two ways to extend it.** Reeder (used by Cisco) and Blumenthal (used by
+  other vendors) don't work with each other. A mismatch looks exactly like a
+  wrong password. Plain **AES-192/256** use Reeder. The Blumenthal versions
+  are offered as separate choices.
+- **DES is hidden on Node builds whose OpenSSL 3 has dropped it.** Otherwise
+  it fails mid-request with "digital envelope routines::unsupported".
+  `/api/snmp/v3-options` serves the list the server can actually use.
+- **The security level comes from the auth and privacy choices**
+  (`v3SecurityOf`). Privacy without authentication is refused.
+
+## CLI and console (`routes/terminal.js`, `serial.js`, `public/tech-parse.js`)
+
+- **Capturing `show tech-support`.** Paging is turned off first with
+  `terminal datadump`, so the capture doesn't stop at a `More:` prompt. The
+  output itself contains prompts, so the capture ends when the prompt
+  reappears *after* the output goes quiet. If it goes quiet with no prompt,
+  it returns what it has and says why.
+- **Parsing a capture.** A table's dashed rule looks like a section banner,
+  so a section name must contain a letter. `show vlan` and
+  `show cdp neighbors` wrap long rows onto lines with an empty first column.
+  Those lines are joined back to the row above.
+- **Backspace on a console.** A terminal sends DEL (0x7f). A raw console line
+  erases on BS (0x08), and Cisco accepts both, so DEL is translated to BS.
+- **Close sessions like a person would.** Send `exit` so the switch logs a
+  clean logout. Dropping the socket leaves the VTY line held until the
+  switch's own timeout.
+- **`serialport` is optional.** Without its prebuilt binaries the console
+  feature is turned off and says why, and the rest of the app still runs.
+  Listing ports on Linux needs `udevadm`.
+- **Legacy SSH algorithms** are kept as fallbacks after the modern ones
+  (`LEGACY_ALGORITHMS`), because some small-business firmware supports only
+  older ones.
+- **Writing config by driving the CLI is unreliable.** A console may be
+  sitting at `User Name:`, not a prompt. Some devices treat CRLF as two key
+  presses. The app reads switches over SNMP and leaves typing config to a
+  person watching the output.
+
+## Port actions (`routes/ports.js`)
+
+- **A PoE bounce makes the config "unsaved".** The bounce is two writes to
+  the port's admin state, so the switch marks its config changed even though
+  the port ends as it started. `rlPethPsePortReactivate` only recovers ports
+  shut down by a hardware fault. So if the config was saved before the
+  bounce, the app saves it again afterwards. If it was already unsaved, the
+  app leaves it alone.
+
+## MIB databases
+
+`public/mib/oid-db.json` (C1200/C1300) and `oid-db-c1300x.json` (C1300X) are
+generated from the official MIB archives. `public/mib/products.json` chooses
+which file each product line uses. Both the browser and the server load the
+same files. To regenerate one for a new firmware:
+
+```bash
+# 1. Parse a MIB set into a name -> OID map
+python3 tools-parse-mibs.py path/to/MIBs_Cat1200_1300_x.y.z          # -> oid-map.json
+# 2. Compact it into the database the app loads
+python3 tools-compact-oiddb.py oid-map.json "C1300_MIBs_vX" public/mib/oid-db.json
+```
+
+The parser handles two traps in the MIB files:
+
+- Inside a `SEQUENCE`, a column can be declared as `foo OBJECT IDENTIFIER,`.
+  That looks like an assignment and used to swallow the next definition. A
+  bare OID assignment must therefore have `::=` straight after `IDENTIFIER`.
+- `DESCRIPTION` text sometimes contains an example assignment (rfc2668's
+  `ifMauType`). String literals are blanked before assignments are matched.
+
+The MIB says what the *files* define, not what a switch implements. An
+unimplemented object comes back as `noSuchObject` or `noSuchInstance`.
