@@ -9362,7 +9362,7 @@
     if (!s.target) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Add SNMP credentials for this switch first.')); return; }
     if (!s._ktReconcile) ensureAclLoaded(s);
     if (!aclLoaded(s)) {
-      if (!s._ktReconcile) { body.appendChild(el('div', 'card-sub', 'Waiting for data…')); p._aclWaiting = true; }
+      if (!s._ktReconcile) { body.appendChild(el('div', 'card-sub', 'Waiting for data\u2026')); p._aclWaiting = true; }
       return;
     }
     // The first load arrived while "Waiting for data" was showing: that is a
@@ -9388,7 +9388,7 @@
     if (!s._ktReconcile) p._aclNotes = {};
     const cols = ['#', 'Action', 'Protocol', 'Source', 'Destination', 'Extra', ''];
     for (const acl of model.acls) {
-      const noteEl = section('ACL · ' + acl.name, '', 'Add rule', () => openAclRuleForm(s, { aclIdx: acl.idx, aclName: acl.name }));
+      const noteEl = section('ACL \u00b7 ' + acl.name, '', 'Add rule', () => openAclRuleForm(s, { aclIdx: acl.idx, aclName: acl.name }));
       if (noteEl) p._aclNotes[acl.idx] = noteEl;
       const note = p._aclNotes && p._aclNotes[acl.idx];
       if (note) note.textContent = acl.aceList.length + ' rule(s)';
@@ -9408,7 +9408,7 @@
         return { key: 'ace:' + acl.idx + '.' + ace.idx, cells: [
           { v: ace.idx, click: { open: () => openAclRuleEditor(s, acl.idx, ace.idx) } },
           { cellNode: el('span', 'pill ' + (v.isPermit ? 'good' : 'warn'), v.action), sig: 'a:' + v.action },
-          { v: v.proto }, { v: v.src }, { v: v.dst }, { v: v.extra.join(', ') || '—' },
+          { v: v.proto }, { v: v.src }, { v: v.dst }, { v: v.extra.join(', ') || '\u2014' },
           { cellNode: del, sig: 'del' } ] };
       });
       mountInto(body, s, p, 'acl:' + acl.idx, cols, rows);
@@ -9445,7 +9445,7 @@
     opts = opts || {};
     const ifType = opts.ifType || IFTYPE_PORT;
     const ifIndex = detail.ifIndex;
-    pane.appendChild(el('div', 'card-sub', 'Loading ACL binding…'));
+    pane.appendChild(el('div', 'card-sub', 'Loading ACL binding\u2026'));
     try {
       if (!aclLoaded(s)) await aclRefresh(s);
       const bind = await readIfAclBinding(s, ifIndex, ifType);
@@ -9501,7 +9501,7 @@
         failLabel: 'Apply binding',
         run: () => snmpSet(s, vbs).then(() => ({ ok: true }), (e) => ({ ok: false, error: e.message })),
         ok: (r) => r && r.ok,
-        error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not apply binding — ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+        error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not apply binding \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
         onApplied: () => markConfigDirty(s, changedCtls),
         // Read the binding back and re-read the ACL tables, so the form shows
         // what the switch now holds before the spinner turns to Done.
@@ -9660,7 +9660,7 @@
   //   { aclIdx, aclName }           -> add a rule to that existing ACL
   //   { edit: {aclIdx, aceIdx, aclName, init} } -> edit an existing rule
   function openAclRuleForm(s, opts) {
-    const title = opts.edit ? ('ACL · ' + opts.edit.aclName + ' · rule ' + opts.edit.aceIdx)
+    const title = opts.edit ? ('ACL \u00b7 ' + opts.edit.aclName + ' \u00b7 rule ' + opts.edit.aceIdx)
       : (opts.newAcl ? 'New access list' : ('Add rule to ' + opts.aclName));
     const tab = opts.edit ? 'Rule' : (opts.newAcl ? 'New ACL' : 'Add rule');
     openTabbedPopout(s, title, [{ label: tab, fill: (pane, close) => aclRuleForm(s, pane, close, opts) }], []);
@@ -9745,7 +9745,7 @@
       const name = aclName || (nameIn ? (nameIn.value || '').trim() : '');
       clear(msg);
       if (!name) { msg.appendChild(el('div', 'sw-err', 'Enter an ACL name.')); return; }
-      if (opts.newAcl && aclModel(s.health).acls.some((a) => a.name === name)) { msg.appendChild(el('div', 'sw-err', 'An ACL named “' + name + '” already exists. Use its Add rule instead.')); return; }
+      if (opts.newAcl && aclModel(s.health).acls.some((a) => a.name === name)) { msg.appendChild(el('div', 'sw-err', 'An ACL named \u201c' + name + '\u201d already exists. Use its Add rule instead.')); return; }
       if (!src.any.checked && !ipv4ToHex(src.ip.value)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid source IPv4 address.')); return; }
       if (!dst.any.checked && !ipv4ToHex(dst.ip.value)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid destination IPv4 address.')); return; }
       const protoName = protoSel.value;
@@ -9769,7 +9769,7 @@
       };
       runButtonAction(ev.currentTarget, {
         failLabel: editing ? 'Save rule' : 'Add rule',
-        spinLabel: editing ? 'Saving…' : (opts.newAcl ? 'Creating…' : 'Adding…'),
+        spinLabel: editing ? 'Saving\u2026' : (opts.newAcl ? 'Creating\u2026' : 'Adding\u2026'),
         run: async () => {
           try {
             if (editing) await editQosAce(s, opts.edit.aclIdx, opts.edit.aceIdx, cfg);
@@ -9778,7 +9778,7 @@
           } catch (e) { return { ok: false, error: e.message }; }
         },
         ok: (r) => r && r.ok,
-        error: (r) => { msg.appendChild(el('div', 'sw-err', (editing ? 'Could not save rule — ' : 'Could not add rule — ') + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+        error: (r) => { msg.appendChild(el('div', 'sw-err', (editing ? 'Could not save rule \u2014 ' : 'Could not add rule \u2014 ') + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
         onApplied: () => markConfigDirty(s),
         settle: () => aclRefresh(s).then(() => close())
       });
