@@ -326,10 +326,14 @@
   // (it morphs to "Confirm?" with a warning tint); a second click within a few
   // seconds runs the action; otherwise it disarms and returns to its label.
   // Wrap a click handler with this to require confirmation. `danger` tints red.
+  // opts.when (optional) decides per click whether this click needs the
+  // confirm at all: when it returns false the action runs on the first tap
+  // (an editor whose Apply only sometimes does something drastic). confirmText
+  // may be a function, so the armed label can name what the click will do.
   function withConfirm(btn, run, opts) {
     opts = opts || {};
     const label = opts.label || btn.textContent;
-    const confirmText = opts.confirmText || 'Confirm?';
+    const textOf = () => (typeof opts.confirmText === 'function' ? opts.confirmText() : opts.confirmText) || 'Confirm?';
     const danger = opts.danger;
     btn._armed = false;
     const disarm = () => {
@@ -340,10 +344,11 @@
     };
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (!btn._armed && opts.when && !opts.when()) { run(e); return; }
       if (!btn._armed) {
         btn._armed = true;
         btn.classList.add(danger ? 'is-arming-danger' : 'is-arming');
-        btn.textContent = confirmText;
+        btn.textContent = textOf();
         clearTimeout(btn._armTimer);
         btn._armTimer = setTimeout(disarm, 3500);
         return;

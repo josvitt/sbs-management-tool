@@ -529,6 +529,21 @@
           if (!Number.isNaN(n)) l2l3ByIf.set(String(r.index), L2L3[n] || ('cat ' + n));
         }
         const hasL2L3 = l2l3ByIf.size > 0;
+        // A routed port's own IPv4 address(es), shown in place of its (empty)
+        // VLAN cells. Same source and filter as the VLAN table's IPv4 column:
+        // rsIpAddrTable rows owned static(1)/dhcp(2) - internal/default are
+        // the switch's system addresses.
+        const ipByIf = new Map();
+        const cvv = (cell) => cell && (cell.value !== undefined ? cell.value : cell.display);
+        for (const a of (h.sviAddrs || [])) {
+          const owner = parseInt(cvv(a.rsIpAdEntOwner), 10);
+          if ((owner !== 1 && owner !== 2) || !isRealIp(String(a.index))) continue;
+          const ifx = String(cvv(a.rsIpAdEntIfIndex));
+          const mask = String(cvv(a.rsIpAdEntNetMask) || '');
+          const pref = mask ? maskToPref(mask) : null;
+          const text = String(a.index) + (pref != null ? '/' + pref : '');
+          ipByIf.set(ifx, ipByIf.has(ifx) ? ipByIf.get(ifx) + ', ' + text : text);
+        }
 
         // 802.1X per-port config: port-control (force-unauth/auto/force-auth),
         // authorized status, and host-mode (single/multiple/multiple-auth).
@@ -649,7 +664,10 @@
             { v: dv(r.rlifPresentHighSpeed) }
           ];
           const withL2 = hasL2L3 ? base.concat([{ v: l2l3ByIf.get(String(r.index)) || '' }]) : base;
-          const withMode = hasModes ? withL2.concat([{ v: modeByIf.get(String(r.index)) || '' }]) : withL2;
+          // A routed (L3) port has no switchport mode; say so rather than show
+          // the leftover vlanPortModeState value the switch still reports.
+          const modeText = l2l3ByIf.get(String(r.index)) === 'L3' ? 'routed' : (modeByIf.get(String(r.index)) || '');
+          const withMode = hasModes ? withL2.concat([{ v: modeText }]) : withL2;
           // 802.1X cell: "control · status", e.g. "auto · authorized".
           let d1xText = '';
           if (d1x || hm) {
@@ -663,7 +681,11 @@
             { pill: true, v: poe ? dv(poe.pethPsePortDetectionStatus) : '' }
           ]) : withDot1x;
           const vl = portVlans.get(String(r.index)) || { untagged: [], tagged: [] };
-          const withVlans = hasVlans ? withPoe.concat([
+          const routed = l2l3ByIf.get(String(r.index)) === 'L3';
+          const withVlans = hasVlans ? withPoe.concat(routed ? [
+            { v: ipByIf.get(String(r.index)) || '' },
+            { v: '' }
+          ] : [
             { v: vl.untagged.join(', ') },
             { v: rangeOf(vl.tagged) }
           ]) : withPoe;

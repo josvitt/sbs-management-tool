@@ -1080,15 +1080,30 @@ function buildAlerts(h) {
   }
 
   // Per-port PoE faults. pethPsePortDetectionStatus reports fault(4) and
-  // otherFault(6) independently of whether anything is plugged in, and a
-  // port that faults with nothing attached is still a fault -- often a
-  // damaged PSE channel or a wiring problem that will bite the moment a
-  // device is connected. So this is never filtered by device presence,
-  // power draw, or the port being "searching".
+  // otherFault(6) independently of whether anything is plugged in. A fault
+  // on an empty port is still raised -- often a damaged PSE channel or a
+  // wiring problem that will bite the moment a powered device is connected.
+  //
+  // What is NOT raised is a fault on a port whose link is up while the PSE
+  // is not powering it: the device on the other end has its own power and
+  // is not a PD (a PC, a server, another switch), so it never asked for PoE
+  // and the fault says nothing about it. A PD that the PSE failed to power
+  // has no power to bring its link up with, so it still alerts. Seen on a
+  // C1300-24MGP-4X: gi1/0/3 linked up to a non-PD reported fault (4), "Port
+  // is off. Short condition", with rlPethPsePortLinkPartnerPoeType none(1);
+  // the two powered phones beside it reported poe(2). The link state needs no
+  // extra walk, so that is what decides here. The PoE row's
+  // port half is the ifIndex (decorateDiscovered sets portIndex), which is
+  // how the port's link state is found.
+  const linkUp = new Set();
+  for (const i of (h.interfaces || [])) {
+    if (/^up/i.test(disp(i, 'rlifPresentOperStatus') || '')) linkUp.add(String(i.index));
+  }
   const poeFaults = [];
   for (const port of h.poePorts) {
     const status = disp(port, 'pethPsePortDetectionStatus') || '';
-    if (/fault/i.test(status)) {
+    const portIf = String(port.portIndex != null ? port.portIndex : String(port.index).split('.').pop());
+    if (/fault/i.test(status) && !linkUp.has(portIf)) {
       poeFaults.push({ port: port.index, status });
     }
     const denied = Number(val(port, 'pethPsePortPowerDeniedCounter'));
@@ -1099,7 +1114,7 @@ function buildAlerts(h) {
   }
   for (const f of poeFaults) {
     add('critical', 'PoE',
-      `Port ${f.port} PoE detection reports ${f.status}. This is a port-side fault and applies whether or not a powered device is attached.`);
+      `Port ${f.port} PoE detection reports ${f.status}. The port has no link, so this is a port-side fault.`);
   }
 
   for (const p of h.poe) {
@@ -1758,5 +1773,5 @@ function summarise(h) {
 
 module.exports = {
   collect, SYSTEM_OIDS, HEALTH_SCALARS, TABLE_WALKS, THRESHOLDS, DECORATION_DEPS,
-  MODEL_POE, MIN_REAL_PSE_WATTS, detectModel
+  MODEL_POE, MIN_REAL_PSE_WATTS, detectModel, buildAlerts
 };

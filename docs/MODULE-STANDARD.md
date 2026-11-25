@@ -601,7 +601,10 @@ on the periodic timer is a cost decision, not just a correctness one.
   (`routeDeleteRisk`), and by extension any future write that would tear down the
   interface, VLAN, or address carrying `s.target.host`. Lock the control with a
   visible reason rather than letting the user cut themselves off; a write the app
-  cannot recover from is worse than a write the switch rejects.
+  cannot recover from is worse than a write the switch rejects. The routed-port
+  mode follows this: a routed port holding the management address cannot be
+  turned back into a switchport, and a port flagged as the uplink cannot be made
+  routed (`buildSwitchportEditor`), each locked with the reason shown.
 - **RowStatus creates** set the mandatory columns and `createAndGo(4)` in ONE PDU (a
   bare RowStatus set returns InconsistentValue).
 - **`markConfigDirty(s)`** in `onApplied` for any running-config change, so the
@@ -659,6 +662,9 @@ on the periodic timer is a cost decision, not just a correctness one.
 | Row action group / confirm button | `actGroup([...])`, `actBtnConfirm(...)` |
 | Status pill | `el('span','pill '+variant, label)` |
 | Modal form | `openTabbedPopout(s, title, tabs, [])`, `formSection`, `field` |
+| A popout tab that exists only in some states | tab `{ hidden: true }` + the popout's `setTabVisible(tab, visible)` (the routed port's IPv4 tab) |
+| Two-tap confirm only when the click is drastic | `withConfirm(btn, run, { when, confirmText })`: `when()` false runs on the first tap; `confirmText` may be a function naming what goes |
+| IPv4 address of an L3 interface (VLAN SVI or routed port) | `buildSviEditor(s, iface, ifIndex, pane)`, `iface` = `vlanIface(vlan)` or `{ name, noun: 'port' }`; one editor, one management lock |
 | IpAddress index ↔ | `ipToOidIndex` |
 | InetAddress index ↔ | `ipv4IndexV4` / `nameserverIndex` / `inetIndexToIp` |
 | DnsName/string index ↔ | `strToOidIndex` / `oidIndexToStr` |
