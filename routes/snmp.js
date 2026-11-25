@@ -5,6 +5,7 @@
  * and SNMPv3 option lookups the UI needs to build them.
  */
 
+const { writeHold } = require('../write-hold');
 const snmp = require('net-snmp');
 const log = require('../logger');
 const mib = require('../mibdb');
@@ -92,7 +93,7 @@ module.exports = function register(app) {
   });
 
   // SET one or more OIDs.
-  app.post('/api/snmp/set', (req, res) => {
+  app.post('/api/snmp/set', writeHold(), (req, res) => {
     const { target, varbinds } = req.body || {};
     if (!target || !target.host || !Array.isArray(varbinds) || varbinds.length === 0) {
       return res.status(400).json({ error: 'target.host and a non-empty varbinds array are required.' });

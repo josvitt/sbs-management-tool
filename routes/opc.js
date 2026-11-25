@@ -4,6 +4,7 @@
  * Onboard Packet Capture: configure, run, export and fetch captures.
  */
 
+const { writeHold } = require('../write-hold');
 const snmp = require('net-snmp');
 const log = require('../logger');
 const configFetch = require('../config-fetch');
@@ -46,7 +47,7 @@ module.exports = function register(app) {
   // Configure (create) the capture point + bind the control plane. Body:
   // { target, name, bufferType, bufferSizeMb, filter, aclName, direction,
   //   limitDurationSec, limitPackets, limitMaxLen }
-  app.post('/api/opc/configure', async (req, res) => {
+  app.post('/api/opc/configure', writeHold(), async (req, res) => {
     const b = req.body || {};
     if (!b.target || !b.target.host) return res.status(400).json({ error: 'target.host is required.' });
     if (!b.name) return res.status(400).json({ error: 'A capture name is required.' });
@@ -91,7 +92,7 @@ module.exports = function register(app) {
   // action row is NOT created with the capture point — it is created on demand —
   // so every start/stop/export first ensures the row exists. Creating a row that
   // already exists is refused, which is fine: we ignore that and proceed.
-  app.post('/api/opc/action', async (req, res) => {
+  app.post('/api/opc/action', writeHold(), async (req, res) => {
     const b = req.body || {};
     if (!b.target || !b.target.host) return res.status(400).json({ error: 'target.host is required.' });
     if (!b.name || !opc.ACTION[b.action]) return res.status(400).json({ error: 'name and a valid action are required.' });
@@ -128,7 +129,7 @@ module.exports = function register(app) {
   });
 
   // Delete the capture point. Body: { target, name }
-  app.post('/api/opc/delete', async (req, res) => {
+  app.post('/api/opc/delete', writeHold(), async (req, res) => {
     const b = req.body || {};
     if (!b.target || !b.target.host) return res.status(400).json({ error: 'target.host is required.' });
     if (!b.name) return res.status(400).json({ error: 'name is required.' });
@@ -177,7 +178,7 @@ module.exports = function register(app) {
   // All require confirm:true. cw-setup/combined enforce the capture is present,
   // stopped, and non-empty; cw-trigger acts on the row left by cw-setup.
   // Body: { target, name, confirm, method, flashFileName? }
-  app.post('/api/opc/export-to-flash', async (req, res) => {
+  app.post('/api/opc/export-to-flash', writeHold(), async (req, res) => {
     const b = req.body || {};
     if (!b.target || !b.target.host) return res.status(400).json({ error: 'target.host is required.' });
     if (!b.name) return res.status(400).json({ error: 'name is required.' });
@@ -374,7 +375,7 @@ module.exports = function register(app) {
   // it is gated by confirm:true and clearly labelled in the UI. The point is to
   // test whether the stable copy engine behaves differently from the OPC action.
   // Body: { target, name, confirm }
-  app.post('/api/copy/capture-to-flash', async (req, res) => {
+  app.post('/api/copy/capture-to-flash', writeHold(), async (req, res) => {
     const b = req.body || {};
     if (!b.target || !b.target.host) return res.status(400).json({ error: 'target.host is required.' });
     if (!b.name) return res.status(400).json({ error: 'name (capture name) is required.' });

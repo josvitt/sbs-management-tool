@@ -4,6 +4,7 @@
  * SNMP traps and syslog: the receivers' persistence and their routes.
  */
 
+const { writeHold } = require('../write-hold');
 const log = require('../logger');
 const mib = require('../mibdb');
 const syslog = require('../syslog');
@@ -194,7 +195,7 @@ module.exports = function register(app) {
   });
 
   // Writes to the switch: adds this machine as a syslog destination.
-  app.post('/api/syslog/configure', async (req, res) => {
+  app.post('/api/syslog/configure', writeHold(), async (req, res) => {
     const { target, severity } = req.body || {};
     if (!target || !target.host) return res.status(400).json({ error: 'target.host is required.' });
     try {
@@ -216,7 +217,7 @@ module.exports = function register(app) {
     }
   });
 
-  app.post('/api/syslog/remove', async (req, res) => {
+  app.post('/api/syslog/remove', writeHold(), async (req, res) => {
     const { target, index, table } = req.body || {};
     if (!target || !target.host || index === undefined) {
       return res.status(400).json({ error: 'target.host and index are required.' });

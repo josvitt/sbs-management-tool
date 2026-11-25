@@ -208,6 +208,23 @@ read a panel made after that collection (a write's re-read, the 15 s capture
 counter while a capture runs) is kept. A full collection is marked
 `complete: true`, which tells the panels nothing is left to load on open.
 
+### 3d. Writes hold the collection (`write-hold.js`, `collector.holdForWrite`)
+
+This firmware has crashed when a full multi-table read lands on top of a
+config-touching SET, and one change from the dashboard is several SETs in a
+row. The browser's `writeBusy` flag only stops the browser's own refreshes, so
+the server holds its own collection too:
+
+- Every route that writes to a switch takes the `writeHold()` middleware
+  (for snmp-config, only the `*-apply` actions). Before the route runs, it
+  calls `collector.holdForWrite(host)`.
+- That holds the switch's **full** collection until `WRITE_QUIET_MS` (15 s)
+  after the latest write, and waits (at most `WRITE_WAIT_MAX_MS`, 30 s) for a
+  poll of that switch that is already running. The cheap 30 s probe still runs,
+  so reachability and the metric graph keep going.
+- A manual Refresh (`nudge`) during a hold waits for the hold to end, then reads.
+- A new write route takes `writeHold()` too. `test/write-hold.test.js` covers it.
+
 ## 4. The event log — `events.js`
 
 An **event** records what changed and when — distinct from `app.log` (what the
@@ -509,6 +526,7 @@ its concern lives; a new route or caller uses it rather than re-implementing it.
 | Where the dashboard listens | `SBS_BIND` in server.js | `127.0.0.1` by default: only the PC the app runs on can open it (the owner's choice, in place of a sign-in). `SBS_BIND=0.0.0.0` re-opens LAN access and logs a warning. The UDP receivers are separate sockets and always listen on every interface. |
 | Browser security headers | `security-headers.js` | Sets CSP (`script-src 'self'`, inline style attributes allowed, connections only back to the page's host), `frame-ancestors 'none'`/X-Frame-Options, nosniff, no referrer. A page change that needs an inline script or another origin changes this policy here, deliberately. |
 | Who may call the server | `request-guard.js` (`middleware`, `verifyClient`) | Runs before every HTTP request and on the WebSocket upgrade. It does NOT decide which machine connects (`SBS_BIND` does); it refuses a browser request whose `Origin` is another site, and any `Host` that is not an IP, `localhost`, this computer's name, or a name in `SBS_ALLOWED_HOSTS` (DNS rebinding). |
+| No full read during a write | `writeHold()` (write-hold.js) → `collector.holdForWrite` | Every write route takes it, so the collector never starts a full collection of a switch while a change is being written to it (§3d). |
 | JSON varbinds → net-snmp SET | `mapSetVarbinds(varbinds)` (snmp-core.js) | Every SET path (the `/api/snmp/set` route, snmp-config's bundle, the OPC/AAA/flash step runners) converts through it: numeric types, `valueHex` → Buffer with an even-length check, anything else unchanged. There were three copies, only some handling `valueHex`. |
 | Walking a subtree | `boundedWalk(session, base, opts, onDone)` (snmp-core.js) | The ONE walk: subtree boundary, advance check, pacing (§B5a), row/depth caps, and a per-request watchdog (`SNMP_STEP_WATCHDOG_MS`, 12 s) so a reply net-snmp never delivers ends the walk instead of hanging it. `raw: true` returns untouched varbinds for snmp-config (`boundedWalkRaw` is that, with its 4000-row / depth-64 limits). |
 | SNMPv3 security level | `v3SecurityOf(v3)` (snmp-core.js) | One derivation of auth/priv method and level, used to build the session and to judge whether a shared key would travel in cleartext, so the two cannot disagree. |

@@ -5,6 +5,7 @@
  * identity): one dispatch route; snmp-config.js owns the logic.
  */
 
+const { writeHold } = require('../write-hold');
 const log = require('../logger');
 const snmpConfig = require('../snmp-config');
 const { buildSnmpSession, snmpConfigBundle } = require('../snmp-core');
@@ -21,7 +22,7 @@ module.exports = function register(app) {
 
   // snmp-config dispatch. One route; the action decides read or apply (every
   // *-apply action builds its plan of SETs and runs it in one call).
-  app.post('/api/snmp-config/:action', async (req, res) => {
+  app.post('/api/snmp-config/:action', writeHold((req) => /-apply$/.test(req.params.action)), async (req, res) => {
     const action = req.params.action;
     const { target } = req.body || {};
     if (!target || !target.host) return res.status(400).json({ error: 'target.host is required.' });

@@ -4,6 +4,7 @@
  * RADIUS and TACACS+ servers over SNMP (aaa.js owns the index encoding).
  */
 
+const { writeHold } = require('../write-hold');
 const log = require('../logger');
 const aaa = require('../aaa');
 const { v3SecurityOf, buildSnmpSession, redactTarget, mapSetVarbinds, snmpSetPromise } = require('../snmp-core');
@@ -40,7 +41,7 @@ module.exports = function register(app) {
   }
 
   // RADIUS add/edit. Body: { target, ...cfg, edit?, confirm? }
-  app.post('/api/aaa/radius', async (req, res) => {
+  app.post('/api/aaa/radius', writeHold(), async (req, res) => {
     const b = req.body || {};
     if (!b.target || !b.target.host) return res.status(400).json({ error: 'target.host is required.' });
     if (!b.address || !aaa.ipv4Octets(b.address)) return res.status(400).json({ error: 'A valid IPv4 server address is required.' });
@@ -58,7 +59,7 @@ module.exports = function register(app) {
   });
 
   // RADIUS delete. Body: { target, address, authPort, acctPort }
-  app.post('/api/aaa/radius/delete', async (req, res) => {
+  app.post('/api/aaa/radius/delete', writeHold(), async (req, res) => {
     const b = req.body || {};
     if (!b.target || !b.target.host) return res.status(400).json({ error: 'target.host is required.' });
     if (!b.address) return res.status(400).json({ error: 'address is required.' });
@@ -72,7 +73,7 @@ module.exports = function register(app) {
   });
 
   // TACACS add/edit. Body: { target, ...cfg, edit?, confirm? }
-  app.post('/api/aaa/tacacs', async (req, res) => {
+  app.post('/api/aaa/tacacs', writeHold(), async (req, res) => {
     const b = req.body || {};
     if (!b.target || !b.target.host) return res.status(400).json({ error: 'target.host is required.' });
     if (!b.address || !aaa.ipv4Octets(b.address)) return res.status(400).json({ error: 'A valid IPv4 server address is required.' });
@@ -90,7 +91,7 @@ module.exports = function register(app) {
   });
 
   // TACACS delete. Body: { target, address }
-  app.post('/api/aaa/tacacs/delete', async (req, res) => {
+  app.post('/api/aaa/tacacs/delete', writeHold(), async (req, res) => {
     const b = req.body || {};
     if (!b.target || !b.target.host) return res.status(400).json({ error: 'target.host is required.' });
     if (!b.address) return res.status(400).json({ error: 'address is required.' });

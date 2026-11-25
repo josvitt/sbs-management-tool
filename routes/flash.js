@@ -4,6 +4,7 @@
  * The switch's flash file system: list and delete.
  */
 
+const { writeHold } = require('../write-hold');
 const snmp = require('net-snmp');
 const log = require('../logger');
 const { buildSnmpSession, describeVarbind, redactTarget, snmpSetPromise } = require('../snmp-core');
@@ -116,7 +117,7 @@ module.exports = function register(app) {
 
   // Delete a flash file: rlFileRowStatus = destroy(6), keyed by the implied
   // filename. Body: { target, fileName }
-  app.post('/api/flash/delete', async (req, res) => {
+  app.post('/api/flash/delete', writeHold(), async (req, res) => {
     const b = req.body || {};
     if (!b.target || !b.target.host) return res.status(400).json({ error: 'target.host is required.' });
     if (!b.fileName) return res.status(400).json({ error: 'fileName is required.' });
