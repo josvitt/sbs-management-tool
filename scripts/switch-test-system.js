@@ -4,7 +4,7 @@
  * Supervised write test for the System panel (switch-system.js, routes/system.js)
  * on a test switch. Every change is put back, and nothing is saved to startup.
  *
- *   SBS_COMM=<community> node scripts/switch-test-system.js <address> [--login-check] [results folder]
+ *   SBS_COMM=<community> node scripts/switch-test-system.js <address> [--login-check] [--sntp-room] [results folder]
  *
  *   1. Reads the clock, SNTP, users and management access.
  *   2. Sets the time zone to +01:30 "TST", checks, and puts it back.
@@ -21,6 +21,13 @@
  *      Press Enter to go on; the user is deleted either way.
  *   7. Turns Telnet on and off again (or off and on, if it was on).
  *
+ *   --sntp-room   if the switch refuses a new SNTP server, removes its last
+ *                 server, tries again, removes the test server and adds the
+ *                 removed one back. This checks whether the refusal is a
+ *                 limit on how many servers it holds. If the add back is
+ *                 refused too, that server stays off until the switch
+ *                 reboots (nothing is saved).
+ *
  * The app's own routes run on 127.0.0.1, so this tests what the panel sends.
  * No password or community is written to the results file.
  */
@@ -35,10 +42,11 @@ const readline = require('readline');
 const args = process.argv.slice(2);
 const host = args[0];
 const loginCheck = args.includes('--login-check');
+const sntpRoom = args.includes('--sntp-room');
 const outDir = args.filter((a, i) => i > 0 && !a.startsWith('--'))[0] || null;
 const community = process.env.SBS_COMM;
 if (!host || !community) {
-  console.error('Usage: SBS_COMM=<community> node scripts/switch-test-system.js <address> [--login-check] [results folder]');
+  console.error('Usage: SBS_COMM=<community> node scripts/switch-test-system.js <address> [--login-check] [--sntp-room] [results folder]');
   process.exit(2);
 }
 
@@ -125,6 +133,21 @@ async function main() {
     const rm = await post('/api/system/sntp/remove', { address });
     const s2 = await status();
     check('remove SNTP server ' + address, rm.httpOk && !s2.time.servers.some((x) => x.address === address), rm.error || '');
+  }
+  if (sntpRoom && t0.servers.length && results.some((x) => /^add SNTP server/.test(x.name) && !x.ok)) {
+    const last = t0.servers[t0.servers.length - 1].address;
+    say('  Is it a limit on servers? Removing ' + last + ' to make room.');
+    const rm = await post('/api/system/sntp/remove', { address: last });
+    let s = await status();
+    check('remove ' + last + ' for room', rm.httpOk && !s.time.servers.some((x) => x.address === last), rm.error || '');
+    const r = await post('/api/system/sntp/add', { address: '192.0.2.123' });
+    s = await status();
+    check('add 192.0.2.123 with ' + s.time.servers.length + ' servers left before it', r.httpOk && s.time.servers.some((x) => x.address === '192.0.2.123'),
+      r.error || ('form "' + r.shape + '"'));
+    if (r.httpOk) await post('/api/system/sntp/remove', { address: '192.0.2.123' });
+    const back = await post('/api/system/sntp/add', { address: last });
+    s = await status();
+    check('add ' + last + ' back', back.httpOk && s.time.servers.some((x) => x.address === last), back.error || '');
   }
   {
     const s = await status();

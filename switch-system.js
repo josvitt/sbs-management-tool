@@ -362,17 +362,22 @@ async function firstAccepted(session, shapes) {
 }
 
 /**
- * Add an SNTP server. On 4.1.9.92 a createAndGo that also sets the polled
- * column is refused (InconsistentValue), so the row is created on its own
- * first; polled defaults to true in the switch's own rows.
+ * Add an SNTP server. On 4.1.9.92 the switch refuses a new row in the
+ * inet table with InconsistentValue, both with and without the polled
+ * column, while it holds its five default servers. An IPv4 server is also
+ * tried in the older IPv4-only table (101.92.2.2.12).
  */
 async function addSntpServer(session, address) {
   const { index, kind } = serverIndex(address);
   const status = SNTP_SERVERS + '.10.' + index;
-  const r = await firstAccepted(session, [
+  const shapes = [
     { name: 'createAndGo', varbinds: [I(status, ROW.createAndGo)] },
     { name: 'createAndWait then active', varbinds: [I(status, ROW.createAndWait)] }
-  ]);
+  ];
+  if (kind === 'ipv4') {
+    shapes.push({ name: 'IPv4 table createAndGo', varbinds: [I(SNTP + '.12.1.9.' + index.slice(4), ROW.createAndGo)] });
+  }
+  const r = await firstAccepted(session, shapes);
   if (r.shape === 'createAndWait then active') await setVarbinds(session, [I(status, ROW.active)]);
   return { added: String(address).trim(), kind, shape: r.shape };
 }
@@ -427,10 +432,10 @@ async function guardLastAdmin(session, name) {
 const PW_SET = V + '.79.68.1';   // rlAAALocalUserPasswordVerificationAndSettingTable
 
 /**
- * The forms tried for setting a password. On 4.1.9.92 the "$" clear-text
+ * The forms tried for changing a password. On 4.1.9.92 the "$" clear-text
  * form the MIB describes is refused with CommitFailed, so the plain text
  * and the separate setting table (new password and its confirmation) are
- * tried too; the one the switch takes is reported.
+ * tried first; the one the switch takes is reported.
  */
 function passwordShapes(name, password) {
   const idx = stringIndex(name);
@@ -445,24 +450,38 @@ function passwordShapes(name, password) {
 }
 
 /**
- * Add a user: create the row, set the password, then the privilege.
- * If no password form is taken, the new row is removed again.
+ * Add a user. The switch will not create a user row without a password
+ * (privilege and row status alone are refused with InconsistentValue), so
+ * the password goes in the creating PDU. The forms are tried in turn, each
+ * at privilege 1; a row a refused form left behind is removed before the
+ * next, and the privilege is raised only once a form is taken.
  */
 async function addUser(session, name, password, privilege) {
   const n = checkUserName(name), p = checkPassword(password), pr = checkPrivilege(privilege);
   const existing = await readUsers(session);
   if (existing.some((u) => u.name === n)) throw new Error('There is already a user called ' + n + '.');
-  // Created at privilege 1 and raised only once the password is set, so a
-  // row left behind by a failure can never be an admin without a password.
-  await setVarbinds(session, [I(userOid(3, n), 1), I(userOid(4, n), ROW.createAndGo)]);
-  try {
-    const r = await firstAccepted(session, passwordShapes(n, p));
-    if (pr !== 1) await setVarbinds(session, [I(userOid(3, n), pr)]);
-    return { added: n, privilege: pr, passwordForm: r.shape };
-  } catch (e) {
-    try { await setVarbinds(session, [I(userOid(4, n), ROW.destroy)]); } catch (e2) { /* reported below */ }
-    throw new Error('The user was not added: ' + e.message);
+  const base = [I(userOid(3, n), 1), I(userOid(4, n), ROW.createAndGo)];
+  const shapes = [
+    { name: 'plain text', varbinds: [OS(userOid(2, n), p)].concat(base) },
+    { name: 'plain text, SHA-512', varbinds: [OS(userOid(2, n), p), I(userOid(11, n), 2)].concat(base) },
+    { name: '$ clear text', varbinds: [OS(userOid(2, n), '$' + p)].concat(base) }
+  ];
+  const refused = [];
+  for (const sh of shapes) {
+    try {
+      await setVarbinds(session, sh.varbinds);
+      if (pr !== 1) await setVarbinds(session, [I(userOid(3, n), pr)]);
+      return { added: n, privilege: pr, passwordForm: sh.name };
+    } catch (e) {
+      refused.push(sh.name + ': ' + e.message);
+      const [vb] = await getChunk(session, [userOid(4, n)]).catch(() => [null]);
+      if (vb && !snmp.isVarbindError(vb)) {
+        try { await setVarbinds(session, [I(userOid(4, n), ROW.destroy)]); }
+        catch (e2) { throw new Error('The user was not added, and a partly created row could not be removed: ' + e2.message + ' (' + refused.join('; ') + ')'); }
+      }
+    }
   }
+  throw new Error('The user was not added. The switch refused every form (' + refused.join('; ') + ').');
 }
 
 async function setUserPassword(session, name, password) {
