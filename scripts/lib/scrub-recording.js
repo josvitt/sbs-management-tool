@@ -187,6 +187,13 @@ function scrub(varbinds, secrets) {
         const str = buf.toString('latin1');
         const swapped = names.has(str) ? names.get(str) : fixText(str);
         buf = Buffer.from(swapped, 'latin1');
+      } else {
+        // Binary or padded text (a NUL-padded string, a UTF-8 description):
+        // names are swapped byte for byte (same length, so the layout holds),
+        // and an address written as text is mapped like any other text.
+        const str = buf.toString('latin1');
+        const fixed = fixText(str);
+        if (fixed !== str) buf = Buffer.from(fixed, 'latin1');
       }
       v = { $buf: buf.toString('hex') };
     } else if (typeof v === 'string') {
@@ -198,12 +205,14 @@ function scrub(varbinds, secrets) {
   // Check: nothing the caller named, and no private address in text.
   // (Values only: an OID index is a run of numbers, so an address-shaped run
   // can turn up there by chance; names in indexes were swapped above.)
-  const text = out.map(([, , v]) => (v && v.$buf ? Buffer.from(v.$buf, 'hex').toString('latin1') : (typeof v === 'string' ? v : ''))).join('\n');
+  // The error names the columns (never the value), so a miss can be fixed.
+  const texts = out.map(([oid, , v]) => [oid, v && v.$buf ? Buffer.from(v.$buf, 'hex').toString('latin1') : (typeof v === 'string' ? v : '')]);
+  const where = (hit) => Array.from(new Set(texts.filter(([, t]) => hit(t)).map(([oid]) => colOf(oid).name || oid))).slice(0, 8).join(', ');
   for (const s of (secrets || [])) {
-    if (s && String(s).length >= 3 && text.includes(String(s))) throw new Error('A secret survived scrubbing.');
+    if (s && String(s).length >= 3 && texts.some(([, t]) => t.includes(String(s)))) throw new Error('A secret survived scrubbing in ' + where((t) => t.includes(String(s))) + '.');
   }
-  const priv = text.match(/(^|[^.\d])(10\.\d{1,3}|172\.(1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}(?![.\d])/);
-  if (priv) throw new Error('A private address survived scrubbing: ' + priv[0]);
+  const PRIV = /(^|[^.\d])(10\.\d{1,3}|172\.(1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}(?![.\d])/;
+  if (texts.some(([, t]) => PRIV.test(t))) throw new Error('A private address survived scrubbing in ' + where((t) => PRIV.test(t)) + '.');
   return { varbinds: out, counts: { ips: ips.size, macs: macs.size, names: names.size } };
 }
 

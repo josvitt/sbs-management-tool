@@ -369,7 +369,10 @@
     6: 'ggp', 7: 'hello', 8: 'rip', 9: 'isIs', 10: 'esIs', 11: 'ciscoIgrp',
     12: 'bbnSpfIgp', 13: 'ospf', 14: 'bgp' };
   const ROUTE_TYPE = { 1: 'other', 2: 'reject', 3: 'local', 4: 'remote' };
-  const STATIC_ROUTE_TYPE = { 1: 'other', 2: 'reject', 3: 'local', 4: 'remote' };
+  // CISCOSB-IPROUTER rlIpStaticRouteType: reject(1), local(2), remote(3). Not
+  // the RFC ipCidrRouteType numbers: the switch refuses remote = 4 (WrongValue,
+  // 2026-11-25 switch test) and its own rows read remote(3).
+  const STATIC_ROUTE_TYPE = { 1: 'reject', 2: 'local', 3: 'remote' };
   const DNS_ROUTE = {
     forwarding: '1.3.6.1.2.1.4.1',                       // ipForwarding scalar
     dnsEnable:  '1.3.6.1.4.1.9.6.1.101.93.2',            // rlDnsClEnable scalar
@@ -730,12 +733,12 @@
   function dnsHostIndex(name) { return dnsNameIndex(name) + '.1.0'; }
 
   // The SET that adds a static route (rlIpStaticRouteTable, base 26.17).
-  // Index = dest.mask.tos(0).nextHop; type remote(4), the metric, and
+  // Index = dest.mask.tos(0).nextHop; type remote(3), the metric, and
   // RowStatus createAndGo(4), in one PDU.
   function staticRouteVarbinds(dest, mask, nh, metric) {
     const suffix = ipToOidIndex(dest) + '.' + ipToOidIndex(mask) + '.0.' + ipToOidIndex(nh);
     return [
-      { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.6.' + suffix, type: 'Integer', value: 4 },
+      { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.6.' + suffix, type: 'Integer', value: 3 },
       { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.5.' + suffix, type: 'Integer', value: metric },
       { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.9.' + suffix, type: 'Integer', value: 4 }
     ];

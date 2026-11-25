@@ -145,7 +145,7 @@ test('a static route is one PDU on dest.mask.0.nextHop', () => {
     '\n;staticRouteVarbinds', ctx);
   const sfx = '10.20.0.0.255.255.0.0.0.192.168.1.1';
   assert.deepEqual(plain(fn('10.20.0.0', '255.255.0.0', '192.168.1.1', 5)), [
-    { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.6.' + sfx, type: 'Integer', value: 4 },
+    { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.6.' + sfx, type: 'Integer', value: 3 },
     { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.5.' + sfx, type: 'Integer', value: 5 },
     { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.9.' + sfx, type: 'Integer', value: 4 }
   ]);

@@ -48,3 +48,15 @@ test('an address inside free text is mapped too', () => {
   const { varbinds } = scrub([['1.3.6.1.2.1.1.1.0', OCT, hex('managed from 10.9.8.7')]], []);
   assert.equal(Buffer.from(varbinds[0][2].$buf, 'hex').toString(), 'managed from 192.0.2.7');
 });
+
+test('a community inside a NUL-padded or binary value is replaced byte for byte', () => {
+  const comm = 'S3cretComm';
+  const padded = { $buf: Buffer.concat([Buffer.from(comm), Buffer.alloc(6)]).toString('hex') };
+  const binary = { $buf: Buffer.concat([Buffer.from([0xff, 0x01]), Buffer.from(comm + ' 10.9.8.7')]).toString('hex') };
+  const { varbinds } = scrub([['1.3.6.1.4.1.9.6.1.101.1.1.0', OCT, padded], ['1.3.6.1.4.1.9.6.1.101.1.2.0', OCT, binary]], [comm]);
+  const a = Buffer.from(varbinds[0][2].$buf, 'hex');
+  assert.equal(a.length, comm.length + 6);
+  assert.ok(!a.toString('latin1').includes(comm));
+  const b = Buffer.from(varbinds[1][2].$buf, 'hex').toString('latin1');
+  assert.ok(!b.includes(comm) && b.includes('192.0.2.7'), b);
+});
