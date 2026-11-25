@@ -144,51 +144,16 @@ test('time zone, SNTP and clock writes', async () => {
   await assert.rejects(sys.setClock(s, 'tomorrow'), /must look like/);
 });
 
-test('SNTP servers are indexed by type, length and address, like the switch\'s own rows', async () => {
-  const s = fakeSession({});
-  await sys.addSntpServer(s, 'Pool.NTP.org');
-  const name = '16.12.' + Array.from(Buffer.from('pool.ntp.org')).join('.');
-  assert.deepEqual(s.sets[0], [{ oid: sys.SNTP_SERVERS + '.10.' + name, type: T.Integer, value: 4 }]);
-  await sys.addSntpServer(s, '192.0.2.5');
-  assert.equal(s.sets[1][0].oid, sys.SNTP_SERVERS + '.10.1.4.192.0.2.5');
-  await sys.removeSntpServer(s, 'pool.ntp.org');
-  assert.deepEqual(s.sets[2], [{ oid: sys.SNTP_SERVERS + '.10.' + name, type: T.Integer, value: 6 }]);
-  await assert.rejects(sys.addSntpServer(s, 'bad name!'), /not a valid host name/);
-  await assert.rejects(sys.addSntpServer(s, '2001:db8::1'), /IPv6/);
-});
-
-test('users: add with a clear-text password, change privilege, delete, and keep the last admin', async () => {
-  const s = fakeSession(userValues([['admin', 15]]));
-  assert.deepEqual(await sys.addUser(s, 'tech', 'Str0ng-pass', 7), { added: 'tech', privilege: 7, passwordForm: 'plain text' });
-  assert.deepEqual(s.sets[0], [
-    { oid: sys.USERS + '.2.' + idx('tech'), type: T.OctetString, value: 'Str0ng-pass' },
-    { oid: sys.USERS + '.3.' + idx('tech'), type: T.Integer, value: 1 },
-    { oid: sys.USERS + '.4.' + idx('tech'), type: T.Integer, value: 4 }
-  ]);
-  assert.deepEqual(s.sets[1], [{ oid: sys.USERS + '.3.' + idx('tech'), type: T.Integer, value: 7 }]);
-  await assert.rejects(sys.addUser(s, 'admin', 'Str0ng-pass', 15), /already/);
-  await assert.rejects(sys.addUser(s, 'x', 'short', 15), /8 to 64/);
-  await assert.rejects(sys.addUser(s, 'x', 'Str0ng-pass', 5), /privilege/);
+test('users: change privilege, delete, and keep the last admin', async () => {
+  const s = fakeSession(userValues([['admin', 15], ['tech', 1]]));
+  await sys.setUserPrivilege(s, 'tech', 7);
+  assert.deepEqual(s.sets[0], [{ oid: sys.USERS + '.3.' + idx('tech'), type: T.Integer, value: 7 }]);
+  await assert.rejects(sys.setUserPrivilege(s, 'tech', 5), /privilege/);
   await assert.rejects(sys.deleteUser(s, 'admin'), /only admin/);
   await assert.rejects(sys.setUserPrivilege(s, 'admin', 1), /only admin/);
-  // A switch that refuses a form but leaves a row behind: the row is removed
-  // before the next form, and a switch that refuses every form adds nothing.
-  const values = userValues([['admin', 15]]);
-  const leaky = fakeSession(values, { refuse: (vbs) => {
-    const pw = vbs.find((v) => v.oid.includes('.79.17.1.2.'));
-    if (pw && String(pw.value) === 'Str0ng-pass' && !vbs.some((v) => v.oid.includes('.79.17.1.11.'))) {
-      values[sys.USERS + '.4.' + idx('tech')] = int(1);   // a half-made row
-      return 'CommitFailed';
-    }
-    return null;
-  } });
-  assert.equal((await sys.addUser(leaky, 'tech', 'Str0ng-pass', 1)).passwordForm, 'plain text, SHA-512');
-  assert.deepEqual(leaky.sets[1], [{ oid: sys.USERS + '.4.' + idx('tech'), type: T.Integer, value: 6 }]);
-  const strict = fakeSession(userValues([['admin', 15]]), { refuse: (vbs) => (vbs.some((v) => v.oid.includes('.79.17.1.2.')) ? 'CommitFailed' : null) });
-  await assert.rejects(sys.addUser(strict, 'tech', 'Str0ng-pass', 1), /not added.*plain text: CommitFailed.*SHA-512: CommitFailed.*\$ clear text: CommitFailed/);
-  // The setting table is the second form tried.
-  const second = fakeSession({}, { refuse: (vbs) => (vbs.some((v) => v.oid.includes('.79.17.1.2.')) ? 'CommitFailed' : null) });
-  assert.deepEqual(await sys.setUserPassword(second, 'tech', 'An0ther-pass'), { user: 'tech', passwordForm: 'setting table' });
+  await sys.deleteUser(s, 'tech');
+  assert.deepEqual(s.sets[1], [{ oid: sys.USERS + '.4.' + idx('tech'), type: T.Integer, value: 6 }]);
+  assert.equal(s.sets.length, 2);
   // Two admins: either may go.
   const two = fakeSession(userValues([['admin', 15], ['root', 15]]));
   await sys.deleteUser(two, 'admin');

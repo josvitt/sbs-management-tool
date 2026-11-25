@@ -5,8 +5,10 @@
  * servers; local user accounts; and which management services are on.
  * The writes are encoded from the rows the switch itself made, recorded
  * from a C1300 on 4.1.9.92 (MODULE-STANDARD rule 5, docs/SWITCH-NOTES.md).
- * Summer time is read-only: its 14-byte start and end encoding is not yet
- * known.
+ * Read-only for now (docs/SWITCH-NOTES.md): summer time, whose 14-byte
+ * start and end encoding is not yet known; SNTP servers, since the switch
+ * refused every form of adding one over SNMP (so removing one could not be
+ * undone); and adding users or setting passwords, refused in every form.
  *
  * Objects (CISCOSB MIBs, vendor root 1.3.6.1.4.1.9.6.1.101):
  *   rlTimeSyncMethodMode 92.1: .4 rndTimeSyncManagedDateTime (ddmmyyhhmmss),
@@ -290,7 +292,7 @@ function setVarbinds(session, varbinds) {
 
 const I = (oid, value) => ({ oid, type: snmp.ObjectType.Integer, value });
 const OS = (oid, value) => ({ oid, type: snmp.ObjectType.OctetString, value: Buffer.from(String(value), 'utf8') });
-const ROW = { active: 1, createAndGo: 4, createAndWait: 5, destroy: 6 };
+const ROW = { destroy: 6 };
 
 /** Arcs for a length-prefixed string index. */
 function stringIndex(str) {
@@ -328,66 +330,6 @@ async function setSntp(session, on) {
   return { unicast: !!on };
 }
 
-/** The InetAddress index arcs for an SNTP server: type.len.bytes. */
-function serverIndex(address) {
-  const a = String(address || '').trim();
-  if (!a || a.length > 158) throw new Error('Enter a server address or host name.');
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(a)) {
-    const parts = a.split('.').map(Number);
-    if (parts.some((n) => n > 255)) throw new Error(a + ' is not an IPv4 address.');
-    return { kind: 'ipv4', index: '1.4.' + parts.join('.') };
-  }
-  if (a.includes(':')) throw new Error('IPv6 SNTP servers are not supported yet.');
-  if (!/^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/.test(a)) {
-    throw new Error(a + ' is not a valid host name.');
-  }
-  return { kind: 'name', index: '16.' + stringIndex(a.toLowerCase()) };
-}
-
-/** Add an SNTP server, polled. */
-// Try each shape until the switch takes one; report which. A refusal is
-// not proof the feature is missing (governing rule 6), so every shape is
-// tried and every refusal is reported.
-async function firstAccepted(session, shapes) {
-  const refused = [];
-  for (const sh of shapes) {
-    try {
-      await setVarbinds(session, sh.varbinds);
-      return { shape: sh.name, refused };
-    } catch (e) {
-      refused.push(sh.name + ': ' + e.message);
-    }
-  }
-  throw new Error('The switch refused every form (' + refused.join('; ') + ').');
-}
-
-/**
- * Add an SNTP server. On 4.1.9.92 the switch refuses a new row in the
- * inet table with InconsistentValue, both with and without the polled
- * column, while it holds its five default servers. An IPv4 server is also
- * tried in the older IPv4-only table (101.92.2.2.12).
- */
-async function addSntpServer(session, address) {
-  const { index, kind } = serverIndex(address);
-  const status = SNTP_SERVERS + '.10.' + index;
-  const shapes = [
-    { name: 'createAndGo', varbinds: [I(status, ROW.createAndGo)] },
-    { name: 'createAndWait then active', varbinds: [I(status, ROW.createAndWait)] }
-  ];
-  if (kind === 'ipv4') {
-    shapes.push({ name: 'IPv4 table createAndGo', varbinds: [I(SNTP + '.12.1.9.' + index.slice(4), ROW.createAndGo)] });
-  }
-  const r = await firstAccepted(session, shapes);
-  if (r.shape === 'createAndWait then active') await setVarbinds(session, [I(status, ROW.active)]);
-  return { added: String(address).trim(), kind, shape: r.shape };
-}
-
-async function removeSntpServer(session, address) {
-  const { index } = serverIndex(address);
-  await setVarbinds(session, [I(SNTP_SERVERS + '.10.' + index, ROW.destroy)]);
-  return { removed: String(address).trim() };
-}
-
 /** Set the clock. `local` is the switch's local time as "YYYY-MM-DD hh:mm:ss". */
 async function setClock(session, local) {
   const m = /^20(\d\d)-(\d\d)-(\d\d)[ T](\d\d):(\d\d)(?::(\d\d))?$/.exec(String(local || '').trim());
@@ -405,13 +347,6 @@ function checkUserName(name) {
   return n;
 }
 
-function checkPassword(pw) {
-  const p = String(pw == null ? '' : pw);
-  if (p.length < 8 || p.length > 64) throw new Error('A password must be 8 to 64 characters.');
-  if (/[\s"?]/.test(p)) throw new Error('A password cannot contain spaces, quotes or question marks.');
-  return p;
-}
-
 function checkPrivilege(priv) {
   const n = Number(priv);
   if (!(n === 1 || n === 7 || n === 15)) throw new Error('The privilege must be 1 (read-only), 7 (limited) or 15 (admin).');
@@ -427,67 +362,6 @@ async function guardLastAdmin(session, name) {
   if (admins.length === 1 && admins[0].name === name) {
     throw new Error(name + ' is the only admin (privilege 15). Add another admin first.');
   }
-}
-
-const PW_SET = V + '.79.68.1';   // rlAAALocalUserPasswordVerificationAndSettingTable
-
-/**
- * The forms tried for changing a password. On 4.1.9.92 the "$" clear-text
- * form the MIB describes is refused with CommitFailed, so the plain text
- * and the separate setting table (new password and its confirmation) are
- * tried first; the one the switch takes is reported.
- */
-function passwordShapes(name, password) {
-  const idx = stringIndex(name);
-  return [
-    { name: 'plain text', varbinds: [OS(userOid(2, name), password)] },
-    { name: 'setting table', varbinds: [
-      OS(PW_SET + '.3.' + idx, password),
-      OS(PW_SET + '.4.' + idx, password)
-    ] },
-    { name: '$ clear text', varbinds: [OS(userOid(2, name), '$' + password)] }
-  ];
-}
-
-/**
- * Add a user. The switch will not create a user row without a password
- * (privilege and row status alone are refused with InconsistentValue), so
- * the password goes in the creating PDU. The forms are tried in turn, each
- * at privilege 1; a row a refused form left behind is removed before the
- * next, and the privilege is raised only once a form is taken.
- */
-async function addUser(session, name, password, privilege) {
-  const n = checkUserName(name), p = checkPassword(password), pr = checkPrivilege(privilege);
-  const existing = await readUsers(session);
-  if (existing.some((u) => u.name === n)) throw new Error('There is already a user called ' + n + '.');
-  const base = [I(userOid(3, n), 1), I(userOid(4, n), ROW.createAndGo)];
-  const shapes = [
-    { name: 'plain text', varbinds: [OS(userOid(2, n), p)].concat(base) },
-    { name: 'plain text, SHA-512', varbinds: [OS(userOid(2, n), p), I(userOid(11, n), 2)].concat(base) },
-    { name: '$ clear text', varbinds: [OS(userOid(2, n), '$' + p)].concat(base) }
-  ];
-  const refused = [];
-  for (const sh of shapes) {
-    try {
-      await setVarbinds(session, sh.varbinds);
-      if (pr !== 1) await setVarbinds(session, [I(userOid(3, n), pr)]);
-      return { added: n, privilege: pr, passwordForm: sh.name };
-    } catch (e) {
-      refused.push(sh.name + ': ' + e.message);
-      const [vb] = await getChunk(session, [userOid(4, n)]).catch(() => [null]);
-      if (vb && !snmp.isVarbindError(vb)) {
-        try { await setVarbinds(session, [I(userOid(4, n), ROW.destroy)]); }
-        catch (e2) { throw new Error('The user was not added, and a partly created row could not be removed: ' + e2.message + ' (' + refused.join('; ') + ')'); }
-      }
-    }
-  }
-  throw new Error('The user was not added. The switch refused every form (' + refused.join('; ') + ').');
-}
-
-async function setUserPassword(session, name, password) {
-  const n = checkUserName(name), p = checkPassword(password);
-  const r = await firstAccepted(session, passwordShapes(n, p));
-  return { user: n, passwordForm: r.shape };
 }
 
 async function setUserPrivilege(session, name, privilege) {
@@ -532,5 +406,5 @@ async function setService(session, service, on) {
   return { service, on: !!on };
 }
 
-module.exports = { readSystem, setTimeZone, setSntp, addSntpServer, removeSntpServer, setClock,
-  addUser, setUserPassword, setUserPrivilege, deleteUser, setService, normaliseOffset, serverIndex, stringIndex, switchDateTime, takeInet, inetText, SCALARS, SNTP_SERVERS, USERS, MNG_RULES };
+module.exports = { readSystem, setTimeZone, setSntp, setClock,
+  setUserPrivilege, deleteUser, setService, normaliseOffset, stringIndex, switchDateTime, takeInet, inetText, SCALARS, SNTP_SERVERS, USERS, MNG_RULES };

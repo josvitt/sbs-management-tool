@@ -4,56 +4,38 @@
  * Supervised write test for the System panel (switch-system.js, routes/system.js)
  * on a test switch. Every change is put back, and nothing is saved to startup.
  *
- *   SBS_COMM=<community> node scripts/switch-test-system.js <address> [--login-check] [--sntp-room] [results folder]
+ *   SBS_COMM=<community> node scripts/switch-test-system.js <address> [results folder]
  *
  *   1. Reads the clock, SNTP, users and management access.
  *   2. Sets the time zone to +01:30 "TST", checks, and puts it back.
- *   3. Adds SNTP servers 192.0.2.123 and sbs-test.example.com, checks, and
- *      removes them.
- *   4. Turns SNTP off and on again (or on and off, if it was off).
- *   5. Sets the clock to this computer's time in the switch's time zone and
+ *   3. Turns SNTP off and on again (or on and off, if it was off).
+ *   4. Sets the clock to this computer's time in the switch's time zone and
  *      checks it reads back within a minute.
- *   6. Adds a user "sbstest" with privilege 1 and a random password, changes
- *      its privilege to 7 and its password, checks the only-admin guard, and
- *      deletes the user.
- *      --login-check pauses after the user is added and prints its password,
- *      so you can sign in over SSH as sbstest and confirm the password works.
- *      Press Enter to go on; the user is deleted either way.
- *   7. Turns Telnet on and off again (or off and on, if it was on).
- *
- *   --sntp-room   if the switch refuses a new SNTP server, removes its last
- *                 server, tries again, removes the test server and adds the
- *                 removed one back. This checks whether the refusal is a
- *                 limit on how many servers it holds. If the add back is
- *                 refused too, that server stays off until the switch
- *                 reboots (nothing is saved).
+ *   5. Checks that the only admin can be neither deleted nor demoted.
+ *   6. Turns Telnet on and off again (or off and on, if it was on).
  *
  * The app's own routes run on 127.0.0.1, so this tests what the panel sends.
- * No password or community is written to the results file.
+ * No community is written to the results file.
  */
 
 process.env.SNMP_MAX_RPS = process.env.SNMP_MAX_RPS || '20';
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
-const crypto = require('crypto');
-const readline = require('readline');
 
 const args = process.argv.slice(2);
 const host = args[0];
-const loginCheck = args.includes('--login-check');
-const sntpRoom = args.includes('--sntp-room');
-const outDir = args.filter((a, i) => i > 0 && !a.startsWith('--'))[0] || null;
+const outDir = args[1] || null;
 const community = process.env.SBS_COMM;
 if (!host || !community) {
-  console.error('Usage: SBS_COMM=<community> node scripts/switch-test-system.js <address> [--login-check] [--sntp-room] [results folder]');
+  console.error('Usage: SBS_COMM=<community> node scripts/switch-test-system.js <address> [results folder]');
   process.exit(2);
 }
 
 const lines = [];
-function say(msg, secret) {
+function say(msg) {
   const l = '[' + new Date().toISOString().slice(11, 19) + '] ' + msg;
-  if (!secret) lines.push(l);
+  lines.push(l);
   console.log(l);
 }
 const results = [];
@@ -74,13 +56,6 @@ async function startApp() {
 }
 
 const sameOffset = (a, b) => String(a || '').replace(/^\+/, '') === String(b || '').replace(/^\+/, '');
-
-function pressEnter(prompt) {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(prompt, () => { rl.close(); resolve(); });
-  });
-}
 
 // The switch's local time from this computer's clock, as the panel sends it.
 function switchLocalNow(offsetSec) {
@@ -122,39 +97,7 @@ async function main() {
       back.error || ('reads ' + s2.time.zoneOffset + ' ' + s2.time.zoneCode));
   }
 
-  // ---- 3. SNTP servers --------------------------------------------------------
-  for (const address of ['192.0.2.123', 'sbs-test.example.com']) {
-    const had = t0.servers.some((x) => x.address === address);
-    if (had) { say('SKIP SNTP server ' + address + ': already configured'); continue; }
-    const r = await post('/api/system/sntp/add', { address });
-    const s = await status();
-    const row = s.time.servers.find((x) => x.address === address);
-    check('add SNTP server ' + address, r.httpOk && !!row, r.error || (row ? 'form "' + r.shape + '", polled ' + row.polled + ', status ' + row.status : 'not listed'));
-    const rm = await post('/api/system/sntp/remove', { address });
-    const s2 = await status();
-    check('remove SNTP server ' + address, rm.httpOk && !s2.time.servers.some((x) => x.address === address), rm.error || '');
-  }
-  if (sntpRoom && t0.servers.length && results.some((x) => /^add SNTP server/.test(x.name) && !x.ok)) {
-    const last = t0.servers[t0.servers.length - 1].address;
-    say('  Is it a limit on servers? Removing ' + last + ' to make room.');
-    const rm = await post('/api/system/sntp/remove', { address: last });
-    let s = await status();
-    check('remove ' + last + ' for room', rm.httpOk && !s.time.servers.some((x) => x.address === last), rm.error || '');
-    const r = await post('/api/system/sntp/add', { address: '192.0.2.123' });
-    s = await status();
-    check('add 192.0.2.123 with ' + s.time.servers.length + ' servers left before it', r.httpOk && s.time.servers.some((x) => x.address === '192.0.2.123'),
-      r.error || ('form "' + r.shape + '"'));
-    if (r.httpOk) await post('/api/system/sntp/remove', { address: '192.0.2.123' });
-    const back = await post('/api/system/sntp/add', { address: last });
-    s = await status();
-    check('add ' + last + ' back', back.httpOk && s.time.servers.some((x) => x.address === last), back.error || '');
-  }
-  {
-    const s = await status();
-    check('the original SNTP servers are all still there', t0.servers.every((x) => s.time.servers.some((y) => y.address === x.address)));
-  }
-
-  // ---- 4. SNTP on/off ---------------------------------------------------------
+  // ---- 3. SNTP on/off ---------------------------------------------------------
   {
     const was = t0.sntp.unicast;
     const r = await post('/api/system/sntp', { on: !was });
@@ -165,7 +108,7 @@ async function main() {
     check('turn SNTP ' + (was ? 'on' : 'off') + ' again', back.httpOk && s2.time.sntp.unicast === was, back.error || ('reads ' + s2.time.sntp.unicast));
   }
 
-  // ---- 5. clock ---------------------------------------------------------------
+  // ---- 4. clock ---------------------------------------------------------------
   {
     const local = switchLocalNow(t0.totalOffsetSec);
     const r = await post('/api/system/clock', { local });
@@ -174,44 +117,22 @@ async function main() {
     check('set the clock to this computer\'s time', r.httpOk && diff < 60, r.error || ('sent ' + local + ', reads ' + s.time.now + ' (' + s.time.clock + ')'));
   }
 
-  // ---- 6. users ---------------------------------------------------------------
+  // ---- 5. users: the only-admin guard ----------------------------------------
   {
-    const name = 'sbstest';
-    if (st0.users.list.some((u) => u.name === name)) {
-      say('SKIP users: a user called sbstest already exists');
+    const admins = st0.users.list.filter((x) => x.privilege === 15);
+    if (admins.length === 1) {
+      const name = admins[0].name;
+      const g = await post('/api/system/user/delete', { name });
+      const g2 = await post('/api/system/user/privilege', { name, privilege: 1 });
+      const s = await status();
+      const u = s.users.list.find((x) => x.name === name);
+      check('the only admin can be neither deleted nor demoted', !g.httpOk && !g2.httpOk && u && u.privilege === 15, g.error || 'it was accepted');
     } else {
-      const pw = 'Sb' + crypto.randomBytes(6).toString('hex') + '-7';
-      const r = await post('/api/system/user/add', { name, password: pw, privilege: 1 });
-      let s = await status();
-      let u = s.users.list.find((x) => x.name === name);
-      check('add user sbstest with privilege 1', r.httpOk && u && u.privilege === 1, r.error || (u ? 'password form "' + r.passwordForm + '", privilege ' + u.privilege : 'not listed'));
-      if (!r.httpOk && !u) say('  (the add removed its own row again, as it should)');
-      if (r.httpOk && u && loginCheck) {
-        say('  Sign in over SSH now: ssh ' + name + '@' + host + '  password ' + pw, true);
-        await pressEnter('  Did the sign-in work? Note it, then press Enter to go on. ');
-      }
-      if (!u) {
-        say('SKIP the other user steps: sbstest was not added');
-      } else {
-      const pr = await post('/api/system/user/privilege', { name, privilege: 7 });
-      s = await status(); u = s.users.list.find((x) => x.name === name);
-      check('change its privilege to 7', pr.httpOk && u && u.privilege === 7, pr.error || (u ? 'privilege ' + u.privilege : 'not listed'));
-      const pw2 = await post('/api/system/user/password', { name, password: 'Sb' + crypto.randomBytes(6).toString('hex') + '-8' });
-      check('change its password', pw2.httpOk, pw2.error || ('form "' + pw2.passwordForm + '"'));
-      const admins = s.users.list.filter((x) => x.privilege === 15);
-      if (admins.length === 1) {
-        const g = await post('/api/system/user/delete', { name: admins[0].name });
-        const s3 = await status();
-        check('the only admin cannot be deleted', !g.httpOk && s3.users.list.some((x) => x.name === admins[0].name), g.error || 'it was accepted');
-      }
-      const del = await post('/api/system/user/delete', { name });
-      s = await status();
-      check('delete user sbstest', del.httpOk && !s.users.list.some((x) => x.name === name), del.error || '');
-      }
+      say('SKIP the only-admin guard: the switch has ' + admins.length + ' admins');
     }
   }
 
-  // ---- 7. a management service ----------------------------------------------
+  // ---- 6. a management service ----------------------------------------------
   {
     const was = !!a0.telnet;
     const r = await post('/api/system/service', { service: 'telnet', on: !was });
@@ -226,7 +147,7 @@ async function main() {
   {
     const s = await status();
     const same = sameOffset(s.time.zoneOffset, t0.zoneOffset) && s.time.sntp.unicast === t0.sntp.unicast &&
-      s.time.servers.length === t0.servers.length && s.users.list.length === st0.users.list.length &&
+      s.users.list.length === st0.users.list.length &&
       ['ssh', 'telnet', 'https', 'http'].every((k) => s.access[k] === a0[k]);
     check('everything is as it was at the start', same);
   }

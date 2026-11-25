@@ -14665,24 +14665,16 @@
     if (!s._ktReconcile) body.appendChild(el('div', 'section-title', 'SNTP servers'));
     const servers = t.servers || [];
     if (servers.length) {
-      mountInto(body, s, p, 'system:sntp', ['Server', 'Polled', 'Stratum', 'Status', ''], servers.map((x) => ({
+      mountInto(body, s, p, 'system:sntp', ['Server', 'Polled', 'Stratum', 'Status'], servers.map((x) => ({
         key: 'sntp:' + x.address,
         cells: [{ v: x.address }, { v: x.polled == null ? '' : (x.polled ? 'yes' : 'no') },
           { v: x.stratum == null ? '' : String(x.stratum) },
-          { pill: SERVER_PILL[x.status] || true, v: x.status || 'unknown' },
-          { cellNode: actGroup([x.kind === 'ipv6' ? null : actBtnConfirm('Remove', (e) => systemWrite(e.currentTarget, s,
-            '/api/system/sntp/remove', { address: x.address }, 'Remove server'), 'danger', 'Stop using this server')]), sig: 'rm' }]
+          { pill: SERVER_PILL[x.status] || true, v: x.status || 'unknown' }]
       })));
     } else if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'No SNTP servers are set.'));
     if (!s._ktReconcile) {
-      const row = el('div', 'maint-row');
-      const addr = textInput('', 'pool.ntp.org or 192.0.2.1');
-      const add = el('button', 'btn', 'Add server'); add.type = 'button';
-      add.addEventListener('click', (e) => systemWrite(e.currentTarget, s, '/api/system/sntp/add',
-        { address: addr.value.trim() }, 'Add server', () => { addr.value = ''; }));
-      row.appendChild(field('Server', addr));
-      row.appendChild(add);
-      body.appendChild(row);
+      body.appendChild(el('div', 'card-sub', 'The switch does not accept new SNTP servers over SNMP, so the list is read-only here. ' +
+        'Change it on the switch\'s web page under Administration > Time Settings > SNTP Unicast.'));
     }
 
     // ---- Users ----
@@ -14703,33 +14695,27 @@
     } else if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'The switch did not list any local users.'));
     if (!s._ktReconcile) {
       const row = el('div', 'maint-row');
-      const name = textInput('', 'user name'); name.autocomplete = 'off';
-      const pw = el('input'); pw.type = 'password'; pw.autocomplete = 'new-password'; pw.placeholder = '8 or more characters';
+      p._sysUser = selectInput([], '');
       const priv = selectInput(PRIVILEGES, '15');
-      const known = () => (((s._system.data || {}).users || {}).list || []).some((u) => u.name === name.value.trim());
-      const add = el('button', 'btn', 'Add user'); add.type = 'button';
-      add.addEventListener('click', (e) => systemWrite(e.currentTarget, s, '/api/system/user/add',
-        { name: name.value.trim(), password: pw.value, privilege: Number(priv.value) }, 'Add user', () => { pw.value = ''; }));
-      const setPw = el('button', 'btn btn-blue', 'Change password'); setPw.type = 'button';
-      setPw.addEventListener('click', (e) => (known() ? systemWrite(e.currentTarget, s, '/api/system/user/password',
-        { name: name.value.trim(), password: pw.value }, 'Change password', () => { pw.value = ''; })
-        : toast('There is no user called ' + name.value.trim() + '.', 'error')));
-      const setPriv = el('button', 'btn btn-blue', 'Change privilege'); setPriv.type = 'button';
-      setPriv.addEventListener('click', (e) => (known() ? systemWrite(e.currentTarget, s, '/api/system/user/privilege',
-        { name: name.value.trim(), privilege: Number(priv.value) }, 'Change privilege')
-        : toast('There is no user called ' + name.value.trim() + '.', 'error')));
-      row.appendChild(field('User', name));
-      row.appendChild(field('Password', pw));
+      const setPriv = el('button', 'btn', 'Change privilege'); setPriv.type = 'button';
+      setPriv.addEventListener('click', (e) => systemWrite(e.currentTarget, s, '/api/system/user/privilege',
+        { name: p._sysUser.value, privilege: Number(priv.value) }, 'Change privilege'));
+      row.appendChild(field('User', p._sysUser));
       row.appendChild(field('Privilege', priv));
-      row.appendChild(add); row.appendChild(setPw); row.appendChild(setPriv);
+      row.appendChild(setPriv);
       body.appendChild(row);
-      p._sysPwWarn = el('div', 'sw-warn', '');
-      body.appendChild(p._sysPwWarn);
+      body.appendChild(el('div', 'card-sub', 'The switch does not accept new users or passwords over SNMP. ' +
+        'Add a user or change a password on the switch\'s web page under Administration > User Accounts.'));
     }
-    const v3priv = !!(s.target && String(s.target.version) === '3' && s.target.v3 && String(s.target.v3.level) === 'authPriv');
-    p._sysPwWarn.textContent = v3priv ? '' : 'This connection uses SNMPv2c, so a password you set here crosses the network unencrypted. ' +
-      'Over SNMPv3 with privacy it is encrypted.';
-    p._sysPwWarn.hidden = v3priv;
+    // Keep the user picker in step with the list, keeping the choice.
+    const names = users.map((u) => u.name);
+    if (p._sysUserNames !== names.join('\n')) {
+      p._sysUserNames = names.join('\n');
+      const keep = p._sysUser.value;
+      clear(p._sysUser);
+      for (const n of names) { const o = el('option', '', n); o.value = n; p._sysUser.appendChild(o); }
+      if (names.includes(keep)) p._sysUser.value = keep;
+    }
 
     // ---- Management access ----
     if (!s._ktReconcile) body.appendChild(el('div', 'section-title', 'Management access'));

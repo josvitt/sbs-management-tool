@@ -54,14 +54,9 @@ module.exports = function register(app) {
   writeRoute(app, '/api/system/timezone', 'Time zone set', (s, b) => sys.setTimeZone(s, b.offset, b.code));
   // { on: true }
   writeRoute(app, '/api/system/sntp', 'SNTP turned on or off', (s, b) => sys.setSntp(s, !!b.on));
-  // { address }
-  writeRoute(app, '/api/system/sntp/add', 'SNTP server added', (s, b) => sys.addSntpServer(s, b.address));
-  writeRoute(app, '/api/system/sntp/remove', 'SNTP server removed', (s, b) => sys.removeSntpServer(s, b.address));
   // { local: 'YYYY-MM-DD hh:mm:ss' }
   writeRoute(app, '/api/system/clock', 'Clock set', (s, b) => sys.setClock(s, b.local));
-  // { name, password, privilege }. The password is never logged.
-  writeRoute(app, '/api/system/user/add', 'Local user added', (s, b) => sys.addUser(s, b.name, b.password, b.privilege));
-  writeRoute(app, '/api/system/user/password', 'Local user password changed', (s, b) => sys.setUserPassword(s, b.name, b.password));
+  // { name, privilege }
   writeRoute(app, '/api/system/user/privilege', 'Local user privilege changed', (s, b) => sys.setUserPrivilege(s, b.name, b.privilege));
   writeRoute(app, '/api/system/user/delete', 'Local user deleted', (s, b) => sys.deleteUser(s, b.name));
   // { service: 'ssh' | 'telnet' | 'https' | 'http', on }
