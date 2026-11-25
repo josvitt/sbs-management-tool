@@ -9976,7 +9976,7 @@
           ok: (r) => r && r.ok,
           error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not remove the IPv4 interface \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
           onApplied: () => markConfigDirty(s),
-          settle: () => refreshSvi(s).then(() => { const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove(); })
+          settle: () => refreshSvi(s).then(() => { if (done) { done(); return; } const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove(); })
         });
       }, 'danger', 'Remove this ' + iface.noun + '\u2019s IPv4 interface');
       const rmRow = el('div', 'snmp-form-actions'); rmRow.style.marginTop = '8px'; rmRow.appendChild(rm);
@@ -9999,7 +9999,7 @@
 
   // Remove an SVI's IPv4 configuration for a given ifIndex: any static address
   // (rsIpAdEntStatus = invalid(2)) and the DHCP client (rlDhcpClActionStatus =
-  // destroy(6)). Used before deleting a VLAN, and when clearing its IPv4 tab.
+  // destroy(6)). Used before deleting a VLAN, and before a routed port goes back to a switchport.
   async function teardownSvi(s, ifIndex) {
     const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
     // Remove any address rows that belong to this ifIndex.
