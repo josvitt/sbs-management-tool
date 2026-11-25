@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "build": "node scripts/build-app.js",
     "test": "node --test --test-force-exit \"test/*.test.js\""
   },
   "dependencies": {

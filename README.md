@@ -18,7 +18,9 @@ while it runs — close it (or Ctrl+C) to stop.
 Not on Windows? `npm install && npm start`, then open
 `http://localhost:3000`.
 
-`npm test` runs the tests. GitHub runs them too, on Node 22 and 24, with an
+The browser code lives in `public/src/`, one file per feature; `npm run
+build` joins them into `public/app.js`, which is what the page loads (see
+docs/MODULE-STANDARD.md). `npm test` runs the tests. GitHub runs them too, on Node 22 and 24, with an
 `npm audit` of the shipped dependencies, on every push and pull request
 (`.github/workflows/ci.yml`); Dependabot proposes dependency and Action
 updates weekly.
