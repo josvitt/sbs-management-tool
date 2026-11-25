@@ -123,6 +123,16 @@ async function collectHealthFor(target, opts) {
   });
   const key = redactTarget(target).host + ':' + (target.port || 161);
   try {
+    // One cheap read first. A switch that does not answer SNMP (wrong
+    // community, an SNMP host filter, or down) would otherwise time out
+    // table by table for minutes and come back as a "complete" collection
+    // with nothing in it.
+    try {
+      await snmpGetPromise(session, resolveOids(['sysUpTime.0']));
+    } catch (e) {
+      throw new Error('The switch did not answer SNMP (' + e.message + '). ' +
+        'Check the community or v3 credentials, and that the switch allows SNMP from this computer.');
+    }
     const data = await health.collect({
       only,
       previous: lastCollection.get(key),

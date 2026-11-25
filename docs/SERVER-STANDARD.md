@@ -39,9 +39,14 @@ it. This is governing rule 4 (survey/reconcile) made concrete: there is no
 second, parallel poller. A change to how collection works is made in this one
 place and both callers inherit it.
 
-- It throws on a session-build failure; it does **not** throw merely because a
-  switch is unreachable — `health.collect` is resilient and returns a partial
-  result with empty tables (see §3). The session is always closed (`finally`).
+- It throws on a session-build failure, and when the switch does not answer
+  one cheap read (`sysUpTime.0`) made before anything else: the §2 rule,
+  probe first, applied to this path too. Without it, a switch filtering SNMP
+  or a wrong community cost minutes of per-table timeouts and came back as a
+  "complete" collection with nothing in it (seen live: about 9 minutes). Once
+  that read answers, it does **not** throw because individual tables fail —
+  `health.collect` is resilient and returns a partial result with those tables
+  empty (see §3). The session is always closed (`finally`).
 - `previous` (the per-switch `lastCollection` cache) turns error counters into
   rates; it is keyed by `host:port`.
 
