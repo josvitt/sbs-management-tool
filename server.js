@@ -124,7 +124,7 @@ function startCollector() {
     // with every full collection; SNMP configuration, Flash files and Reboot
     // and firmware follow the settings rule (after a change, a reboot, a
     // Refresh, or hourly).
-    modules: { everyCycle: ['captures'], onSettings: ['snmpConfig', 'flash', 'maint', 'system'] },
+    modules: { everyCycle: ['captures'], onSettings: ['snmpConfig', 'flash', 'maint', 'system', 'ports'] },
     collectModules: (target, keys) => collectModulesFor(target, keys),
     history, events, log, configHistory
   });
