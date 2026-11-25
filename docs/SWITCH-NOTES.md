@@ -65,6 +65,39 @@ Proven on a C1300 (gi1/0/4, 25 Nov 2026, `scripts/switch-test.js`):
 - **Nameservers are added in `rlDnsResConfigSbeltInetTable` and deleted from
   the DNS client v2 servers table,** whose row the switch makes for each one.
 
+## Reboot and firmware (`switch-maint.js`, `26-maint.js`)
+
+Proven on a C1300 (25 Nov 2026, firmware 4.1.9.92, `scripts/switch-test-maint.js`):
+
+- **A reboot is `rlRebootDelay` (TimeTicks).** Setting 360000 schedules one in
+  an hour, and reading it back gives the time left. Setting 4294967295 cancels
+  it, and that is also what it reads when nothing is scheduled.
+  `rlManualReboot` is not a control: it is read-only and says whether the
+  last restart was orderly.
+- **The next boot image is `rndActiveSoftwareFileAfterReset.<unit>`**,
+  image1(1) or image2(2). It reads back at once. The running one is
+  `rndActiveSoftwareFile.<unit>`, read-only.
+- **The switch pulls a file from the app with an `rlCopyTable` row:** source
+  tftp(3) with the app's address and a file name, source type other(1),
+  destination local(1) on unit 1 with the file type, `createAndGo` in one PDU.
+  The row is gone when the copy ends.
+- **A configuration copied into startup this way is not stored as sent.** A
+  143-line startup copied back into itself came back as 138 lines: two stray
+  `!` comment lines and a block of an `aaa ...` line, `!` and `exit` were
+  dropped. Doing it again gives the same result. So restoring a stored
+  version to startup is held back until it is known which lines the switch
+  drops and why.
+- **The images are listed in `rndImageInfoTable`, one row per unit,** with a
+  name, version and build date and time column for each slot. The name is a
+  full path such as `flash://system/images/<file>.bin`.
+- **A firmware install is the same copy with file type image(8).** A 65.7 MB
+  image took 121 s. The switch writes it to the slot it is not running,
+  stores it under the TFTP file name it was offered, and makes that slot
+  the next boot image by itself.
+- **Reading startup back over TFTP can stall right after a copy into it.**
+  Twice the upload sat at uploadInProgress until the app gave up; a later
+  read worked.
+
 ## Spanning tree (`health.js`)
 
 - **`dot1dStpVersion` can't be trusted on its own.** Firmware reports `rstp`

@@ -78,3 +78,12 @@ test('an address inside a switch-internal "TR-" name and an LLDP management addr
   // the same address maps the same way in the index and in the value
   assert.ok(varbinds[0][0].endsWith('.84.82.45.' + Array.from(val.slice(3)).join('.')), varbinds[0][0]);
 });
+
+test('a firmware version that looks like an address is left alone', () => {
+  const { varbinds } = scrub([
+    ['1.3.6.1.4.1.9.6.1.101.2.16.1.1.4.1', OCT, hex('4.1.9.92')],          // rndImage1Version
+    ['1.3.6.1.2.1.1.1.0', OCT, hex('reached via 4.1.9.92')]                  // free text still maps
+  ], []);
+  assert.equal(Buffer.from(varbinds[0][2].$buf, 'hex').toString(), '4.1.9.92');
+  assert.notEqual(Buffer.from(varbinds[1][2].$buf, 'hex').toString(), 'reached via 4.1.9.92');
+});

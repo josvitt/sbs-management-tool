@@ -28,6 +28,10 @@ const mib = require('../../mibdb');
 
 const SENSITIVE = /sysName|sysLocation|sysContact|Community|SecurityName|UserName|usmUser|Key|Password|Secret|Alias|lldpRemSys|lldpRemPortDesc|lldpLocSys(Name|Desc)|cdpCache(DeviceId|Platform|Version|DevicePort)|cdpGlobalDeviceId|HostName|Hostname|DomainName|DnsCl.*Name|Description|Descr$|FileName|ContactInfo|Location|rlFile/i;
 const NOT_SENSITIVE = /^(sysDescr|entPhysical|ifDescr|rlifPresentName|rlPhdUnitGenParam|rlCopy)/;
+// Firmware and boot versions are dotted numbers ("4.1.9.92") that look like
+// addresses, and image file names are the vendor's; neither identifies a
+// network, and mapping them would make the fixture lie.
+const VERSION_COL = /^(rndImage\d(Internal)?Version|rndImage\dName|rndBrgVersion|rndBaseBootVersion|entPhysical(Hardware|Firmware|Software)Rev)$/;
 const MAC_COL = /Mac(Address)?|PhysAddress|ChassisId|BridgeAddress|DesignatedRoot|DesignatedBridge|BridgeId|RootId/i;
 // Tables with a MAC in the index: [entry OID prefix, arc position of the MAC
 // from the end of the suffix (0 = the last six arcs)].
@@ -203,6 +207,8 @@ function scrub(varbinds, secrets) {
         const head = buf.length === 8 ? buf.slice(0, 2).toString('hex') : '';
         const mac = macs.get((buf.length === 8 ? buf.slice(2) : buf).toString('hex'));
         if (mac) buf = Buffer.from(head + mac, 'hex');
+      } else if (isPrintable(buf) && VERSION_COL.test(c.name)) {
+        // a version string: left as it is
       } else if (isPrintable(buf)) {
         const str = buf.toString('latin1');
         const swapped = names.has(str) ? names.get(str) : fixText(str);

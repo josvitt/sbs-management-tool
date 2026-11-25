@@ -34,6 +34,7 @@
     if (key === 'vlans') { paintVlanPanel(s, body, p); return; }
     if (key === 'capture') { paintCapturePanel(s, body, p); return; }
     if (key === 'flash') { paintFlashPanel(s, body, p); return; }
+    if (key === 'maint') { paintMaintPanel(s, body, p); return; }
     const h = s.health;
     if (!h) { body.appendChild(el('div', 'card-sub', 'No SNMP data yet.')); return; }
     const sc = (k) => (h.scalars[k] ? h.scalars[k].display : null);
