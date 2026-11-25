@@ -5070,13 +5070,22 @@
     form.appendChild(actions); form.appendChild(msg);
     // Remove button when something is configured.
     if (cur || dhcpOn) {
-      const rm = actBtnConfirm('Remove IPv4', async () => {
-        try {
-          if (dhcpOn) await snmpSet(s, { oid: DHCP_CL.status + '.' + sviIfIndex, type: 'Integer', value: 6 });
-          if (cur) await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 });
-          markConfigDirty(s); refreshSvi(s);
-          const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove();
-        } catch (e) { toast('Could not remove the IPv4 interface: ' + e.message, 'error'); }
+      const rm = actBtnConfirm('Remove IPv4', (e) => {
+        clear(msg);
+        runButtonAction(e.currentTarget, {
+          failLabel: 'Remove IPv4',
+          run: async () => {
+            try {
+              if (dhcpOn) await snmpSet(s, { oid: DHCP_CL.status + '.' + sviIfIndex, type: 'Integer', value: 6 });
+              if (cur) await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 });
+              return { ok: true };
+            } catch (err) { return { ok: false, error: err.message }; }
+          },
+          ok: (r) => r && r.ok,
+          error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not remove the IPv4 interface \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+          onApplied: () => markConfigDirty(s),
+          settle: () => refreshSvi(s).then(() => { const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove(); })
+        });
       }, 'danger', 'Remove this VLAN\u2019s IPv4 interface');
       const rmRow = el('div', 'snmp-form-actions'); rmRow.style.marginTop = '8px'; rmRow.appendChild(rm);
       form.appendChild(rmRow);
@@ -5141,9 +5150,11 @@
   // interface row (and, for DHCP, to obtain a lease). Refresh the VLAN + SVI
   // tables twice - soon, and again a few seconds later - so the table reflects
   // the change without the user having to reload. Light, targeted walks only.
+  // Returns the first refresh's promise, so a write's runButtonAction settle
+  // holds its spinner until the table shows the change (§B6).
   function refreshSvi(s) {
-    setTimeout(() => refreshTables(s, ['vlans', 'interfaces', 'sviAddrs']), 1000);
     setTimeout(() => refreshTables(s, ['vlans', 'interfaces', 'sviAddrs']), 4500);
+    return new Promise((res) => { setTimeout(() => { refreshTables(s, ['vlans', 'interfaces', 'sviAddrs']).then(res, res); }, 1000); });
   }
 
   // The "add VLAN" control shown above the VLAN table.
