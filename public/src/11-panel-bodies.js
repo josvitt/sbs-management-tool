@@ -134,7 +134,7 @@
           qa.appendChild(b);
           return b;
         };
-        act(s.tech ? 'Recollect tech-support' : 'Collect tech-support', 'btn-amber',
+        act(s.tech ? 'Recollect tech-support' : 'Collect tech-support', '',
           () => startTechCollect(s), s.techBusy, 'Runs show tech-support over SSH');
         if (s.tech) {
           act('View tech-support', '', () => openOverlay(s, 'techOverlay'));

@@ -106,7 +106,7 @@
       pane.appendChild(el('div', 'card-sub', iface.name + ' has no IPv4 interface configured.'));
       if (sviIfIndex == null) pane.appendChild(el('div', 'sw-err', 'Could not resolve this ' + iface.noun + '\u2019s L3 ifIndex (needed to add an address).'));
       const addRow = el('div', 'snmp-form-actions'); addRow.style.marginTop = '10px';
-      const addBtn = el('button', 'btn btn-small btn-blue', iface.addLabel || 'Add IPv4 address'); addBtn.type = 'button';
+      const addBtn = el('button', 'btn btn-small', iface.addLabel || 'Add IPv4 address'); addBtn.type = 'button';
       addBtn.disabled = sviIfIndex == null;
       addBtn.addEventListener('click', () => { clear(pane); sviConfigForm(s, iface, sviIfIndex, pane, null, false, done); });
       addRow.appendChild(addBtn); pane.appendChild(addRow);
@@ -758,7 +758,7 @@
       body.appendChild(field('Metric', metricIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add route'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add route'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const dest = destIn.value.trim(), mask = maskIn.value.trim(), nh = nhIn.value.trim();
         const metric = parseInt(metricIn.value, 10) || 1;
@@ -788,7 +788,7 @@
       body.appendChild(field('Domain name', nameIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add domain'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add domain'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const name = nameIn.value.trim();
         if (!name) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a domain name.')); return; }
@@ -815,7 +815,7 @@
       body.appendChild(field('Server IP', addrIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add nameserver'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add nameserver'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const addr = addrIn.value.trim();
         const vbs = nameserverVarbinds(addr);
@@ -845,7 +845,7 @@
       body.appendChild(field('IP address', addrIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add mapping'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add mapping'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const name = nameIn.value.trim(), addr = addrIn.value.trim();
         if (!name || !/^\d+\.\d+\.\d+\.\d+$/.test(addr)) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a host name and a valid IPv4 address.')); return; }

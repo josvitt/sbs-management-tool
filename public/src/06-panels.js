@@ -629,7 +629,7 @@
         }, 10000);
         popTimers.push(ctrTimer);
         const cActions = el('div', 'snmp-form-actions'); cActions.style.marginTop = '8px';
-        const clearBtn = el('button', 'btn btn-small btn-amber', 'Clear counters'); clearBtn.type = 'button';
+        const clearBtn = el('button', 'btn btn-small btn-danger', 'Clear counters'); clearBtn.type = 'button';
         const cMsg = el('div', 'sw-msg');
         clearBtn.addEventListener('click', (ev) => {
           clear(cMsg);

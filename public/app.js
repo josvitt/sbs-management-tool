@@ -237,7 +237,7 @@
   function applyActions(label, opts) {
     opts = opts || {};
     const actions = el('div', 'snmp-form-actions');
-    const apply = el('button', 'btn btn-small btn-blue', label || 'Apply'); apply.type = 'button';
+    const apply = el('button', 'btn btn-small', label || 'Apply'); apply.type = 'button';
     const msg = el('div', opts.msgClass || 'port-detail-msg');
     actions.appendChild(apply);
     for (const b of opts.extra || []) if (b) actions.appendChild(b);
@@ -3794,7 +3794,7 @@
         }, 10000);
         popTimers.push(ctrTimer);
         const cActions = el('div', 'snmp-form-actions'); cActions.style.marginTop = '8px';
-        const clearBtn = el('button', 'btn btn-small btn-amber', 'Clear counters'); clearBtn.type = 'button';
+        const clearBtn = el('button', 'btn btn-small btn-danger', 'Clear counters'); clearBtn.type = 'button';
         const cMsg = el('div', 'sw-msg');
         clearBtn.addEventListener('click', (ev) => {
           clear(cMsg);
@@ -5307,7 +5307,7 @@
       cosIn.value = String(scn('vlanVoiceAutoAdminVpt') || '0');
       const dscpIn = el('input'); dscpIn.type = 'number'; dscpIn.min = '0'; dscpIn.max = '63'; dscpIn.style.width = '58px';
       dscpIn.value = String(scn('vlanVoiceAutoAdminDscp') || '0');
-      const applyCfg = el('button', 'btn btn-small btn-blue', 'Apply'); applyCfg.type = 'button'; applyCfg.style.marginLeft = '6px';
+      const applyCfg = el('button', 'btn btn-small', 'Apply'); applyCfg.type = 'button'; applyCfg.style.marginLeft = '6px';
       applyCfg.addEventListener('click', (e) => {
         const curMode = scn('vlanVoiceAdminState');
         const mode = parseInt(modeSel.value, 10);
@@ -5419,7 +5419,7 @@
       const cosIn = el('input'); cosIn.type = 'number'; cosIn.min = '0'; cosIn.max = '7'; cosIn.style.width = '52px'; cosIn.value = String(cos != null ? cos : 0);
       const remarkChk = el('input'); remarkChk.type = 'checkbox'; remarkChk.checked = (remark === 1);
       const agingIn = el('input'); agingIn.type = 'number'; agingIn.min = '1'; agingIn.max = '43200'; agingIn.style.width = '72px'; agingIn.value = String(aging != null ? aging : 1);
-      const apply = el('button', 'btn btn-small btn-blue', 'Apply'); apply.type = 'button'; apply.style.marginLeft = '6px';
+      const apply = el('button', 'btn btn-small', 'Apply'); apply.type = 'button'; apply.style.marginLeft = '6px';
       apply.addEventListener('click', (e) => {
         const nc = parseInt(cosIn.value, 10), na = parseInt(agingIn.value, 10), nr = remarkChk.checked ? 1 : 2;
         const vbs = [];
@@ -6517,7 +6517,7 @@
           qa.appendChild(b);
           return b;
         };
-        act(s.tech ? 'Recollect tech-support' : 'Collect tech-support', 'btn-amber',
+        act(s.tech ? 'Recollect tech-support' : 'Collect tech-support', '',
           () => startTechCollect(s), s.techBusy, 'Runs show tech-support over SSH');
         if (s.tech) {
           act('View tech-support', '', () => openOverlay(s, 'techOverlay'));
@@ -8284,7 +8284,7 @@
     row.appendChild(el('span', 'card-sub', 'Send'));
     row.appendChild(sev);
 
-    const go = el('button', 'btn btn-amber', 'Configure this switch');
+    const go = el('button', 'btn', 'Configure this switch');
     go.type = 'button'; go.style.width = 'auto';
     // Two taps (B8): the first arms the button, the second writes.
     withConfirm(go, () => configureSyslog(s, sev.value), {
@@ -8913,7 +8913,7 @@
         ? 'The running configuration has not been saved. A reload would revert these ' +
           changed + ' line(s) to the startup configuration.'
         : 'The switch reports unsaved changes. Saving clears that.'));
-      const go = el('button', 'btn btn-amber', 'Save running to startup');
+      const go = el('button', 'btn', 'Save running to startup');
       go.type = 'button'; go.style.width = 'auto';
       go.title = 'Copies running-config over startup-config on the switch';
       // Two taps (B8): the first arms the button, the second overwrites startup.
@@ -9906,7 +9906,7 @@
       pane.appendChild(el('div', 'card-sub', iface.name + ' has no IPv4 interface configured.'));
       if (sviIfIndex == null) pane.appendChild(el('div', 'sw-err', 'Could not resolve this ' + iface.noun + '\u2019s L3 ifIndex (needed to add an address).'));
       const addRow = el('div', 'snmp-form-actions'); addRow.style.marginTop = '10px';
-      const addBtn = el('button', 'btn btn-small btn-blue', iface.addLabel || 'Add IPv4 address'); addBtn.type = 'button';
+      const addBtn = el('button', 'btn btn-small', iface.addLabel || 'Add IPv4 address'); addBtn.type = 'button';
       addBtn.disabled = sviIfIndex == null;
       addBtn.addEventListener('click', () => { clear(pane); sviConfigForm(s, iface, sviIfIndex, pane, null, false, done); });
       addRow.appendChild(addBtn); pane.appendChild(addRow);
@@ -10558,7 +10558,7 @@
       body.appendChild(field('Metric', metricIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add route'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add route'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const dest = destIn.value.trim(), mask = maskIn.value.trim(), nh = nhIn.value.trim();
         const metric = parseInt(metricIn.value, 10) || 1;
@@ -10588,7 +10588,7 @@
       body.appendChild(field('Domain name', nameIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add domain'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add domain'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const name = nameIn.value.trim();
         if (!name) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a domain name.')); return; }
@@ -10615,7 +10615,7 @@
       body.appendChild(field('Server IP', addrIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add nameserver'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add nameserver'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const addr = addrIn.value.trim();
         const vbs = nameserverVarbinds(addr);
@@ -10645,7 +10645,7 @@
       body.appendChild(field('IP address', addrIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add mapping'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add mapping'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const name = nameIn.value.trim(), addr = addrIn.value.trim();
         if (!name || !/^\d+\.\d+\.\d+\.\d+$/.test(addr)) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a host name and a valid IPv4 address.')); return; }
@@ -13974,7 +13974,7 @@
     });
     acts.appendChild(add);
 
-    const copy = el('button', 'btn btn-amber', 'Copy OID');
+    const copy = el('button', 'btn btn-blue', 'Copy OID');
     copy.type = 'button';
     copy.addEventListener('click', () => {
       const text = e.oid;
@@ -14192,7 +14192,7 @@
       'Only needed if checks say GitHub\'s hourly limit is used up, for example when many PCs share one internet address. ' +
       'Make one on GitHub: Settings → Developer settings → Fine-grained tokens → Generate, with Public repositories (read-only) access and no permissions. It is sent only to api.github.com.'));
     const tokRow = el('div', 'row-split update-actions');
-    const saveTok = el('button', 'btn btn-blue', 'Save token'); saveTok.type = 'button';
+    const saveTok = el('button', 'btn', 'Save token'); saveTok.type = 'button';
     saveTok.addEventListener('click', () => runButtonAction(saveTok, {
       failLabel: 'Save token',
       run: () => tokenInput.value.trim()

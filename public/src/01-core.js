@@ -225,7 +225,7 @@
   function applyActions(label, opts) {
     opts = opts || {};
     const actions = el('div', 'snmp-form-actions');
-    const apply = el('button', 'btn btn-small btn-blue', label || 'Apply'); apply.type = 'button';
+    const apply = el('button', 'btn btn-small', label || 'Apply'); apply.type = 'button';
     const msg = el('div', opts.msgClass || 'port-detail-msg');
     actions.appendChild(apply);
     for (const b of opts.extra || []) if (b) actions.appendChild(b);

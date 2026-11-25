@@ -218,7 +218,7 @@
     });
     acts.appendChild(add);
 
-    const copy = el('button', 'btn btn-amber', 'Copy OID');
+    const copy = el('button', 'btn btn-blue', 'Copy OID');
     copy.type = 'button';
     copy.addEventListener('click', () => {
       const text = e.oid;

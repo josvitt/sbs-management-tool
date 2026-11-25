@@ -494,7 +494,7 @@
     row.appendChild(el('span', 'card-sub', 'Send'));
     row.appendChild(sev);
 
-    const go = el('button', 'btn btn-amber', 'Configure this switch');
+    const go = el('button', 'btn', 'Configure this switch');
     go.type = 'button'; go.style.width = 'auto';
     // Two taps (B8): the first arms the button, the second writes.
     withConfirm(go, () => configureSyslog(s, sev.value), {

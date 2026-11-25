@@ -149,7 +149,7 @@
       'Only needed if checks say GitHub\'s hourly limit is used up, for example when many PCs share one internet address. ' +
       'Make one on GitHub: Settings → Developer settings → Fine-grained tokens → Generate, with Public repositories (read-only) access and no permissions. It is sent only to api.github.com.'));
     const tokRow = el('div', 'row-split update-actions');
-    const saveTok = el('button', 'btn btn-blue', 'Save token'); saveTok.type = 'button';
+    const saveTok = el('button', 'btn', 'Save token'); saveTok.type = 'button';
     saveTok.addEventListener('click', () => runButtonAction(saveTok, {
       failLabel: 'Save token',
       run: () => tokenInput.value.trim()
