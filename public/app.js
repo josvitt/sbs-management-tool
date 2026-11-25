@@ -6344,6 +6344,18 @@
 
     const setVb = (varbinds) => snmpSetResult(s, varbinds).then((res) => ({ ok: res.ok, b: res.body }));
 
+    // Take a port out of its channel. Tested on a C1300 (firmware 4.1.9.92):
+    // the switch refuses (WrongValue) a key change on its own, whether to 0
+    // or to the port's own ifIndex; it takes the key and the actor admin
+    // state together in one SET. 0x22 (Aggregation + Defaulted) is the state
+    // every standalone port reads back, so the port ends exactly as a port
+    // that was never in a channel. Adding already sends state + key together.
+    const STANDALONE_STATE = '22';
+    const leaveChannel = (pIdx) => [
+      { oid: OIDS.portActorState + '.' + pIdx, type: 'OctetString', valueHex: STANDALONE_STATE },
+      { oid: OIDS.portActorKey + '.' + pIdx, type: 'Integer', value: 0 }
+    ];
+
     // Build the channel table rows.
     const cols = ['Channel', 'Mode', 'Members', 'Key', 'Aggregating', 'Status'].concat(editable ? [''] : []);
     const rows = lagCreate.map((c) => {
@@ -6492,8 +6504,7 @@
         // on this firmware - they describe capability, not config. Channel
         // membership is driven entirely by the port's actor admin KEY: setting a
         // port's key to the aggregator's key (= its ifIndex here, e.g. 1000 for
-        // Po1) joins it; setting the key back to the port's own ifIndex (its
-        // individual aggregator) removes it. Static vs LACP is the LACP_Activity
+        // Po1), together with its state, joins it; leaveChannel removes it. Static vs LACP is the LACP_Activity
         // bit of the actor admin STATE (bit 0): LACP = active, static = cleared.
         const want = new Set(checks.filter((cb) => cb.checked).map((cb) => cb.dataset.port));
         // CONFIRMED from CLI-configured members in BOTH modes (LAG debug):
@@ -6530,12 +6541,11 @@
             addSteps.push({ oid: OIDS.portActorKey + '.' + pIdx, type: 'Integer', value: keyVal });
           } else if (!now && was) {
             // Removed member: break out (intended removal - not rolled back).
-            removeSteps.push({ oid: OIDS.portActorKey + '.' + pIdx, type: 'Integer', value: 0 });
+            removeSteps.push(...leaveChannel(pIdx));
           } else if (modeChanged) {
             // Staying, but mode changed: break out (phase 1) then re-add (phase 2).
             // Capture how to restore it if the re-add fails.
-            removeSteps.push({ oid: OIDS.portActorKey + '.' + pIdx, type: 'Integer', value: 0 });
-            removeSteps.push({ oid: OIDS.portActorState + '.' + pIdx, type: 'OctetString', valueHex: '00' });
+            removeSteps.push(...leaveChannel(pIdx));
             addSteps.push({ oid: OIDS.portActorState + '.' + pIdx, type: 'OctetString', valueHex: stateHex });
             addSteps.push({ oid: OIDS.portActorKey + '.' + pIdx, type: 'Integer', value: keyVal });
             rollbackSteps.push({ oid: OIDS.portActorState + '.' + pIdx, type: 'OctetString', valueHex: origStateHex(pIdx) });
@@ -6589,11 +6599,11 @@
       host.appendChild(el('div', 'sw-warn', 'Remove all members and unconfigure port channel ' + (nameByIdx.get(aggIdx) || aggIdx) + '?'));
       const row = el('div', 'snmp-form-actions');
       const yes = actBtn('Clear', async () => {
-        // Remove each member by resetting its actor key to its own ifIndex (its
-        // individual aggregator = standalone). The creation-table flags are
-        // NotWritable, so membership is managed purely through the port keys.
+        // Take every member out (leaveChannel: state + key in one SET). The
+        // creation-table flags are NotWritable, so membership is managed
+        // purely through the ports' actor key and state.
         const steps = [];
-        for (const p of members) steps.push({ oid: OIDS.portActorKey + '.' + p, type: 'Integer', value: 0 });
+        for (const p of members) steps.push(...leaveChannel(p));
         if (steps.length) {
           const r = await setVb(steps);
           if (!r.ok || r.b.error) { toast('Could not clear the channel: ' + (r.b.error || 'the switch rejected it'), 'error'); return; }
