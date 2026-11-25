@@ -18,6 +18,11 @@ while it runs — close it (or Ctrl+C) to stop.
 Not on Windows? `npm install && npm start`, then open
 `http://localhost:3000`.
 
+`npm test` runs the tests. GitHub runs them too, on Node 22 and 24, with an
+`npm audit` of the shipped dependencies, on every push and pull request
+(`.github/workflows/ci.yml`); Dependabot proposes dependency and Action
+updates weekly.
+
 ### Run it unattended (as a service)
 
 `start.bat` is the interactive way to run it. To have it collect from your

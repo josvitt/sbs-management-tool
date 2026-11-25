@@ -1,0 +1,15 @@
+# Weekly update proposals for the npm packages and for the pinned Actions.
+# Each arrives as a pull request that CI tests; nothing merges on its own.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # net-snmp is pinned because snmp-crypto.js patches its internals;
+    # test/snmp-crypto.test.js is what tells a safe bump from a breaking one.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
