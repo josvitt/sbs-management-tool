@@ -3878,10 +3878,6 @@
     await snmpSet(s, { oid: STATIC_MAC.status + '.' + suffix, type: 'Integer', value: 2 }); // invalid = delete
   }
 
-  // Walk the static-MAC tables so we can see exactly how THIS switch stores a
-  // static entry: which table, the index format, and the port-bitmap width.
-  // Create one static entry on the switch (CLI/web), then run this.
-
   // The add-static-MAC form (popout): MAC, VLAN, and the port to map it to.
   function openStaticMacForm(s, h) {
     // Port options: each bridge port -> its interface name. AllowedToGoTo is a
@@ -4726,12 +4722,6 @@
     return box;
   }
 
-  // Walk/GET the 802.1X-relevant OIDs for a port and present the raw values, so
-  // the exact index encoding and which tables the switch populates are visible.
-  // Walk every LAG-related table and present the raw values so a CLI-configured
-  // channel member can be inspected (the exact actor key, state, attached ids).
-
-
   // Build a minimal q-bridge PortList octet string with a single port's bit
   // set. Encoding (same MSB-first scheme as the VLAN-list bitmaps): octet 0
   // covers ports 1-8, MSB = lowest port. Only as many octets as needed to reach
@@ -4747,9 +4737,11 @@
   }
 
   // Reset one port's MIB counters via rlIfClearPortMibCounters (a read-write
-  // PortList scalar: each set bit = a port whose counters are cleared). On this
-  // switch the physical-port ifIndex equals the front-panel port number, so the
-  // ifIndex is used for the bit position.
+  // PortList scalar: each set bit = a port whose counters are cleared). A
+  // PortList bit is a bridge port number. On the C1200/C1300 a physical port's
+  // bridge port equals its ifIndex (the recorded C1300-24MGP-4X: gi1/0/1-24 =
+  // 1-24, te1/0/1-4 = 49-52 in both dot1dBasePortTable and rlifPresentTable),
+  // so the ifIndex is the bit position, as in the port-channel member lists.
   async function clearPortCounters(s, ifIndex) {
     if (!s.target) return { ok: false, error: 'Not connected.' };
     const ownsBusy = !s.writeBusy;
