@@ -514,6 +514,10 @@ The app must not raise the switch's CPU input rate by more than **~100 pps**. Ev
 periodic walk and every panel load spends SNMP PDUs against that budget, so what goes
 on the periodic timer is a cost decision, not just a correctness one.
 
+- **Enforced per switch.** Every session from `buildSnmpSession` sends through
+  one spacing gate per switch (`SNMP_MAX_RPS`, default 100 requests a second),
+  shared by walks, GETs, SETs and the probe. The estimates below decide what is
+  worth sending; the gate guarantees the ceiling whatever is sent.
 - **Averaged vs burst.** Averaged over the refresh interval (default 300s) almost
   anything is cheap. The constraint is the **burst**: a load fires all its PDUs in a
   ~1–2s window, and that spike is what approaches the budget. Estimate a load as
@@ -527,6 +531,11 @@ on the periodic timer is a cost decision, not just a correctness one.
   its Refresh and after its own writes, and never added to the always-on walk. Do not "make it load like the other
   modules" if that puts a heavy burst on every refresh for data the user may not be
   viewing.
+- **Per-port tables are `perPort`, settings are `settings`** (SERVER-STANDARD
+  §1a). A table with one row per port is marked `perPort` so it is fetched for
+  the interfaces that exist, not walked across the whole ifIndex space; a table
+  of configuration is marked `settings` so the collector carries it between
+  reads. Named columns are always walked together.
 - **Large tables are `onDemand`.** A big table (the full route table, a per-port walk
   a panel rarely needs) is marked `onDemand` in `health.js` and loaded once per visit
   (§B4), not on every periodic walk — the same budget discipline inside a keyed panel.

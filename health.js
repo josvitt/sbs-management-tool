@@ -89,6 +89,20 @@ const STP_SCALARS = [
  * Tables small enough that the request count would dominate are left
  * whole; a five-row table is not worth four walks.
  */
+/*
+ * Two markers decide how a table is read (SERVER-STANDARD §1a):
+ *
+ *  perPort: 'ifIndex' | 'bridgePort' -- the table has one row per port, and
+ *    the switch answers for every slot of its ifIndex space (424 rows on a
+ *    24-port C1300, against 40 interfaces that exist). Rather than walk them
+ *    all and throw the empty slots away, the rows of the interfaces that
+ *    rlifPresentTable lists are fetched by GET. 'bridgePort' tables are indexed
+ *    by bridge port, which dot1dBasePortTable maps to the ifIndex.
+ *  settings: true -- configuration that only changes when someone changes it.
+ *    The collector carries the last copy forward between full reads (`reuse`)
+ *    and re-reads it after a config change, a reboot, an app write, a manual
+ *    Refresh, or an hour.
+ */
 const TABLE_WALKS = {
   // Keys must match the property names buildAlerts()/summarise() read.
   psus:       { oid: 'rlEnvMonSupplyStatusTable' },
@@ -108,20 +122,20 @@ const TABLE_WALKS = {
   // Switchport mode per port, from vlanPortModeState (CISCOSB vlanPortModeTable),
   // indexed by ifIndex. Confirmed on this switch against the CLI: value 11 is
   // access, 12 is trunk. Other values are shown raw rather than mislabeled.
-  portModes:  { oid: 'vlanPortModeTable', maxRows: 1000, columns: ['vlanPortModeState'] },
+  portModes:  { perPort: 'ifIndex', oid: 'vlanPortModeTable', maxRows: 1000, columns: ['vlanPortModeState'] },
   // Per-port configured access VLAN and trunk native VLAN. These reflect the
   // port's CONFIGURED membership even when the port is down (the static egress
   // tables only show applied membership once the port is up), so they are the
   // authoritative source for what VLAN a switchport is set to.
-  portAccessVlan: { oid: 'vlanAccessPortModeTable', maxRows: 1000, columns: ['vlanAccessPortModeVlanId'] },
-  portNativeVlan: { oid: 'vlanTrunkPortModeTable', maxRows: 1000, columns: ['vlanTrunkPortModeNativeVlanId'] },
+  portAccessVlan: { perPort: 'ifIndex', oid: 'vlanAccessPortModeTable', maxRows: 1000, columns: ['vlanAccessPortModeVlanId'] },
+  portNativeVlan: { perPort: 'ifIndex', oid: 'vlanTrunkPortModeTable', maxRows: 1000, columns: ['vlanTrunkPortModeNativeVlanId'] },
   // Whether each port is an L2 switchport or an L3 routed port, from the CISCOSB
   // vlanSwitchPortModeTable (vlanSwitchPortModeCategory), indexed by ifIndex.
   // Enum: 1 = l2 (switchport), 2 = l3 (no switchport / routed).
-  portL2L3:   { oid: 'vlanSwitchPortModeTable', maxRows: 1000, columns: ['vlanSwitchPortModeCategory'] },
+  portL2L3:   { perPort: 'ifIndex', oid: 'vlanSwitchPortModeTable', maxRows: 1000, columns: ['vlanSwitchPortModeCategory'] },
 
   // Equivalents for data that used to come only from a capture:
-  inventory:  { oid: 'entPhysicalTable', maxRows: 2000, columns: [
+  inventory:  { settings: true, oid: 'entPhysicalTable', maxRows: 2000, columns: [
     'entPhysicalDescr', 'entPhysicalClass', 'entPhysicalName', 'entPhysicalHardwareRev',
     'entPhysicalSoftwareRev', 'entPhysicalSerialNum', 'entPhysicalModelName'] },
   vlans:      { oid: 'dot1qVlanStaticTable', maxRows: 4096, columns: [
@@ -129,7 +143,7 @@ const TABLE_WALKS = {
   // Voice VLAN Telephony OUI table (editable): index is the 3-byte OUI prefix;
   // Description is the only readable value (RowStatus too). The prefix is read
   // from the row index.
-  voiceOUI:   { oid: 'vlanVoiceOUIBasedTable', maxRows: 128, columns: [
+  voiceOUI:   { settings: true, oid: 'vlanVoiceOUIBasedTable', maxRows: 128, columns: [
     'vlanVoiceOUIBasedDescription', 'vlanVoiceOUIBasedEntryRowStatus'] },
   // Voice VLAN local source (UC Device) table - read-only display. Index is a
   // row id; all fields are readable columns.
@@ -166,12 +180,12 @@ const TABLE_WALKS = {
     'ipCidrRouteIfIndex', 'ipCidrRouteType', 'ipCidrRouteProto', 'ipCidrRouteStatus'] },
   // User-configured static routes (the editable set). IPv4, plain IpAddress
   // indices - simpler than the inet-typed table and right for this model.
-  staticRoutes: { oid: 'rlIpStaticRouteTable', maxRows: 1000, columns: [
+  staticRoutes: { settings: true, oid: 'rlIpStaticRouteTable', maxRows: 1000, columns: [
     'rlIpStaticRouteDest', 'rlIpStaticRouteMask', 'rlIpStaticRouteNextHop',
     'rlIpStaticRouteType', 'rlIpStaticRouteMetric', 'rlIpStaticRouteOwner',
     'rlIpStaticRouteForwardingStatus'] },
   // DNS domain / search-suffix list.
-  dnsDomains: { oid: 'rlDnsClDomainNameTable', maxRows: 64, columns: [
+  dnsDomains: { settings: true, oid: 'rlDnsClDomainNameTable', maxRows: 64, columns: [
     'rlDnsClDomainNameOwner'] },
   // Configured nameservers. The Cisco rlDnsResConfigSbeltInetTable is the
   // writable one on this model (the standard MIB-II sbelt is read-only), and we
@@ -181,7 +195,7 @@ const TABLE_WALKS = {
   // (the sbelt table rejects every delete). Everything about a server lives in
   // the row index (address, source, preference, class are all index columns);
   // only RowStatus is a readable value, so the row is driven entirely off index.
-  dnsServersV2: { oid: 'rlDnsClv2ServersTable', maxRows: 64, columns: [
+  dnsServersV2: { settings: true, oid: 'rlDnsClv2ServersTable', maxRows: 64, columns: [
     'rlDnsClv2ServersRowStatus'] },
   // Nameservers come from the DNS-client-v2 servers table (dnsServersV2, 93.15),
   // the table the CLI "ip name-server" uses. The old sbelt tables
@@ -190,7 +204,7 @@ const TABLE_WALKS = {
   // were removed from the walk once the panel moved to v2 - the add path still
   // writes 93.9 (it propagates into v2), but nothing reads the sbelt tables.
   // Static host-name -> IP mappings (the switch's local hosts file).
-  dnsHosts: { oid: 'rlDnsClNamesTable', maxRows: 256, columns: [
+  dnsHosts: { settings: true, oid: 'rlDnsClNamesTable', maxRows: 256, columns: [
     'rlDnsClNamesIndex', 'rlDnsClNamesAddr'] },
   // QoS ACL panel (rlQosAcl 88.7 / 88.31 / 88.5). These three tables are joined
   // client-side (ACL header -> ACEs -> tuple values via pointer indirection), so
@@ -200,7 +214,7 @@ const TABLE_WALKS = {
   aclNames:  { raw: true, onDemand: true, maxRows: 2000, oid: '1.3.6.1.4.1.9.6.1.101.88.7.1' },     // name(.2)+type(.3)
   aclAces:   { raw: true, onDemand: true, maxRows: 4000, oid: '1.3.6.1.4.1.9.6.1.101.88.31' },      // ACE table (action/type/tuple ptrs)
   aclTuples: { raw: true, onDemand: true, maxRows: 4000, oid: '1.3.6.1.4.1.9.6.1.101.88.5' },       // tuple values
-  bridgePorts: { oid: 'dot1dBasePortTable', maxRows: 1000, columns: ['dot1dBasePortIfIndex'] },
+  bridgePorts: { perPort: 'ifIndex', oid: 'dot1dBasePortTable', maxRows: 1000, columns: ['dot1dBasePortIfIndex'] },
   // The operational VLAN table. Switches populate this even when the
   // static table is sparse, which is why membership has to come from here
   // and only the names from the static one.
@@ -219,11 +233,11 @@ const TABLE_WALKS = {
   // Per-port 802.1X configuration: port-control mode (force-unauth/auto/
   // force-auth) and the current authorized/unauthorized status, plus the
   // host-mode (single / multiple / multiple-auth) from the interface table.
-  dot1xPortCfg: { oid: 'dot1xAuthConfigTable', maxRows: 1000, columns: [
+  dot1xPortCfg: { perPort: 'ifIndex', oid: 'dot1xAuthConfigTable', maxRows: 1000, columns: [
     'dot1xAuthAuthControlledPortControl', 'dot1xAuthAuthControlledPortStatus'] },
   // Per-port authentication method (802.1X / MAC(MAB) / Web combinations), the
   // per-port MAB enable, shown and editable in the interface 802.1X section.
-  dot1xPortMethod: { oid: 'rldot1xAuthenticationPortTable', maxRows: 1000, columns: [
+  dot1xPortMethod: { perPort: 'ifIndex', oid: 'rldot1xAuthenticationPortTable', maxRows: 1000, columns: [
     'rldot1xAuthenticationPortMethod'] },
   // swIfTable host-mode only (shown in the main table's 802.1X column). The
   // editable physical settings (speed, duplex, auto-neg, flow, MDIX) and the
@@ -231,18 +245,18 @@ const TABLE_WALKS = {
   // so they are fetched on demand for that one port when it is opened. Keeping
   // them out of the regular poll avoids walking swIfTable/ifXTable on every
   // interface refresh, which was loading the CPU.
-  dot1xHostMode: { oid: 'swIfTable', maxRows: 1000, columns: ['swIfHostMode'] },
+  dot1xHostMode: { perPort: 'ifIndex', oid: 'swIfTable', maxRows: 1000, columns: ['swIfHostMode'] },
   // Port channels (LAGs). The creation table lists every aggregator slot the
   // switch supports (static/LACP flags); the standard dot3ad tables give the
   // key, aggregating status, system id, and the member-port bitmap. Member
   // assignment is per physical port's actor admin key.
-  lagCreation: { oid: 'rlDot3adAggCreationTable', maxRows: 128, columns: [
+  lagCreation: { settings: true, oid: 'rlDot3adAggCreationTable', maxRows: 128, columns: [
     'rlDot3adAggCreationTrunk', 'rlDot3adAggCreationLacp'] },
   lagAgg: { oid: 'dot3adAggTable', maxRows: 128, columns: [
     'dot3adAggActorAdminKey', 'dot3adAggActorOperKey', 'dot3adAggAggregateOrIndividual',
     'dot3adAggActorSystemID'] },
   lagMembers: { oid: 'dot3adAggPortListTable', maxRows: 128, columns: ['dot3adAggPortListPorts'] },
-  lagPortKey: { oid: 'dot3adAggPortTable', maxRows: 1000, columns: [
+  lagPortKey: { perPort: 'ifIndex', oid: 'dot3adAggPortTable', maxRows: 1000, columns: [
     'dot3adAggPortActorAdminKey', 'dot3adAggPortSelectedAggID', 'dot3adAggPortAttachedAggID',
     'dot3adAggPortActorAdminState'] },
   // Curated per-host (port+MAC) 802.1X counters: EAPOL frame totals, the key
@@ -266,7 +280,7 @@ const TABLE_WALKS = {
   // AAA servers (RADIUS + TACACS+): configured servers, their live state, and
   // the standard RFC 4668 RADIUS client statistics. Small tables, collected
   // with the auth data since that is where they are shown.
-  radiusServers: { oid: 'rlRadiusServerInetTable', maxRows: 64, columns: [
+  radiusServers: { settings: true, oid: 'rlRadiusServerInetTable', maxRows: 64, columns: [
     'rlRadiusServerInetAddress', 'rlRadiusServerInetAuthPortNumber', 'rlRadiusServerInetAcctPortNumber',
     'rlRadiusServerInetTimeout', 'rlRadiusServerInetRetries', 'rlRadiusServerInetDeadtime',
     'rlRadiusServerInetPriority', 'rlRadiusServerInetUsage', 'rlRadiusServerInetUseGlobalDefaultKey',
@@ -277,15 +291,15 @@ const TABLE_WALKS = {
     'radiusAuthClientAccessRejects', 'radiusAuthClientAccessChallenges', 'radiusAuthClientMalformedAccessResponses',
     'radiusAuthClientBadAuthenticators', 'radiusAuthClientPendingRequests', 'radiusAuthClientTimeouts',
     'radiusAuthClientUnknownTypes', 'radiusAuthClientPacketsDropped'] },
-  tacacsServers: { oid: 'rlTacacsServerInetTable', maxRows: 64, columns: [
+  tacacsServers: { settings: true, oid: 'rlTacacsServerInetTable', maxRows: 64, columns: [
     'rlTacacsServerInetAddress', 'rlTacacsServerInetPortNumber', 'rlTacacsServerInetConnectionType',
     'rlTacacsServerInetConnectionStatus', 'rlTacacsServerInetTimeout', 'rlTacacsServerInetPriority',
     'rlTacacsServerInetUseGlobalDefaultKey', 'rlTacacsServerInetKey'] },
-  stpPorts: { oid: 'dot1dStpPortTable', maxRows: 1000, columns: [
+  stpPorts: { perPort: 'bridgePort', oid: 'dot1dStpPortTable', maxRows: 1000, columns: [
     'dot1dStpPortState', 'dot1dStpPortEnable', 'dot1dStpPortPathCost', 'dot1dStpPortPriority',
     'dot1dStpPortDesignatedBridge', 'dot1dStpPortDesignatedPort',
     'dot1dStpPortForwardTransitions'] },
-  stpExtPorts: { oid: 'dot1dStpExtPortTable', maxRows: 1000, columns: [
+  stpExtPorts: { perPort: 'bridgePort', oid: 'dot1dStpExtPortTable', maxRows: 1000, columns: [
     'dot1dStpPortOperEdgePort', 'dot1dStpPortOperPointToPoint'] },
   // Always walked, and small: one row per VLAN or per MST instance. These
   // are what actually decide which spanning-tree family is running --
@@ -293,6 +307,9 @@ const TABLE_WALKS = {
   pvstVlans: { oid: 'rlBrgPvstOperVlanTable', maxRows: 4096 },
   mstpInstances: { oid: 'rldot1sMstpInstanceTable', maxRows: 200 }
 };
+
+// The tables the collector may carry between full reads (see `settings`).
+const SETTINGS_TABLES = Object.keys(TABLE_WALKS).filter((k) => TABLE_WALKS[k].settings);
 
 // Walked only when the switch is running the matching mode: under MSTP the
 // PVST tables are empty and vice versa, so walking both wastes round trips.
@@ -1237,7 +1254,7 @@ const DECORATION_DEPS = {
  * A partial collection skips the scalars and the findings, because both
  * describe the whole switch and would be wrong if derived from a slice.
  */
-async function collect({ get, walk, only, previous }) {
+async function collect({ get, walk, only, previous, reuse }) {
   const health = {
     collectedAt: new Date().toISOString(),
     scalars: {},
@@ -1281,16 +1298,71 @@ async function collect({ get, walk, only, previous }) {
       return out;
     }
     if (!spec.columns || !spec.columns.length) return pivot(await walk(spec.oid, spec));
-    const results = [];
-    for (const column of spec.columns) {
-      try {
-        for (const r of await walk(column, spec)) results.push(r);
-      } catch (e) {
-        // A column this model does not implement is not a failed table.
-      }
+    // The named columns are walked together (one GETBULK stream carries them
+    // all); a column this model does not implement simply ends at once.
+    try {
+      return pivot(await walk(spec.columns, spec));
+    } catch (e) {
+      // No column answered: not a failed table, as before.
+      return [];
     }
-    return pivot(results);
   };
+
+  /**
+   * Fetch a per-port table's named columns for exactly these ports, by GET,
+   * in batches of GET_BATCH. Ports the switch does not know come back as
+   * noSuchInstance and are dropped by pivot. If nothing at all answers (the
+   * table is indexed some other way on this model, or not there), fall back
+   * to walking it, so a model that differs only costs the old walk.
+   */
+  const fetchPorts = async (spec, ports) => {
+    if (!ports || !ports.length || !spec.columns || !spec.columns.length) return fetchTable(spec);
+    const oids = [];
+    for (const column of spec.columns) for (const port of ports) oids.push(column + '.' + port);
+    const results = [];
+    for (let i = 0; i < oids.length; i += GET_BATCH) {
+      try {
+        for (const r of await get(oids.slice(i, i + GET_BATCH))) results.push(r);
+      } catch (e) { /* one lost batch must not lose the rest */ }
+    }
+    const rows = pivot(results);
+    return rows.length ? rows : fetchTable(spec);
+  };
+
+  // Bridge ports for the given interfaces. On these switches the bridge port
+  // number IS the ifIndex, so dot1dBasePortIfIndex.<ifIndex> is read for each
+  // interface and kept when it maps back to itself. If any answer maps
+  // elsewhere, or none answers, the whole table is walked (the old way) and
+  // its mapping is used instead. Returns the bridge ports whose interface
+  // exists; sets health.bridgePorts.
+  const resolveBridgePorts = async (present) => {
+    const spec = TABLE_WALKS.bridgePorts;
+    let rows = await fetchPorts(spec, present);
+    const identity = rows.length > 0 &&
+      rows.every((r) => String(val(r, 'dot1dBasePortIfIndex')) === String(r.index));
+    if (!identity) rows = await fetchTable(spec);
+    health.bridgePorts = rows;
+    const exists = new Set(present.map(String));
+    return rows.filter((r) => exists.has(String(val(r, 'dot1dBasePortIfIndex')))).map((r) => String(r.index));
+  };
+
+  // One table, by the cheapest read that gives the same rows.
+  const carried = [];
+  let present = [];        // ifIndexes of the interfaces that exist
+  let bridgeList = null;   // bridge ports of those interfaces, once resolved
+  const readTable = async (key, spec) => {
+    if (spec.settings && reuse && Array.isArray(reuse[key])) {
+      carried.push(key);
+      return reuse[key];
+    }
+    if (spec.perPort === 'ifIndex' && present.length) return fetchPorts(spec, present);
+    if (spec.perPort === 'bridgePort' && present.length) {
+      if (!bridgeList) bridgeList = await resolveBridgePorts(present);
+      if (bridgeList.length) return fetchPorts(spec, bridgeList);
+    }
+    return fetchTable(spec);
+  };
+  const indexesOf = (rows) => (rows || []).map((r) => String(r.index)).filter((i) => i !== '');
 
   const partial = Array.isArray(only) && only.length > 0;
   if (partial) {
@@ -1301,14 +1373,34 @@ async function collect({ get, walk, only, previous }) {
     // panel asks for them by name.
     const catalogue = Object.assign({}, TABLE_WALKS, MODE_WALKS.mstp, MODE_WALKS.pvst);
     const jobs = Object.entries(catalogue).filter(([key]) => wanted.has(key));
+    // The interfaces that exist decide which rows a per-port table needs:
+    // from this refresh when it reads interfaces (read first), otherwise from
+    // the last full collection, otherwise one cheap column walk for the list.
+    const needsPorts = jobs.some(([, spec]) => spec.perPort);
+    if (needsPorts) {
+      if (wanted.has('interfaces')) {
+        try { health.interfaces = await fetchTable(TABLE_WALKS.interfaces); }
+        catch (e) { health.failed.push({ what: TABLE_WALKS.interfaces.oid, error: e.message }); }
+        present = indexesOf(health.interfaces);
+      } else if (previous && Array.isArray(previous.interfaces) && previous.interfaces.length) {
+        present = indexesOf(previous.interfaces);
+      } else {
+        try { present = indexesOf(await walk('rlifPresentName', { maxRows: 1000 })); } catch (e) { present = []; }
+      }
+    }
+    if (needsPorts && wanted.has('bridgePorts') && present.length) {
+      try { bridgeList = await resolveBridgePorts(present); } catch (e) { bridgeList = null; }
+    }
     for (const [key, spec] of jobs) {
+      if (needsPorts && key === 'interfaces') continue;                    // read above
+      if (key === 'bridgePorts' && bridgeList) continue;                   // read above
       try {
         // Use fetchTable so column-specified tables walk only their named
         // columns. Walking the whole table OID with a row cap (the old
         // behaviour) could stop before reaching a later column - e.g. the
         // dot1x port-control/status columns (.5/.6) were never reached on a
         // targeted refresh, so they vanished from the panel after a write.
-        health[key] = await fetchTable(spec);
+        health[key] = await readTable(key, spec);
       } catch (e) {
         health.failed.push({ what: spec.oid, error: e.message });
         health[key] = [];
@@ -1452,13 +1544,25 @@ async function collect({ get, walk, only, previous }) {
   // large and only needed when a specific panel is open, so they are fetched by
   // that panel's targeted refresh instead. This keeps the big MAC forwarding
   // table (dot1qTpFdbTable, up to ~1500 rows) off the regular poll.
-  const jobs = Object.entries(TABLE_WALKS).filter(([, spec]) => !spec.onDemand);
+  //
+  // Interfaces are read first: the list of interfaces that exist is what lets
+  // every per-port table be fetched for those ports alone (readTable), and the
+  // bridge-port mapping is settled once before the spanning-tree tables need it.
+  try { health.interfaces = await fetchTable(TABLE_WALKS.interfaces); }
+  catch (e) { health.failed.push({ what: TABLE_WALKS.interfaces.oid, error: e.message }); health.interfaces = []; }
+  present = indexesOf(health.interfaces);
+  if (present.length) {
+    try { bridgeList = await resolveBridgePorts(present); }
+    catch (e) { health.failed.push({ what: TABLE_WALKS.bridgePorts.oid, error: e.message }); bridgeList = []; }
+  }
+  const jobs = Object.entries(TABLE_WALKS).filter(([key, spec]) => !spec.onDemand &&
+    key !== 'interfaces' && !(key === 'bridgePorts' && bridgeList));
   let next = 0;
   const worker = async () => {
     while (next < jobs.length) {
       const [key, spec] = jobs[next++];
       try {
-        health[key] = await fetchTable(spec);
+        health[key] = await readTable(key, spec);
       } catch (e) {
         // A table this model does not implement is not fatal: record it
         // and let the panel stay hidden.
@@ -1626,6 +1730,9 @@ async function collect({ get, walk, only, previous }) {
     return out;
   });
 
+  // Settings tables carried from the previous collection rather than re-read.
+  if (carried.length) health.carried = carried;
+
   health.alerts = buildAlerts(health);
   health.summary = summarise(health);
   // Working state, not payload: a Map serialises to an empty object and
@@ -1774,6 +1881,6 @@ function summarise(h) {
 }
 
 module.exports = {
-  collect, SYSTEM_OIDS, HEALTH_SCALARS, TABLE_WALKS, THRESHOLDS, DECORATION_DEPS,
+  collect, SYSTEM_OIDS, HEALTH_SCALARS, TABLE_WALKS, THRESHOLDS, DECORATION_DEPS, SETTINGS_TABLES,
   MODEL_POE, MIN_REAL_PSE_WATTS, detectModel, buildAlerts
 };

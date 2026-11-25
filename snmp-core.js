@@ -41,7 +41,60 @@ function v3SecurityOf(v3) {
   return { authName, privName, level: v3crypto.securityLevelFor(authName, privName) };
 }
 
+// ---------------------------------------------------------------
+// Per-switch request limiter (MODULE-STANDARD §B5a)
+// ---------------------------------------------------------------
+// The ~100 pps budget is a property of the SWITCH, not of one walk: two walks,
+// a panel load and the 30 s probe all land on the same CPU. The old guard was
+// a pace *between* the requests of one walk, so the first request of every
+// walk (every column is a walk) went out at once and a run of small tables
+// burst well past the budget. Every session built here now sends through one
+// spacing gate per host:port, shared by every session to that switch, so no
+// mix of walks, GETs and SETs can exceed SNMP_MAX_RPS requests a second.
+const MAX_REQUESTS_PER_SEC = Number(process.env.SNMP_MAX_RPS) || 100;
+const nextSendAt = new Map();          // host:port -> earliest time the next request may go
+const writeListeners = [];             // fn(host), told after every successful SET
+
+// Register a listener for successful SNMP writes. The collector uses it to
+// re-read its settings tables after the app changes the switch.
+function onSwitchWrite(fn) { if (typeof fn === 'function') writeListeners.push(fn); }
+
+function limitRequests(session, host, port) {
+  const key = host + ':' + (port || 161);
+  const gap = 1000 / MAX_REQUESTS_PER_SEC;
+  for (const method of ['get', 'getNext', 'getBulk', 'set']) {
+    const original = session[method];
+    if (typeof original !== 'function') continue;
+    session[method] = function limited(...args) {
+      const last = args.length - 1;
+      if (method === 'set' && typeof args[last] === 'function') {
+        const cb = args[last];
+        args[last] = (error, varbinds) => {
+          if (!error) for (const fn of writeListeners) { try { fn(host); } catch (e) { /* a listener never breaks a write */ } }
+          cb(error, varbinds);
+        };
+      }
+      const now = Date.now();
+      const at = Math.max(now, nextSendAt.get(key) || 0);
+      nextSendAt.set(key, at + gap);
+      const send = () => {
+        try { original.apply(session, args); } catch (e) {
+          // A session closed while this request waited its turn: answer the
+          // caller rather than leaving its callback pending.
+          if (typeof args[last] === 'function') args[last](e);
+        }
+      };
+      if (at <= now) send(); else setTimeout(send, at - now);
+    };
+  }
+  return session;
+}
+
 function buildSnmpSession(target) {
+  return limitRequests(buildRawSession(target), target.host, target.port);
+}
+
+function buildRawSession(target) {
   const { host, port, version, community, v3 } = target;
   const commonOptions = {
     port: port || 161,
@@ -139,7 +192,10 @@ const WALK_DEFAULTS = {
   // hangs its HTTP request and, in the collector, leaves that switch marked
   // in-flight so it is never polled again until a restart. It bounds ONE
   // request, not the whole walk, so a long legitimate walk is unaffected.
-  stepWatchdogMs: Number(process.env.SNMP_STEP_WATCHDOG_MS) || 12000
+  stepWatchdogMs: Number(process.env.SNMP_STEP_WATCHDOG_MS) || 12000,
+  // Varbinds asked for per GETBULK when several columns are walked together
+  // (shared by the open columns). A reply the switch says is too big halves it.
+  maxVarbinds: Number(process.env.SNMP_BULK_VARBINDS) || 40
 };
 
 function isWithinSubtree(base, oid) {
@@ -164,14 +220,31 @@ function oidCompare(a, b) {
 // ({ oid, value, type }) for callers that decode values themselves
 // (snmp-config) and skips per-varbind errors; otherwise rows are described
 // for the UI. onDone fires exactly once.
+//
+// `baseOid` may be an ARRAY of column OIDs. Over GETBULK they are then walked
+// together: each request carries every column still open, so a seven-column
+// table costs one stream of requests instead of seven. The subtree boundary is
+// enforced per column exactly as for one OID (a column stops at the first
+// varbind outside its own subtree), maxRows applies per column, and results
+// come back column after column, the order separate walks gave. A column that
+// ends drops out of the next request. If the switch rejects a combined request
+// (an error status, not a timeout), the open columns are walked one at a time
+// from the start so one awkward column cannot hide the others. Without GETBULK
+// (SNMPv1 or 'next' mode) the columns are walked one after another.
 function boundedWalk(session, baseOid, options, onDone) {
   const opts = Object.assign({}, WALK_DEFAULTS, options || {});
   const useBulk = opts.mode !== 'next' && session.version !== snmp.Version1;
+  if (Array.isArray(baseOid)) {
+    if (baseOid.length === 1) return boundedWalk(session, baseOid[0], options, onDone);
+    if (!useBulk) return walkColumnsInTurn(session, baseOid, options, onDone);
+    return walkColumnsTogether(session, baseOid, opts, options, onDone);
+  }
   const results = [];
   let current = baseOid;
   let truncated = null;
   let done = false;
   let watchdog = null;
+  let reps = opts.maxRepetitions;
 
   function finish(error) {
     if (done) return;
@@ -183,60 +256,34 @@ function boundedWalk(session, baseOid, options, onDone) {
   function handle(error, varbinds) {
     if (done) return;               // the watchdog already ended this walk
     clearTimeout(watchdog);
-    if (error) return finish(error);
-
-    for (const vb of varbinds) {
-      // endOfMibView / noSuchObject terminate the walk cleanly.
-      if (vb.type === snmp.ObjectType.EndOfMibView ||
-          vb.type === snmp.ObjectType.NoSuchObject ||
-          vb.type === snmp.ObjectType.NoSuchInstance) {
-        return finish(null);
-      }
-      // The boundary check: anything outside the requested subtree is an
-      // over-fetch, not a result. Drop it and stop.
-      if (!isWithinSubtree(baseOid, vb.oid)) {
-        return finish(null);
-      }
-      if (oidCompare(vb.oid, current) <= 0) {
-        // Agent did not advance -- bail out instead of looping forever.
-        return finish(null);
-      }
-      if (vb.oid.split('.').length > opts.maxOidLength) {
-        truncated = 'Stopped: OID depth exceeded the safety limit.';
-        return finish(null);
-      }
-
-      if (opts.raw) {
-        if (!snmp.isVarbindError(vb)) results.push({ oid: vb.oid, value: vb.value, type: vb.type });
-      } else if (snmp.isVarbindError(vb)) {
-        results.push(annotate({ oid: vb.oid, error: snmp.varbindError(vb) }));
-      } else {
-        results.push(describeVarbind(vb));
-      }
-      current = vb.oid;
-
-      if (results.length >= opts.maxRows) {
-        truncated = `Stopped after ${opts.maxRows} rows.`;
-        return finish(null);
-      }
+    if (error) {
+      // A reply too big for the switch: ask for fewer rows and try again.
+      if (isTooBig(error) && reps > 1) { reps = Math.max(1, Math.floor(reps / 2)); return later(step); }
+      return finish(error);
     }
 
-    // Pace the next request so the walk is gentle on the switch CPU rather than
-    // a burst. A zero/negative paceMs fires immediately (old behaviour).
-    if (opts.paceMs > 0) setTimeout(step, opts.paceMs);
-    else step();
+    for (const vb of varbinds) {
+      const stop = takeVarbind(vb, baseOid, current, opts, results);
+      if (stop === 'next') { current = vb.oid; continue; }
+      if (stop === 'truncated') truncated = rowsTruncated(opts, vb);
+      return finish(null);
+    }
+
+    later(step);
+  }
+
+  // Pace the next request so the walk is gentle on the switch CPU rather than
+  // a burst. A zero/negative paceMs fires immediately (old behaviour).
+  function later(fn) {
+    if (opts.paceMs > 0) setTimeout(fn, opts.paceMs);
+    else fn();
   }
 
   function step() {
     if (done) return;
-    if (opts.stepWatchdogMs > 0) {
-      watchdog = setTimeout(() => {
-        log.error('snmp', 'Walk request got no SNMP reply; ending the walk', { oid: current, rows: results.length });
-        finish(new Error('The switch did not reply in time.'));
-      }, opts.stepWatchdogMs);
-    }
+    armWatchdog();
     if (useBulk) {
-      session.getBulk([current], 0, opts.maxRepetitions, (error, varbinds) => {
+      session.getBulk([current], 0, reps, (error, varbinds) => {
         // getBulk hands back an array of arrays for the repeater.
         if (error) return handle(error);
         const flat = Array.isArray(varbinds[0]) ? varbinds[0] : varbinds;
@@ -245,6 +292,143 @@ function boundedWalk(session, baseOid, options, onDone) {
     } else {
       session.getNext([current], handle);
     }
+  }
+
+  function armWatchdog() {
+    if (opts.stepWatchdogMs > 0) {
+      watchdog = setTimeout(() => {
+        log.error('snmp', 'Walk request got no SNMP reply; ending the walk', { oid: current, rows: results.length });
+        finish(new Error('The switch did not reply in time.'));
+      }, opts.stepWatchdogMs);
+    }
+  }
+
+  step();
+}
+
+const TOO_BIG = 1;   // SNMP error-status tooBig
+function isTooBig(error) { return !!error && error.status === TOO_BIG; }
+
+function rowsTruncated(opts) {
+  return opts._truncatedBy === 'depth' ? 'Stopped: OID depth exceeded the safety limit.' : `Stopped after ${opts.maxRows} rows.`;
+}
+
+// Apply the walk's rules to one varbind of one column. Returns 'next' when the
+// row was kept and the column goes on, 'end' when the column has finished
+// cleanly, 'truncated' when a safety limit stopped it.
+function takeVarbind(vb, base, current, opts, results) {
+  // endOfMibView / noSuchObject terminate the walk cleanly.
+  if (vb.type === snmp.ObjectType.EndOfMibView ||
+      vb.type === snmp.ObjectType.NoSuchObject ||
+      vb.type === snmp.ObjectType.NoSuchInstance) return 'end';
+  // The boundary check: anything outside the requested subtree is an
+  // over-fetch, not a result. Drop it and stop.
+  if (!isWithinSubtree(base, vb.oid)) return 'end';
+  // Agent did not advance -- bail out instead of looping forever.
+  if (oidCompare(vb.oid, current) <= 0) return 'end';
+  if (vb.oid.split('.').length > opts.maxOidLength) { opts._truncatedBy = 'depth'; return 'truncated'; }
+
+  if (opts.raw) {
+    if (!snmp.isVarbindError(vb)) results.push({ oid: vb.oid, value: vb.value, type: vb.type });
+  } else if (snmp.isVarbindError(vb)) {
+    results.push(annotate({ oid: vb.oid, error: snmp.varbindError(vb) }));
+  } else {
+    results.push(describeVarbind(vb));
+  }
+  if (results.length >= opts.maxRows) return 'truncated';
+  return 'next';
+}
+
+// Columns one after another (no GETBULK). A column that fails is skipped, as
+// separate walks always were; the walk errors only if every column did.
+function walkColumnsInTurn(session, bases, options, onDone) {
+  const all = [];
+  let truncated = null;
+  let lastError = null;
+  let any = false;
+  let i = 0;
+  const nextColumn = () => {
+    if (i >= bases.length) return onDone(any || !lastError ? null : lastError, all, truncated);
+    boundedWalk(session, bases[i++], options, (error, rows, trunc) => {
+      if (error && !rows.length) lastError = error; else any = true;
+      for (const r of rows) all.push(r);
+      if (trunc) truncated = trunc;
+      nextColumn();
+    });
+  };
+  nextColumn();
+}
+
+function walkColumnsTogether(session, bases, opts, options, onDone) {
+  const cols = bases.map((base) => ({ base, current: base, rows: [], open: true }));
+  let budget = opts.maxVarbinds;   // varbinds per reply, shared by the open columns
+  let truncated = null;
+  let done = false;
+  let watchdog = null;
+
+  const gather = () => [].concat(...cols.map((c) => c.rows));
+  function finish(error) {
+    if (done) return;
+    done = true;
+    clearTimeout(watchdog);
+    onDone(error || null, gather(), truncated);
+  }
+
+  function later(fn) {
+    if (opts.paceMs > 0) setTimeout(fn, opts.paceMs);
+    else fn();
+  }
+
+  function step() {
+    if (done) return;
+    const open = cols.filter((c) => c.open);
+    if (!open.length) return finish(null);
+    const reps = Math.max(1, Math.floor(budget / open.length));
+    if (opts.stepWatchdogMs > 0) {
+      watchdog = setTimeout(() => {
+        log.error('snmp', 'Walk request got no SNMP reply; ending the walk', { oid: open[0].current, columns: open.length });
+        finish(new Error('The switch did not reply in time.'));
+      }, opts.stepWatchdogMs);
+    }
+    session.getBulk(open.map((c) => c.current), 0, reps, (error, varbinds) => {
+      if (done) return;
+      clearTimeout(watchdog);
+      if (error) {
+        if (isTooBig(error) && reps > 1) { budget = Math.max(open.length, Math.floor(budget / 2)); return later(step); }
+        // Timeouts end the walk; an error status from the switch falls back
+        // to one walk per remaining column, from the start of each.
+        if (error instanceof snmp.RequestFailedError) return fallBack(open);
+        return finish(error);
+      }
+      open.forEach((col, j) => {
+        const list = Array.isArray(varbinds[j]) ? varbinds[j] : [varbinds[j]];
+        for (const vb of list) {
+          if (!vb) break;
+          const res = takeVarbind(vb, col.base, col.current, opts, col.rows);
+          if (res === 'next') { col.current = vb.oid; continue; }
+          if (res === 'truncated') truncated = rowsTruncated(opts);
+          col.open = false;
+          break;
+        }
+      });
+      if (cols.some((c) => c.open)) later(step); else finish(null);
+    });
+  }
+
+  function fallBack(open) {
+    let i = 0;
+    const nextColumn = () => {
+      if (i >= open.length) return finish(null);
+      const col = open[i++];
+      col.rows.length = 0;
+      boundedWalk(session, col.base, options, (error, rows, trunc) => {
+        for (const r of rows) col.rows.push(r);
+        if (trunc) truncated = trunc;
+        col.open = false;
+        nextColumn();
+      });
+    };
+    nextColumn();
   }
 
   step();
@@ -537,6 +721,9 @@ module.exports = {
   copyFinishedWaiter,
   v3SecurityOf,
   buildSnmpSession,
+  limitRequests,
+  onSwitchWrite,
+  MAX_REQUESTS_PER_SEC,
   resolveOids,
   annotate,
   WALK_DEFAULTS,

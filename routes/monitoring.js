@@ -73,6 +73,14 @@ module.exports = function register(app) {
     if (!host) return res.status(400).json({ error: 'host is required.' });
     const snap = collector.snapshotByHost(host);
     if (!snap) return res.status(404).json({ error: 'No snapshot yet for ' + host });
+    // The browser says which collection it already shows (`have`, its
+    // collectedAt). The full collection changes every few minutes while the
+    // view re-reads every 30 s, so most reads find the same data: answer
+    // those with a few bytes and let the page skip the download and repaint.
+    const have = req.query.have;
+    if (have && !snap.error && snap.data && snap.data.collectedAt === have) {
+      return res.json({ unchanged: true, at: snap.at, collectedAt: have });
+    }
     res.json(publicSnapshot(snap));
   });
 

@@ -50,6 +50,40 @@ place and both callers inherit it.
 - `previous` (the per-switch `lastCollection` cache) turns error counters into
   rates; it is keyed by `host:port`.
 
+### 1a. How a table is read — the cheapest request that gives the same rows
+
+`health.collect` picks the read per table from two markers in `TABLE_WALKS`
+(health.js), and every choice falls back to the plain walk when the switch
+answers differently:
+
+- **Named columns are walked together.** `boundedWalk` (snmp-core) takes an
+  array of column OIDs and walks them in one GETBULK stream: each request
+  carries every column still open, the open columns share `maxVarbinds`
+  (default 40, `SNMP_BULK_VARBINDS`) and a tooBig reply halves it. The subtree
+  boundary, `maxRows` and the no-advance guard apply **per column**, exactly as
+  for one OID, and rows come back column after column. An error status on a
+  combined request re-walks the open columns one at a time; without GETBULK
+  (SNMPv1, `next` mode) the columns are walked in turn.
+- **`perPort: 'ifIndex' | 'bridgePort'` tables are fetched for the interfaces
+  that exist.** These tables answer for every slot of the ifIndex space (424
+  rows on a 24-port C1300 against 40 interfaces in rlifPresentTable; see the
+  live fixture). `interfaces` is read first; its indexes are GET for each
+  column in batches of `GET_BATCH`. Bridge-port tables use the bridge ports
+  whose `dot1dBasePortIfIndex` maps to an existing interface: the mapping is
+  read by GET on the ifIndexes (bridge port = ifIndex on these switches) and,
+  if any answer maps elsewhere or none answers, dot1dBasePortTable is walked
+  whole and its mapping used. A per-port table that answers no GET at all is
+  walked. A targeted refresh (`only`) takes the interface list from this
+  refresh when it reads `interfaces`, else from the last full collection
+  (`previous.interfaces`), else from one walk of `rlifPresentName`.
+- **`settings: true` tables are carried between full reads.** `collect({ reuse })`
+  takes the previous copy of these tables instead of reading them and lists
+  them in `data.carried`; `SETTINGS_TABLES` exports the list. The collector
+  decides when (§3).
+
+A new table states whichever marker fits; a per-port table that is not marked
+costs a walk of the whole ifIndex space every cycle.
+
 ## 2. The reachability probe — `probeSwitch` (collection.js)
 
 `probeSwitch(target)` is a single-PDU GET of sysUpTime, CPU, PoE, the
@@ -106,8 +140,19 @@ rescheduling.
 `GET /api/collector/snapshot` and summarised by `GET /api/collector/status`.
 This is what a browser reads instead of walking the switch itself (Stage 2).
 
+**Settings tables are carried (`deps.settingsTables`).** A full collection
+passes the last copy of the settings tables as `reuse` unless something may
+have changed them: a reboot, a saved/unsaved flag flip, a config trap
+(`flagConfigChange`), a successful SNMP write from the app
+(`flagSettingsChange`, wired from snmp-core's `onSwitchWrite`), a manual
+Refresh, or an age of `SETTINGS_MAX_AGE_MS` (default 1 hour). Each of those
+bumps a per-switch generation; a full read records the generation it started
+at, so a change during a collection is not lost.
+
 **Manual refresh = `nudge(target)`.** Polls one switch out of cycle and returns
-its fresh snapshot (`POST /api/collect/now`). The browser's "Refresh" nudges the
+its fresh snapshot (`POST /api/collect/now`). If a poll of that switch is
+already running, it waits for it: a full collection that lands is returned as
+is; after a probe-only tick it runs the full poll. The browser's "Refresh" nudges the
 server to poll now; it does not walk the switch directly — the single polling
 authority stays on the server.
 
@@ -116,7 +161,10 @@ authority stays on the server.
 The browser no longer walks the switch on a timer. The contract:
 
 - **Periodic refresh** (the auto countdown) calls `syncView(s)` → `GET
-  /api/collector/snapshot` and renders it. No switch contact. If the tab is
+  /api/collector/snapshot` and renders it. No switch contact. The page sends
+  the `collectedAt` it shows as `have`; when the server still holds that
+  collection it answers `{ unchanged: true, at }` and the page only updates
+  reachability and the metric graph, with no download or repaint. If the tab is
   backgrounded and its timer is throttled, only the VIEW lags; the server keeps
   collecting, so data integrity never depends on the browser.
 - **Manual Refresh** and **first open** call `syncView(s, { nudge: true })` →
@@ -138,9 +186,10 @@ to the server collector instead.
 
 ### 3a. The SNMP cost budget still governs (MODULE-STANDARD §B5a)
 
-Each switch still sees only its own full walk once per interval — the same
-traffic the periodic walk always was, so the per-switch ~100 pps budget is
-unchanged. The pacing gap paces the **server's fan-out** across switches, not
+Each switch still sees only its own full walk once per interval, and every
+request to it — walks, GETs, SETs, the probe, from any session — passes one
+per-switch spacing gate in `buildSnmpSession` (`SNMP_MAX_RPS`, default 100
+requests a second), so no mix of loads can exceed the ~100 pps budget. The pacing gap paces the **server's fan-out** across switches, not
 any one switch's load. `onDemand` modules (snmpcfg / flash / capture) are
 **never** collected by the loop — they stay lazy and browser-only, by the same
 rule. The collector reproduces exactly the scope of the old periodic walk
