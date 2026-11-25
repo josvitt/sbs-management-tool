@@ -13,7 +13,15 @@
  * thing it needs is write access to this folder, granted here before the
  * service first starts. SBS_SERVICE_ACCOUNT=LocalSystem keeps the old
  * account. node-windows creates services as LocalSystem, so the account is
- * changed with sc.exe after the install (UNTESTED on Windows so far).
+ * changed with sc.exe after the install.
+ *
+ * LocalService gets rights on this folder only, so the folder must not sit
+ * inside a user's profile (Desktop, Documents, Downloads): Node cannot start
+ * a script below a folder its account cannot read, and the service dies with
+ * "finished with 1" (service-location.js has the detail). The install stops
+ * before creating anything when it finds that, and says where to move to.
+ * After starting the service it checks the dashboard answers, and prints the
+ * service's own error log when it does not.
  *
  * Files stay in the install directory (__dirname): server.js, the vault key and
  * state.enc, history.json, and logs/. vault.js and the others are __dirname-
@@ -21,7 +29,31 @@
  */
 
 const path = require('path');
+const http = require('http');
 const { execFileSync } = require('child_process');
+const { userProfileFolder, daemonErrorTail } = require('./service-location');
+
+const PORT = process.env.PORT || '3000';
+const KEEP_LOCAL_SYSTEM = /^localsystem$/i.test(process.env.SBS_SERVICE_ACCOUNT || '');
+
+// Before anything is created: LocalService cannot run from inside a profile.
+const profile = KEEP_LOCAL_SYSTEM ? null : userProfileFolder(__dirname);
+if (profile) {
+  console.error('');
+  console.error('This folder is inside the user profile ' + profile + ':');
+  console.error('  ' + __dirname);
+  console.error('The service runs as the LocalService account, which cannot open that');
+  console.error('profile, so it would stop as soon as it started. Nothing was installed.');
+  console.error('');
+  console.error('Move the whole folder somewhere outside C:\\Users, for example');
+  console.error('  C:\\sbs-management-tool');
+  console.error('and run install-service.bat again from there. Your saved switches, key,');
+  console.error('history and logs move with the folder.');
+  console.error('If a service from this folder is already installed, run');
+  console.error('uninstall-service.bat here first.');
+  console.error('');
+  process.exit(1);
+}
 
 let Service;
 try {
@@ -45,7 +77,7 @@ const svc = new Service({
   // Windows has no privileged ports, so the receivers (traps 162, syslog
   // 514, TFTP 69) keep their defaults under either account.
   env: [
-    { name: 'PORT', value: process.env.PORT || '3000' }
+    { name: 'PORT', value: PORT }
   ]
 });
 
@@ -63,7 +95,7 @@ const SERVICE_NAME = svc.id + '.exe';
  * as, saying plainly if it could not be changed.
  */
 function useLocalService() {
-  if (/^localsystem$/i.test(process.env.SBS_SERVICE_ACCOUNT || '')) {
+  if (KEEP_LOCAL_SYSTEM) {
     console.log('SBS_SERVICE_ACCOUNT=LocalSystem: keeping the LocalSystem account.');
     return 'LocalSystem';
   }
@@ -85,14 +117,52 @@ svc.on('install', () => {
 });
 svc.on('alreadyinstalled', () => {
   console.log('The service is already installed. Use uninstall-service.bat first to reinstall.');
+  process.exitCode = 1;
 });
-svc.on('start', () => {
-  console.log('SBS Management Tool service is running.');
-  console.log('Open the dashboard at http://localhost:' + (process.env.PORT || '3000') + ' (or run open-ui.bat),');
-  console.log('then add your switches and credentials there - the service stores them and keeps collecting across reboots.');
+/**
+ * Resolve true once the dashboard answers on PORT (any HTTP status counts:
+ * the server is up), false after `seconds` without an answer.
+ */
+function waitForDashboard(seconds) {
+  const deadline = Date.now() + seconds * 1000;
+  return new Promise((resolve) => {
+    const attempt = () => {
+      const req = http.get({ host: '127.0.0.1', port: PORT, path: '/', timeout: 2000 }, (res) => {
+        res.resume();
+        resolve(true);
+      });
+      req.on('timeout', () => req.destroy());
+      req.on('error', () => {
+        if (Date.now() >= deadline) resolve(false);
+        else setTimeout(attempt, 1000);
+      });
+    };
+    attempt();
+  });
+}
+
+svc.on('start', async () => {
+  console.log('Service started. Checking the dashboard answers...');
+  if (await waitForDashboard(30)) {
+    console.log('SBS Management Tool service is running.');
+    console.log('Open the dashboard at http://localhost:' + PORT + ' (or run open-ui.bat),');
+    console.log('then add your switches and credentials there - the service stores them and keeps collecting across reboots.');
+    return;
+  }
+  console.error('');
+  console.error('The service started, but the dashboard did not answer on port ' + PORT + ' within 30 seconds.');
+  const tail = daemonErrorTail(__dirname);
+  if (tail) {
+    console.error('The last lines the service wrote to its error log (daemon\\*.err.log):');
+    console.error(tail.replace(/^/gm, '  '));
+  } else {
+    console.error('See daemon\\*.err.log and logs\\app.log in this folder, and Windows Event Viewer > Application.');
+  }
+  process.exitCode = 1;
 });
 svc.on('error', (e) => {
   console.error('Service error:', e && e.message ? e.message : e);
+  process.exitCode = 1;
 });
 
 console.log('Installing the SBS Management Tool Windows service...');

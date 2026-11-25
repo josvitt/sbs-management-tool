@@ -41,7 +41,10 @@ notes GitHub writes from the pull request titles.
 switches continuously — with no browser open and even after a reboot, before
 anyone logs in — install it as a background service instead:
 
-- **Windows:** right-click **`install-service.bat`** → *Run as administrator*.
+- **Windows:** first put the app folder somewhere outside `C:\Users`, such
+  as `C:\sbs-management-tool` — not the Desktop, Documents or Downloads, which
+  the service's account cannot open (the installer stops and says so). Then
+  right-click **`install-service.bat`** → *Run as administrator*.
   It installs a "SBS Management Tool" Windows service that starts on boot and
   runs with no window. Open the dashboard with **`open-ui.bat`** (or
   `http://localhost:3000`) and add your switches there — the service stores them

@@ -310,7 +310,23 @@ app installs as a service.
   covered) and then moves the service to it with `sc.exe config` (node-windows
   always creates LocalSystem services). If either step fails it says so and
   the service stays LocalSystem; `SBS_SERVICE_ACCOUNT=LocalSystem` chooses
-  that on purpose. **Not yet run on a real Windows install.**
+  that on purpose.
+- **The install folder must be outside `C:\Users`.** LocalService gets
+  rights on the app folder only, not the folders above it, and a profile
+  (`C:\Users\<name>`, with its Desktop, Documents, Downloads) is open only to
+  its owner, Administrators and SYSTEM. Node resolves a script's real path by
+  `lstat`-ing every folder on the way down, so the first unreadable one fails
+  with EPERM and `node.exe` exits 1 before `server.js` runs; the wrapper logs
+  only `Child process … finished with 1`. That is how 1.2.0 failed when
+  installed on the Desktop. `service-location.js` owns the check
+  (`userProfileFolder`): `service-install.js` stops before creating anything
+  and names the move (`C:\sbs-management-tool`), rather than widening rights
+  on someone's profile. `SBS_SERVICE_ACCOUNT=LocalSystem` skips it.
+- After `net start`, `service-install.js` waits up to 30 s for the dashboard
+  to answer on `PORT`, and when it does not, prints the tail of the
+  service's own stderr log (`daemon\*.err.log`, `daemonErrorTail` in
+  `service-location.js`). `install-service.bat` passes the failure on, so it
+  never says "running" for a service that is not.
 - `node-windows` is installed **on demand** by `install-service.bat`, not
   carried in `package.json`, so a normal interactive install (`start.bat`) stays
   lean. It is needed only to create/remove the service; the running service does
@@ -338,8 +354,9 @@ run mode (service **or** interactive) and stay with it; switching means the
 other identity may not be able to read a vault the first one wrote.
 
 **Install location.** The `.bat`/unit resolve the app directory themselves
-(`%~dp0` / `WorkingDirectory`), so any stable folder works — but not the Desktop
-(the service and the vault key live there). All app files are `__dirname`-based,
+(`%~dp0` / `WorkingDirectory`), so any stable folder works — but on Windows
+not one inside `C:\Users` (Desktop, Documents, Downloads): the LocalService
+account cannot reach it, and the installer refuses it (above). All app files are `__dirname`-based,
 so the service and an interactive run resolve the same vault, history and logs.
 
 ## 10. Products & MIB sets (per-product support)
