@@ -437,7 +437,7 @@ its concern lives; a new route or caller uses it rather than re-implementing it.
 | SSH host keys | `known-hosts.js` (`check`, `trust`) | Trust on first use: the terminal's `hostVerifier` remembers a new switch's key (known-hosts.json), accepts it again, and refuses a different one; the page shows both fingerprints and the only way on is `POST /api/ssh/trust-key` behind a two-tap confirm. |
 | A snapshot leaving the server | `publicSnapshot(snap)` (routes/monitoring.js) | The collector keeps the full target to poll with; responses carry it through `redactTarget`. |
 | Unpacking a release archive | `extractTarGz(gz, dest, { strip })` (targz.js) | Node has gzip but no tar, and the app must not need a tar program. Plain files and folders only; links skipped; an absolute or `..` path stops it. |
-| Moving a misplaced store | `rotate.adoptLegacy(from, to)` | Moves a file (or a folder's files) to its corrected path once, never overwriting. Used for layouts.json and logs/traps, logs/syslog, which 1.0.x wrote under routes/. |
+| Moving a misplaced store | `rotate.adoptLegacy(from, to)` | Moves a file (or a folder's files) to its corrected path once, never overwriting. Used for layouts.json and logs/traps, logs/syslog, which versions before 1.2.0 wrote under routes/. |
 
 Offline tests for these and the persistence helpers live in `test/` and run
 with `npm test` (node:test, no extra dependency). A new control gets a test

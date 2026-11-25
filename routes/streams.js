@@ -57,7 +57,7 @@ module.exports = function register(app) {
   // durable record. The in-memory ring buffers / SSE are unchanged; this is an
   // additional always-on sink.
   const path_ = require('path');
-  // logs/ in the install folder. Versions 1.0.x wrote these under
+  // logs/ in the install folder. Versions before 1.2.0 wrote these under
   // routes/logs/ by mistake (left over from the route split); moved once.
   const STREAM_LOG_DIR = path_.join(__dirname, '..', 'logs');
   for (const kind of ['traps', 'syslog']) {
