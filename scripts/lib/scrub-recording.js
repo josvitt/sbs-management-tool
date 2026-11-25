@@ -50,8 +50,16 @@ const IP_INDEXED = [
   ['1.3.6.1.4.1.9.6.1.101.80.8.1', (a) => (a[0] === '1' && a[1] === '4' ? [2] : [])],   // RADIUS: type.len.ip.ports
   ['1.3.6.1.4.1.9.6.1.101.79.40.9.1', (a) => (a[0] === '1' && a[1] === '4' ? [2] : [])],  // TACACS+: type.len.ip
   ['1.3.6.1.4.1.9.6.1.101.92.2.2.17.1', (a) => (a[0] === '1' && a[1] === '4' ? [2] : [])], // SNTP server: type.len.ip
-  ['1.3.6.1.2.1.32.2.1.1.4.1', () => [0]]                   // dnsResConfigSbeltEntry: ip.subtree.class
+  ['1.3.6.1.2.1.32.2.1.1.4.1', () => [0]],                  // dnsResConfigSbeltEntry: ip.subtree.class
+  ['1.0.8802.1.1.2.1.4.2.1', (a) => (a[3] === '1' && a[4] === '4' ? [5] : [])]   // lldpRemManAddrEntry: time.port.rem.type.len.ip
 ];
+// Switch-internal names that embed an IPv4 address as 4 raw bytes after a
+// prefix ("TR-" + 4 bytes, snmp-config.js), in values and in indexes.
+const INTERNAL_PREFIXES = ['TR-', 'InR-', 'SNR-', 'V_SNR-', 'SSNR-'].map((p) => Buffer.from(p, 'latin1'));
+const internalIp = (buf) => {
+  for (const p of INTERNAL_PREFIXES) if (buf.length === p.length + 4 && buf.slice(0, p.length).equals(p)) return p.length;
+  return -1;
+};
 const DOC_NETS = ['192.0.2', '198.51.100', '203.0.113'];
 
 const isPrintable = (b) => b.length > 0 && b.every((c) => c === 9 || c === 10 || c === 13 || (c >= 32 && c < 127));
@@ -125,6 +133,15 @@ function scrub(varbinds, secrets) {
       for (const i of starts(arcs)) if (i >= 0 && i + 4 <= arcs.length) mapIp(arcs.slice(i, i + 4).join('.'));
     }
     if (buf && buf.length === 6 && /TAddress/i.test(c.syntax + c.name)) mapIp(Array.from(buf.slice(0, 4)).join('.'));
+    if (buf && internalIp(buf) > 0) mapIp(Array.from(buf.slice(internalIp(buf))).join('.'));
+    if (c.index) {
+      const ia = c.index.split('.').map(Number);
+      for (const p of INTERNAL_PREFIXES) {
+        for (let i = 0; i + p.length + 4 <= ia.length; i++) {
+          if (Array.from(p).every((b, j) => ia[i + j] === b)) mapIp(ia.slice(i + p.length, i + p.length + 4).join('.'));
+        }
+      }
+    }
     if (buf && isPrintable(buf) && SENSITIVE.test(c.name) && !NOT_SENSITIVE.test(c.name)) {
       const str = buf.toString('latin1');
       // IP-looking names are handled as addresses, not names
@@ -179,6 +196,9 @@ function scrub(varbinds, secrets) {
         buf = Buffer.from(mapIpKnown(Array.from(buf).join('.')).split('.').map(Number));
       } else if (buf.length === 6 && /TAddress/i.test(c.syntax + c.name)) {
         buf = Buffer.concat([Buffer.from(mapIpKnown(Array.from(buf.slice(0, 4)).join('.')).split('.').map(Number)), buf.slice(4)]);
+      } else if (internalIp(buf) > 0) {
+        const at = internalIp(buf);
+        buf = Buffer.concat([buf.slice(0, at), Buffer.from(mapIpKnown(Array.from(buf.slice(at)).join('.')).split('.').map(Number))]);
       } else if (MAC_COL.test(c.name) && !isPrintable(buf) && (buf.length === 6 || buf.length === 8)) {
         const head = buf.length === 8 ? buf.slice(0, 2).toString('hex') : '';
         const mac = macs.get((buf.length === 8 ? buf.slice(2) : buf).toString('hex'));
@@ -213,6 +233,11 @@ function scrub(varbinds, secrets) {
   }
   const PRIV = /(^|[^.\d])(10\.\d{1,3}|172\.(1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}(?![.\d])/;
   if (texts.some(([, t]) => PRIV.test(t))) throw new Error('A private address survived scrubbing in ' + where((t) => PRIV.test(t)) + '.');
+  // In indexes only the unmistakable ranges are checked (a 10.x run of arcs
+  // turns up by chance; 192.168 and 172.16-31 runs do not).
+  const PRIV_ARCS = /(^|\.)(192\.168|172\.(1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}(\.|$)/;
+  const leaked = out.filter(([oid]) => { const c = colOf(oid); return c.index && PRIV_ARCS.test(c.index); });
+  if (leaked.length) throw new Error('A private address survived scrubbing in the index of ' + Array.from(new Set(leaked.map(([oid]) => colOf(oid).name))).slice(0, 8).join(', ') + '.');
   return { varbinds: out, counts: { ips: ips.size, macs: macs.size, names: names.size } };
 }
 

@@ -60,3 +60,21 @@ test('a community inside a NUL-padded or binary value is replaced byte for byte'
   const b = Buffer.from(varbinds[1][2].$buf, 'hex').toString('latin1');
   assert.ok(!b.includes(comm) && b.includes('192.0.2.7'), b);
 });
+
+test('an address inside a switch-internal "TR-" name and an LLDP management address are mapped', () => {
+  const tr = Buffer.concat([Buffer.from('TR-'), Buffer.from([192, 168, 10, 70])]);
+  const idx = tr.length + '.' + Array.from(tr).join('.');
+  const vbs = [
+    ['1.3.6.1.6.3.16.1.2.1.3.2.' + idx, OCT, { $buf: Buffer.from('v1v2SuperGroup').toString('hex') }],   // vacmGroupName
+    ['1.3.6.1.6.3.18.1.1.1.4.' + arcs('x1'), OCT, { $buf: tr.toString('hex') }],
+    ['1.0.8802.1.1.2.1.4.2.1.3.0.19.76.1.4.192.168.98.253', INT, 2]                               // lldpRemManAddrIfSubtype
+  ];
+  const { varbinds } = scrub(vbs, []);
+  const s = JSON.stringify(varbinds);
+  assert.ok(!/192\.168/.test(varbinds.map((v) => v[0]).join(' ')), s);
+  const val = Buffer.from(varbinds[1][2].$buf, 'hex');
+  assert.equal(val.slice(0, 3).toString(), 'TR-');
+  assert.notEqual(val[4], 168);
+  // the same address maps the same way in the index and in the value
+  assert.ok(varbinds[0][0].endsWith('.84.82.45.' + Array.from(val.slice(3)).join('.')), varbinds[0][0]);
+});

@@ -199,7 +199,7 @@ A new **QoS** panel.
 ## Progress
 | Phase | Status |
 | --- | --- |
-| 1 Half-built | Not started |
+| 1 Half-built | Done (v1.7.0): switch test 31/31 on .253, recordings of .253 and .254 |
 | 2 Design review | Not started |
 | 3 Restore, reboot, firmware | Not started |
 | 4 System | Not started |
