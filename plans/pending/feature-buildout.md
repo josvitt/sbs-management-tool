@@ -108,7 +108,7 @@ A new **System** panel.
 - Step 4.3: Management access: Telnet, SSH, HTTP and HTTPS on or off
   (`rlTelnetEnable`, `rlSsh*`, `rlEmWebHttpEnable`, ...), and the management ACL
   (`rlMngInf*`). It refuses to turn off the protocol the app is using. Size: M.
-- Step 4.4: Create SNMPv3 users (see decision D4). Size: M.
+- Step 4.4: Create SNMPv3 users over SNMP only (D4). Probe `usmUserCloneFrom`; if the switch refuses every SNMP route, report that with the MIB evidence and leave it out. Size: M.
 
 ### Phase 5: Ports and PoE (v1.11.0)
 New tabs in the port popout. Each list has a summary column in Interfaces.
@@ -142,26 +142,26 @@ A new **Switching security** panel.
 - Step 8.2: DHCP snooping and trusted ports (`rlIpDhcpSnoop*`). Size: S.
 - Step 8.3: ARP inspection (`rlIpArpInspect*`). Size: S. Blocked by: 8.2.
 
-### Phase 9: Alerts outside the dashboard (v1.15.0)
+### Phase 9: Alerts outside the dashboard (dropped, D7)
 - Step 9.1: An **Alerts** section in Settings: an SMTP server (password stored
   in the vault) and an optional webhook. A test-send button. Size: M.
 - Step 9.2: The server sends an alert when a switch becomes unreachable or
   recovers, a new critical alert appears, or the config changes. Repeats are
   held back: the same alert at most once an hour. Size: S. Blocked by: 9.1.
 
-### Phase 10: IPv6 addressing (v1.16.0)
+### Phase 10: IPv6 addressing (v1.15.0)
 A new **IPv6 Addressing** panel, built like IPv4 Addressing.
 - Step 10.1: Addresses on VLAN and routed interfaces, including autoconfig and
   link-local. Size: M.
 - Step 10.2: Default gateway, static routes and IPv6 DNS servers. Size: S.
 
-### Phase 11: QoS (v1.17.0)
+### Phase 11: QoS (v1.16.0)
 A new **QoS** panel.
 - Step 11.1: QoS mode and the trust mode (CoS or DSCP). Size: S.
 - Step 11.2: Rate limits and shaping per port. Size: S.
 - Step 11.3: CoS and DSCP to queue maps (read, then edit). Size: M.
 
-### Phase 12: One change on many switches (v1.18.0)
+### Phase 12: One change on many switches (dropped, D8)
 - Step 12.1: Pick saved switches and a change: add or remove a VLAN, SNTP
   servers and time zone, a local user, or the syslog server. Size: M.
 - Step 12.2: A preview per switch, then apply in turn, with each switch's result
@@ -172,15 +172,15 @@ A new **QoS** panel.
 | # | Decision | Chosen option | Why |
 | --- | --- | --- | --- |
 | D1 | Dashboard sign-in | Not built | Joe, 25 Nov 2026 |
-| D2 | One PR and release per phase | (pending Joe) | Small, testable releases, matching the project rule |
-| D3 | Switch tests | (pending Joe) | Rule 6 needs a real switch for each new write |
-| D4 | SNMPv3 user creation | (pending Joe) | The firmware blocks it over SNMP. Try `usmUserCloneFrom` first, as rule 5 asks |
-| D5 | Design standard changes | (pending Joe) | Four Part A edits from the design review |
-| D6 | Config restore target | (pending Joe) | Startup and reboot is the reversible path |
-| D7 | Alert delivery | (pending Joe) | |
-| D8 | Multi-switch scope | (pending Joe) | |
-| D9 | QoS scope | (pending Joe) | |
-| D10 | Where the new features go | (pending Joe) | |
+| D2 | One PR and release per phase | Merge and release without asking once tests and the switch test pass | Joe, 25 Nov 2026 |
+| D3 | Switch tests | Write tests on .253 gi1/0/4, restored and never saved; reboots of .253 announced first | Joe, 25 Nov 2026 |
+| D4 | Everything over SNMP | No CLI writes at all. SNMPv3 user creation is built only if an SNMP route works (`usmUserCloneFrom` or `rlUsmUserExt`) | Joe, 25 Nov 2026 |
+| D5 | Design standard changes | Separate warning color; green apply, blue secondary, red destructive, no amber or violet buttons; sentence-case labels, no 9.5px; one focus ring and reduced motion | Joe, 25 Nov 2026 |
+| D6 | Config restore target | Restore to startup, then offer a reboot | Joe, 25 Nov 2026 |
+| D7 | Alerts outside the dashboard | Not built for now (Phase 9 dropped) | Joe, 25 Nov 2026 |
+| D8 | Changes on many switches | Not built for now (Phase 12 dropped) | Joe, 25 Nov 2026 |
+| D9 | QoS scope | Trust mode, rate limits, queue maps; no policy maps | Joe, 25 Nov 2026 |
+| D10 | Where the new features go | Panels: System, Switching security, Port mirroring, IPv6 Addressing, QoS; per-port settings as popout tabs | Joe, 25 Nov 2026 |
 
 ## Not yet specified
 - Phase 3: the exact OIDs for the active and next boot image. Fog: read the
@@ -194,7 +194,7 @@ A new **QoS** panel.
   collector held during writes (from Phase 1); offline tests for each write's
   SET plan; plain-language release notes.
 - Never: dashboard sign-in; saving the config during a switch test; a switch
-  test without Joe's typed approval; driving the CLI for anything SNMP can do.
+  test without Joe's typed approval; driving the CLI for any write (D4); alerts and multi-switch changes (D7, D8).
 
 ## Progress
 | Phase | Status |
@@ -207,7 +207,7 @@ A new **QoS** panel.
 | 6 Spanning tree | Not started |
 | 7 Access lists | Not started |
 | 8 Switching security | Not started |
-| 9 Alerts | Not started |
+| 9 Alerts | Dropped (D7) |
 | 10 IPv6 | Not started |
 | 11 QoS | Not started |
-| 12 Many switches | Not started |
+| 12 Many switches | Dropped (D8) |
