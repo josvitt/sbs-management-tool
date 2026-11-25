@@ -20,6 +20,7 @@ function load(refuse) {
     console,
     sets,
     appLog: () => {},
+    setTimeout: (fn) => setImmediate(fn),
     teardownCalls: [],
     snmpSetResult: async (s, vbs) => {
       const list = Array.isArray(vbs) ? vbs : [vbs];
@@ -108,4 +109,12 @@ test('a routed port whose next step fails gets its address back', async () => {
   assert.deepEqual(plain(ctx.teardownCalls), [4]);
   assert.ok(sets.includes('vlanSwitchPortModeCategory.4=2'));
   assert.ok(sets.some((x) => x.startsWith('1.3.6.1.4.1.9.6.1.101.26.1.1.6.198.51.100.1=1')));
+});
+
+test('a routed port put back waits before its address, which the switch refuses for ~2 s', () => {
+  const { api } = load();
+  const p = api.planSwitchportChange({ ifIndex: 4, mode: 'access', access: 1, wasRouted: true,
+    before: { mode: 'routed', addrs: [{ ip: '10.1.1.1', mask: '255.255.255.252', owner: 1 }] } });
+  assert.deepEqual(plain(p.undo.map((x) => [x[0], x[2] || null])),
+    [['no switchport', null], ['address 10.1.1.1', { waitBefore: 2500 }]]);
 });

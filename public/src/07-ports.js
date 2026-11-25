@@ -624,7 +624,7 @@
   // Gauge, native always in the allowed bitmap (all four blocks, so the list is
   // exact), mode flipped last so a rejected VLAN write can't leave a port in a
   // new mode with no membership. state: { mode: 'access'|'trunk', access,
-  // native, tagged }. Each step is [title, varbinds].
+  // native, tagged }. Each step is [title, varbinds], with an optional { waitBefore: ms }.
   function switchportSteps(if_, st) {
     const steps = [];
     if (st.mode === 'trunk') {
@@ -663,6 +663,7 @@
   // switchport"); back to a switchport = the port's IPv4 address and DHCP
   // client come off first (teardown, run by the caller), then 1
   // ("switchport"), then the usual access/trunk steps.
+  const ROUTED_SETTLE_MS = 2500;
   function planSwitchportChange(cfg) {
     const if_ = cfg.ifIndex;
     const CATEGORY = 'vlanSwitchPortModeCategory.' + if_;
@@ -677,7 +678,11 @@
       if (cfg.wasRouted) {
         forward.push(['switchport', [{ oid: CATEGORY, type: 'Integer', value: 1 }]]);
         undo.push(['no switchport', [{ oid: CATEGORY, type: 'Integer', value: 2 }]]);
-        undo.push(...addressRestoreSteps(if_, before.addrs));
+        // The switch refuses an address for about 2 s after the category
+        // changes, so the first address step waits.
+        const back = addressRestoreSteps(if_, before.addrs);
+        if (back.length) back[0] = [back[0][0], back[0][1], { waitBefore: ROUTED_SETTLE_MS }];
+        undo.push(...back);
       } else {
         undo.push(...switchportSteps(if_, before));
       }
@@ -697,7 +702,8 @@
   // reached the switch and succeeded.
   async function runSetSteps(s, steps, log, prefix, stopOnFail) {
     let ok = true, sent = 0;
-    for (const [title, vbs] of steps) {
+    for (const [title, vbs, opt] of steps) {
+      if (opt && opt.waitBefore) await new Promise((r) => setTimeout(r, opt.waitBefore));
       let stepOk = true;
       try {
         const { ok: rOk, status, body } = await snmpSetResult(s, vbs);
