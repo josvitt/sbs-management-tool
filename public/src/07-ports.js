@@ -648,11 +648,7 @@
     for (const a of (addrs || [])) {
       if (a.owner === 2) steps.push(['DHCP client', [{ oid: DHCP_CL.status + '.' + if_, type: 'Integer', value: 4 }]]);
       else if (a.owner === 1 && a.ip && a.mask) {
-        steps.push(['address ' + a.ip, [
-          { oid: SVI_IP.status + '.' + a.ip, type: 'Integer', value: 1 },
-          { oid: SVI_IP.ifIndex + '.' + a.ip, type: 'Integer', value: parseInt(if_, 10) },
-          { oid: SVI_IP.netmask + '.' + a.ip, type: 'IpAddress', value: a.mask }
-        ]]);
+        steps.push(['address ' + a.ip, ifAddressVarbinds(a.ip, a.mask, if_)]);
       }
     }
     // One DHCP step is enough however many rows the lease shows.
