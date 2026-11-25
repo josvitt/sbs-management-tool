@@ -154,6 +154,19 @@
       const url = (id) => '/api/config/history/version?host=' + encodeURIComponent(s.host) + '&id=' + encodeURIComponent(id);
       const picked = await getJson(url(v.id));
       let against = null;
+      if (mode === 'restore') {
+        // What a restore changes is judged against the switch as it runs now,
+        // so read the running configuration fresh rather than trust a copy.
+        h.busy = 'Reading the running configuration to compare\u2026';
+        repaintConfig(s);
+        const r = await sidePost('/api/config/fetch', { target: s.target, kind: 'running' });
+        if (!r || r.error || r.text == null) throw new Error((r && r.error) || 'no answer');
+        against = { label: 'the running configuration', text: r.text };
+        h.shown = { version: picked, mode, against, diff: diffLines(r.text, picked.text), restored: null };
+        h.busy = null;
+        repaintConfig(s);
+        return;
+      }
       if (mode === 'compare') {
         const running = s.docs && s.docs.running;
         if (running && running.text) {
@@ -200,7 +213,9 @@
         // The newest compared with itself says nothing unless running is held.
         (i > 0 || canCompareNewest)
           ? actBtn('Compare', () => showConfigVersion(s, v, 'compare'), null, 'What changed since this version')
-          : null
+          : null,
+        s.target ? actBtn('Restore', () => showConfigVersion(s, v, 'restore'), null,
+          'Show what restoring this version would change, then restore it to the startup configuration') : null
       ])
     ]);
     host.appendChild(plainTable(s, ['Stored', 'Fingerprint', ''], rows));
@@ -216,12 +231,74 @@
       host.appendChild(pre);
       return;
     }
+    if (shown.mode === 'restore') { renderRestore(host, s, shown, when); return; }
     const changed = shown.diff.filter((d) => d.t !== ' ').length;
     host.appendChild(el('div', 'card-sub', changed
       ? changed + ' differing line(s) from the version of ' + when + ' to ' + shown.against.label +
         '. "+" was added since; "\u2212" was there then and is gone now.'
       : 'The version of ' + when + ' is identical to ' + shown.against.label + '.'));
     if (changed) host.appendChild(diffPre(shown.diff));
+  }
+
+  /**
+   * Restore a stored version: what it changes against the running
+   * configuration, the button that writes it to startup, and after that the
+   * offer to reboot. The running configuration is not touched; the switch
+   * starts from the restored version after its next reboot.
+   */
+  function renderRestore(host, s, shown, when) {
+    const changed = shown.diff.filter((d) => d.t !== ' ').length;
+    const done = shown.restored;
+    if (!done) {
+      host.appendChild(el('div', 'card-sub', changed
+        ? 'Restoring the version of ' + when + ' changes ' + changed + ' line(s) against the running configuration. ' +
+          '"+" lines come back with the restore; "\u2212" lines go away.'
+        : 'The version of ' + when + ' is the same as the running configuration. Restoring it only makes it the startup configuration.'));
+      const go = el('button', 'btn btn-danger', 'Restore to startup configuration');
+      go.type = 'button';
+      withConfirm(go, (e) => runButtonAction(e.currentTarget, {
+        failLabel: 'Restore',
+        spinLabel: 'Restoring\u2026',
+        run: async () => {
+          s.writeBusy = true;
+          try { return await sidePost('/api/config/restore', { target: s.target, id: shown.version.id }); }
+          finally { s.writeBusy = false; }
+        },
+        ok: (r) => r && r.ok,
+        error: (r) => (r && r.error) || 'unknown error',
+        onApplied: (r) => {
+          shown.restored = r;
+          appLog('warn', 'Configuration version restored to startup', { host: s.host, id: shown.version.id, matches: r.check && r.check.matches });
+          // Startup changed, so any startup copy held here is stale.
+          if (s.docs) delete s.docs.startup;
+          s.cfgDiff = null;
+        },
+        settle: () => { repaintConfig(s); return null; }
+      }), { danger: true, confirmText: () => 'Tap again to overwrite startup on ' + switchLabel(s) });
+      const row = el('div', 'maint-row');
+      row.appendChild(go);
+      host.appendChild(row);
+      if (changed) host.appendChild(diffPre(shown.diff));
+      return;
+    }
+    const check = done.check || {};
+    host.appendChild(el('div', 'card-sub',
+      'The version of ' + when + ' is now the startup configuration' +
+      (check.matches === true ? ' (read back from the switch and checked).'
+        : (check.matches === false ? ', but the copy read back from the switch differs from it. Compare them before rebooting.'
+          : '. ' + (check.error || 'It could not be read back to check.'))) +
+      ' The switch starts from it after its next reboot.'));
+    const row = el('div', 'maint-row');
+    const now = el('button', 'btn btn-danger', 'Reboot now');
+    now.type = 'button';
+    withConfirm(now, (e) => rebootAction(e.currentTarget, s, 0),
+      { danger: true, confirmText: () => 'Tap again to reboot ' + switchLabel(s) });
+    row.appendChild(now);
+    host.appendChild(row);
+    if (switchSaysUnsaved(s) || changed) {
+      host.appendChild(el('div', 'sw-warn', 'A reboot replaces the running configuration with the restored one, ' +
+        'so any change made since that version is lost.'));
+    }
   }
 
   function storeDoc(s, key, text, via) {

@@ -690,4 +690,4 @@ async function copyCaptureToFlash(buildSession, opts) {
   }
 }
 
-module.exports = { fetchConfig, copyConfig, fetchPcap, copyCaptureToFlash, KINDS };
+module.exports = { fetchConfig, copyConfig, fetchPcap, copyCaptureToFlash, awaitCopyCompletion, localAddressFor, KINDS, COPY_COL: COL };

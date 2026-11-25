@@ -84,7 +84,7 @@ test('the panel is keyed, no health table repaints it, and its Refresh runs its 
   assert.match(read('06-panels.js'), /KEYED_PANELS = new Set\(\[[^\]]*'snmpcfg'/);
   const health = read('04-health.js');
   assert.match(health, /snmpcfg: \[\]/);
-  assert.match(health, /const ownLoader = \{ snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad \}\[p\.key\];/);
+  assert.match(health, /const ownLoader = \{ snmpcfg: snmpLoad,[^}]*\}\[p\.key\];/);
 });
 
 test('the server route offers no preview, status or diagnostics actions', () => {

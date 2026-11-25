@@ -2,7 +2,7 @@
 
 /**
  * The panels whose data is a server-side view rather than health tables --
- * SNMP configuration, Flash files, Packet capture -- read for the server
+ * SNMP configuration, Flash files, Packet capture, Reboot and firmware -- read for the server
  * collector (SERVER-STANDARD §3c), so they ride the snapshot like every other
  * panel instead of loading when opened.
  *
@@ -17,13 +17,15 @@ const { buildSnmpSession, snmpConfigBundle } = require('./snmp-core');
 const snmpConfig = require('./snmp-config');
 const { listFlash } = require('./routes/flash');
 const { listCaptures } = require('./routes/opc');
+const { readMaint } = require('./switch-maint');
 
 const READERS = {
   snmpConfig: (session, target) => snmpConfig.readAll(snmpConfigBundle(session), {
     version: target.version, community: target.community, user: target.v3 && target.v3.username
   }),
   flash: (session) => listFlash(session),
-  captures: (session) => listCaptures(session)
+  captures: (session) => listCaptures(session),
+  maint: (session) => readMaint(session)
 };
 
 const MODULE_KEYS = Object.keys(READERS);
