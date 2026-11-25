@@ -47,10 +47,12 @@
     // Standard IP ACLs: interactive write module (list / add / delete rules,
     // bind to interfaces), loaded on demand like snmpcfg.
     { key: 'acl', title: 'IP access lists', span: 12, h: 0, needs: () => true },
-    // IP Routing & DNS: global L3 status, the forwarding table, static routes,
+    // IPv4 Addressing: every interface address (VLAN SVIs and routed ports,
+    // static or DHCP), global L3 status, the forwarding table, static routes,
     // DNS client status, nameservers and static host mappings. Interactive
-    // (editable), always offered.
-    { key: 'routing', title: 'IP routing & DNS', span: 12, h: 0, needs: () => true },
+    // (editable), always offered. The key stays 'routing' so saved dashboard
+    // layouts keep their place for it.
+    { key: 'routing', title: 'IPv4 Addressing', span: 12, h: 0, needs: () => true },
     // Packet capture: interactive like snmpcfg, driven by writes rather than
     // the health poll, so always offered and loaded on demand.
     { key: 'capture', title: 'Packet capture', span: 12, h: 0, needs: () => true },
@@ -1151,7 +1153,7 @@
     auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs'],
     connected: ['macTable', 'interfaces', 'bridgePorts', 'dot1xHosts'],
     stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts'],
-    routing: ['routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],
+    routing: ['sviAddrs', 'interfaces', 'vlans', 'portL2L3', 'routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],
     acl: ['aclNames', 'aclAces', 'aclTuples']
   };
   function panelDependsOn(key, changedTables) {

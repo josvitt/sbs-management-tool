@@ -562,13 +562,10 @@
     document.body.appendChild(back);
   }
 
-  // A popout with any number of tabs. tabs: [{ label, fill(pane, close), onShow, hidden }].
-  // Returns { close, showTab, panes, setTabVisible }. Panes are created lazily-filled up front but only
+  // A popout with any number of tabs. tabs: [{ label, fill(pane, close), onShow }].
+  // Returns { close, showTab, panes }. Panes are created lazily-filled up front but only
   // the first is visible; onShow (optional) fires each time a tab is selected
-  // (used by the counters tab to know when it is visible). A tab marked
-  // `hidden` is built but its button is not shown until setTabVisible(tab, true)
-  // - used by a port's IPv4 tab, which exists only while the port is routed and
-  // appears the moment the Switchport tab turns the port routed.
+  // (used by the counters tab to know when it is visible).
   function openTabbedPopout(s, title, tabs, popTimers) {
     const prev = document.querySelector('.port-detail-back');
     if (prev) prev.remove();
@@ -586,36 +583,25 @@
     const strip = el('div', 'pd-tabs');
     const panes = [];
     const btns = [];
-    let current = 0;
     const show = (i) => {
-      current = i;
       panes.forEach((p, j) => { p.style.display = i === j ? '' : 'none'; });
       btns.forEach((b, j) => b.classList.toggle('active', i === j));
       const t = tabs[i]; if (t && t.onShow) t.onShow();
     };
     tabs.forEach((t, i) => {
       const b = el('button', 'pd-tab' + (i === 0 ? ' active' : ''), t.label); b.type = 'button';
-      if (t.hidden) b.style.display = 'none';
       b.addEventListener('click', () => show(i));
       strip.appendChild(b); btns.push(b);
     });
-    const setTabVisible = (tab, visible) => {
-      const i = tabs.indexOf(tab);
-      if (i < 0) return;
-      tab.hidden = !visible;
-      btns[i].style.display = visible ? '' : 'none';
-      if (!visible && current === i) show(0);
-    };
     pop.appendChild(strip);
     tabs.forEach((t, i) => {
       const pane = el('div', 'pd-pane'); if (i !== 0) pane.style.display = 'none';
       pop.appendChild(pane); panes.push(pane);
-      t.pane = pane;
       t.fill(pane, close);
     });
     back.appendChild(pop);
     document.body.appendChild(back);
-    return { close, showTab: show, panes, setTabVisible };
+    return { close, showTab: show, panes };
   }
 
   function openPortDetail(s, detail, opts) {
@@ -647,36 +633,9 @@
     } });
 
     // ---- Switchport tab ----
-    // ---- IPv4 tab: the address of a routed (no switchport) port ----
-    // Present for every port whose L2/L3 category the switch reports, but its
-    // button shows only while the port is routed; the Switchport editor reveals
-    // or hides it when it changes the port's category (onL3Change). Its content
-    // loads when first shown, and again after each category change, so a
-    // switchport never spends the address-table walks.
-    let pop = null;
-    let ipv4Tab = null;
-    if (hasIf && detail.sw && (detail.sw.l2l3 === 'L2' || detail.sw.l2l3 === 'L3')) {
-      let loaded = false;
-      const load = () => {
-        if (loaded || !ipv4Tab.pane) return;
-        loaded = true;
-        clear(ipv4Tab.pane);
-        buildSviEditor(s, { name: 'Port ' + detail.name, noun: 'port' }, detail.ifIndex, ipv4Tab.pane);
-      };
-      ipv4Tab = { label: 'IPv4', hidden: detail.sw.l2l3 !== 'L3', fill: () => {}, onShow: load,
-        reset: () => { loaded = false; } };
-    }
+    // A routed port's address is set in the IPv4 Addressing panel, not here.
     if (hasIf && detail.sw) {
-      tabs.push({ label: 'Switchport', fill: (pane) => {
-        pane.appendChild(buildSwitchportEditor(s, detail, {
-          onL3Change: (isL3) => {
-            if (!pop || !ipv4Tab) return;
-            ipv4Tab.reset();
-            pop.setTabVisible(ipv4Tab, isL3);
-          }
-        }));
-      } });
-      if (ipv4Tab) tabs.push(ipv4Tab);
+      tabs.push({ label: 'Switchport', fill: (pane) => { pane.appendChild(buildSwitchportEditor(s, detail)); } });
     }
 
     // ---- 802.1X tab ----
@@ -734,5 +693,5 @@
       } });
     }
 
-    pop = openTabbedPopout(s, (opts.title || ('Interface ' + detail.name)), tabs, popTimers);
+    openTabbedPopout(s, (opts.title || ('Interface ' + detail.name)), tabs, popTimers);
   }

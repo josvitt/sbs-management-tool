@@ -529,19 +529,13 @@
           if (!Number.isNaN(n)) l2l3ByIf.set(String(r.index), L2L3[n] || ('cat ' + n));
         }
         const hasL2L3 = l2l3ByIf.size > 0;
-        // A routed port's own IPv4 address(es), shown in place of its (empty)
-        // VLAN cells. Same source and filter as the VLAN table's IPv4 column:
-        // rsIpAddrTable rows owned static(1)/dhcp(2) - internal/default are
-        // the switch's system addresses.
+        // A routed port's own IPv4 address(es), shown read-only in place of
+        // its (empty) VLAN cells; they are set in the IPv4 Addressing panel.
         const ipByIf = new Map();
-        const cvv = (cell) => cell && (cell.value !== undefined ? cell.value : cell.display);
-        for (const a of (h.sviAddrs || [])) {
-          const owner = parseInt(cvv(a.rsIpAdEntOwner), 10);
-          if ((owner !== 1 && owner !== 2) || !isRealIp(String(a.index))) continue;
-          const ifx = String(cvv(a.rsIpAdEntIfIndex));
-          const mask = String(cvv(a.rsIpAdEntNetMask) || '');
-          const pref = mask ? maskToPref(mask) : null;
-          const text = String(a.index) + (pref != null ? '/' + pref : '');
+        for (const a of ipv4Addresses(s)) {
+          if (!a.real) continue;
+          const ifx = String(a.ifIndex);
+          const text = a.ip + (a.pref != null ? '/' + a.pref : '');
           ipByIf.set(ifx, ipByIf.has(ifx) ? ipByIf.get(ifx) + ', ' + text : text);
         }
 

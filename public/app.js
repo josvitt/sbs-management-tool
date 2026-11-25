@@ -1345,10 +1345,12 @@
     // Standard IP ACLs: interactive write module (list / add / delete rules,
     // bind to interfaces), loaded on demand like snmpcfg.
     { key: 'acl', title: 'IP access lists', span: 12, h: 0, needs: () => true },
-    // IP Routing & DNS: global L3 status, the forwarding table, static routes,
+    // IPv4 Addressing: every interface address (VLAN SVIs and routed ports,
+    // static or DHCP), global L3 status, the forwarding table, static routes,
     // DNS client status, nameservers and static host mappings. Interactive
-    // (editable), always offered.
-    { key: 'routing', title: 'IP routing & DNS', span: 12, h: 0, needs: () => true },
+    // (editable), always offered. The key stays 'routing' so saved dashboard
+    // layouts keep their place for it.
+    { key: 'routing', title: 'IPv4 Addressing', span: 12, h: 0, needs: () => true },
     // Packet capture: interactive like snmpcfg, driven by writes rather than
     // the health poll, so always offered and loaded on demand.
     { key: 'capture', title: 'Packet capture', span: 12, h: 0, needs: () => true },
@@ -2449,7 +2451,7 @@
     auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs'],
     connected: ['macTable', 'interfaces', 'bridgePorts', 'dot1xHosts'],
     stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts'],
-    routing: ['routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],
+    routing: ['sviAddrs', 'interfaces', 'vlans', 'portL2L3', 'routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],
     acl: ['aclNames', 'aclAces', 'aclTuples']
   };
   function panelDependsOn(key, changedTables) {
@@ -3703,13 +3705,10 @@
     document.body.appendChild(back);
   }
 
-  // A popout with any number of tabs. tabs: [{ label, fill(pane, close), onShow, hidden }].
-  // Returns { close, showTab, panes, setTabVisible }. Panes are created lazily-filled up front but only
+  // A popout with any number of tabs. tabs: [{ label, fill(pane, close), onShow }].
+  // Returns { close, showTab, panes }. Panes are created lazily-filled up front but only
   // the first is visible; onShow (optional) fires each time a tab is selected
-  // (used by the counters tab to know when it is visible). A tab marked
-  // `hidden` is built but its button is not shown until setTabVisible(tab, true)
-  // - used by a port's IPv4 tab, which exists only while the port is routed and
-  // appears the moment the Switchport tab turns the port routed.
+  // (used by the counters tab to know when it is visible).
   function openTabbedPopout(s, title, tabs, popTimers) {
     const prev = document.querySelector('.port-detail-back');
     if (prev) prev.remove();
@@ -3727,36 +3726,25 @@
     const strip = el('div', 'pd-tabs');
     const panes = [];
     const btns = [];
-    let current = 0;
     const show = (i) => {
-      current = i;
       panes.forEach((p, j) => { p.style.display = i === j ? '' : 'none'; });
       btns.forEach((b, j) => b.classList.toggle('active', i === j));
       const t = tabs[i]; if (t && t.onShow) t.onShow();
     };
     tabs.forEach((t, i) => {
       const b = el('button', 'pd-tab' + (i === 0 ? ' active' : ''), t.label); b.type = 'button';
-      if (t.hidden) b.style.display = 'none';
       b.addEventListener('click', () => show(i));
       strip.appendChild(b); btns.push(b);
     });
-    const setTabVisible = (tab, visible) => {
-      const i = tabs.indexOf(tab);
-      if (i < 0) return;
-      tab.hidden = !visible;
-      btns[i].style.display = visible ? '' : 'none';
-      if (!visible && current === i) show(0);
-    };
     pop.appendChild(strip);
     tabs.forEach((t, i) => {
       const pane = el('div', 'pd-pane'); if (i !== 0) pane.style.display = 'none';
       pop.appendChild(pane); panes.push(pane);
-      t.pane = pane;
       t.fill(pane, close);
     });
     back.appendChild(pop);
     document.body.appendChild(back);
-    return { close, showTab: show, panes, setTabVisible };
+    return { close, showTab: show, panes };
   }
 
   function openPortDetail(s, detail, opts) {
@@ -3788,36 +3776,9 @@
     } });
 
     // ---- Switchport tab ----
-    // ---- IPv4 tab: the address of a routed (no switchport) port ----
-    // Present for every port whose L2/L3 category the switch reports, but its
-    // button shows only while the port is routed; the Switchport editor reveals
-    // or hides it when it changes the port's category (onL3Change). Its content
-    // loads when first shown, and again after each category change, so a
-    // switchport never spends the address-table walks.
-    let pop = null;
-    let ipv4Tab = null;
-    if (hasIf && detail.sw && (detail.sw.l2l3 === 'L2' || detail.sw.l2l3 === 'L3')) {
-      let loaded = false;
-      const load = () => {
-        if (loaded || !ipv4Tab.pane) return;
-        loaded = true;
-        clear(ipv4Tab.pane);
-        buildSviEditor(s, { name: 'Port ' + detail.name, noun: 'port' }, detail.ifIndex, ipv4Tab.pane);
-      };
-      ipv4Tab = { label: 'IPv4', hidden: detail.sw.l2l3 !== 'L3', fill: () => {}, onShow: load,
-        reset: () => { loaded = false; } };
-    }
+    // A routed port's address is set in the IPv4 Addressing panel, not here.
     if (hasIf && detail.sw) {
-      tabs.push({ label: 'Switchport', fill: (pane) => {
-        pane.appendChild(buildSwitchportEditor(s, detail, {
-          onL3Change: (isL3) => {
-            if (!pop || !ipv4Tab) return;
-            ipv4Tab.reset();
-            pop.setTabVisible(ipv4Tab, isL3);
-          }
-        }));
-      } });
-      if (ipv4Tab) tabs.push(ipv4Tab);
+      tabs.push({ label: 'Switchport', fill: (pane) => { pane.appendChild(buildSwitchportEditor(s, detail)); } });
     }
 
     // ---- 802.1X tab ----
@@ -3875,7 +3836,7 @@
       } });
     }
 
-    pop = openTabbedPopout(s, (opts.title || ('Interface ' + detail.name)), tabs, popTimers);
+    openTabbedPopout(s, (opts.title || ('Interface ' + detail.name)), tabs, popTimers);
   }
 
   // =================================================================
@@ -4341,10 +4302,9 @@
   // "routed" is the port's L2/L3 category, not a switchport mode: CISCOSB-vlan
   // vlanSwitchPortModeCategory (read-write, 1 = l2 "switchport", 2 = l3 "no
   // switchport"). It is offered only where the switch reports that category
-  // for the port. A routed port has no VLANs; its IPv4 address is set on the
-  // popout's IPv4 tab, which opts.onL3Change reveals or hides.
-  function buildSwitchportEditor(s, detail, opts) {
-    opts = opts || {};
+  // for the port. A routed port has no VLANs; its IPv4 address is set in the
+  // IPv4 Addressing panel, like every other interface address.
+  function buildSwitchportEditor(s, detail) {
     const sw = detail.sw;
     const box = el('div', 'sw-editor');
     const knowsCategory = sw.l2l3 === 'L2' || sw.l2l3 === 'L3';
@@ -4414,8 +4374,8 @@
       natField.style.display = m === 'trunk' ? '' : 'none';
       tagField.style.display = m === 'trunk' ? '' : 'none';
       modeNote.textContent = m === 'routed'
-        ? (wasRouted ? 'Routed port: it has no VLANs. Set its address on the IPv4 tab.'
-          : 'Applying makes this a routed port (no switchport): it leaves its VLANs, and its address is then set on the IPv4 tab.')
+        ? (wasRouted ? 'Routed port: it has no VLANs. Set its address in IPv4 Addressing.'
+          : 'Applying makes this a routed port (no switchport): it leaves its VLANs, and its address is then set in IPv4 Addressing.')
         : (wasRouted ? 'Applying makes this a switchport again and removes the port’s IPv4 address.' : '');
       modeNote.style.display = modeNote.textContent ? '' : 'none';
     };
@@ -4467,7 +4427,6 @@
           const nowRouted = cfg.mode === 'routed';
           if (nowRouted !== cfg.wasRouted) {
             sw.l2l3 = nowRouted ? 'L3' : 'L2';
-            if (opts.onL3Change) opts.onL3Change(nowRouted);
             syncMode();
           }
           if (nowRouted) return;
@@ -4870,7 +4829,7 @@
   }
 
   // =================================================================
-  // 08-vlans.js: VLANs: create, delete, edit, SVIs and the VLAN panel.
+  // 08-vlans.js: VLANs: create, delete, edit, Voice VLAN and the VLAN panel.
   // =================================================================
 
   // Create a VLAN via the standard Q-BRIDGE dot1qVlanStaticTable (the same
@@ -4960,7 +4919,7 @@
       // InconsistentValue on delete usually means the VLAN is still in use
       // (member ports, or an IPv4 SVI). Make that actionable.
       let msg = e.message;
-      if (/InconsistentValue/i.test(msg)) msg = 'the switch refused it - the VLAN may still have member ports or an IPv4 interface. Remove those first (open the VLAN and clear its IPv4 tab / unassign ports), then delete.';
+      if (/InconsistentValue/i.test(msg)) msg = 'the switch refused it - the VLAN may still have member ports or an IPv4 interface. Remove those first (remove its address in IPv4 Addressing / unassign ports), then delete.';
       out = { ok: false, error: msg };
     }
     if (ownsBusy) s.writeBusy = false;
@@ -4999,25 +4958,8 @@
     return null;
   }
 
-  // SVI IP table (rsIpAddrTable, base 26.1), indexed by the IP address.
-  const SVI_IP = {
-    ifIndex: '1.3.6.1.4.1.9.6.1.101.26.1.1.2',  // rsIpAdEntIfIndex
-    netmask: '1.3.6.1.4.1.9.6.1.101.26.1.1.3',  // rsIpAdEntNetMask
-    status:  '1.3.6.1.4.1.9.6.1.101.26.1.1.6',  // rsIpAdEntStatus (RowStatus)
-    owner:   '1.3.6.1.4.1.9.6.1.101.26.1.1.10'  // rsIpAdEntOwner static(1)/dhcp(2)/internal(3)/default(4)
-  };
-  const SVI_OWNER = { 1: 'static', 2: 'dhcp', 3: 'internal', 4: 'default' };
-  // DHCP client action table (rlDhcpClActionTable, base 76.3), indexed by ifIndex.
-  const DHCP_CL = {
-    status:   '1.3.6.1.4.1.9.6.1.101.76.3.1.2',  // rlDhcpClActionStatus (RowStatus to enable)
-    hostName: '1.3.6.1.4.1.9.6.1.101.76.3.1.3'
-  };
-  // Prefix length -> dotted netmask.
-  function prefToMask(p) { p = Math.max(0, Math.min(32, p | 0)); const m = p === 0 ? 0 : (0xffffffff << (32 - p)) >>> 0; return [24, 16, 8, 0].map((sh) => (m >>> sh) & 0xff).join('.'); }
-  // Dotted netmask -> prefix length.
-  function maskToPref(mask) { const m = String(mask).split('.').map(Number); if (m.length !== 4) return null; let bits = 0; for (const o of m) bits += (o.toString(2).match(/1/g) || []).length; return bits; }
-
-  // Edit a VLAN: rename, SVI IP address, and ACL binding (no direction).
+  // Edit a VLAN: rename and ACL binding (no direction). Its IPv4 address is
+  // set in the IPv4 Addressing panel.
   function openVlanEditor(s, vlan) {
     const tabs = [];
 
@@ -5045,178 +4987,16 @@
       pane.appendChild(form);
     } });
 
-    // ---- IPv4 tab: the VLAN's SVI address (static or DHCP) ----
-    // The SVI ifIndex is resolved from the authoritative vlanNameTable (tag ->
-    // ifIndex), not guessed from the interface-table row, which is what caused
-    // the earlier wrong-SVI match.
-    tabs.push({ label: 'IPv4', fill: async (pane) => {
-      pane.appendChild(el('div', 'card-sub', 'Reading IPv4 interface\u2026'));
-      const ifx = await vlanSviIfIndex(s, vlan.id);
-      clear(pane);
-      buildSviEditor(s, vlanIface(vlan), ifx, pane);
-    } });
-
     // ---- ACL tab: bind an ACL to the VLAN (default action only, no direction) ----
     tabs.push({ label: 'ACL', fill: async (pane) => {
       pane.appendChild(el('div', 'card-sub', 'Reading ACL binding\u2026'));
       const ifx = await vlanSviIfIndex(s, vlan.id);
       clear(pane);
       if (ifx != null) buildIfAclBinding(s, { ifIndex: ifx }, pane, { ifType: IFTYPE_VLAN, noDirection: true });
-      else pane.appendChild(el('div', 'card-sub', 'This VLAN has no L3 interface yet. Add an IPv4 address on the IPv4 tab first, then an ACL can be bound to it.'));
+      else pane.appendChild(el('div', 'card-sub', 'This VLAN has no L3 interface yet. Add an IPv4 address to it in IPv4 Addressing first, then an ACL can be bound to it.'));
     } });
 
     openTabbedPopout(s, 'VLAN ' + vlan.id + (vlan.name ? ' \u00b7 ' + vlan.name : ''), tabs, []);
-  }
-
-  // SVI IP editor: shows the current address (if any) and lets you set/replace
-  // or remove it. Writing a management SVI wrong can cut access, so this reads
-  // first and is explicit about what it will change.
-  // The VLAN IPv4 (SVI) editor. Reads the address table, filters to real user
-  // addresses on THIS VLAN's L3 interface (owner static/dhcp - internal/default
-  // are system addresses and must be ignored, which is what produced the bogus
-  // "0.193.134.170"), and offers Static or DHCP. When the VLAN has no SVI yet it
-  // shows an "Add IPv4 SVI" button rather than a pre-filled form.
-  //
-  // The same editor serves a routed (no switchport) port: an L3 port carries its
-  // address on its own ifIndex in the same rsIpAddrTable, exactly as an SVI
-  // does, so only the wording differs. `iface` says what is being edited:
-  // { name, noun, vlanId? } - see vlanIface() and the port's IPv4 tab
-  // (07-ports.js). The management lock below applies to both.
-  function vlanIface(vlan) { return { name: 'VLAN ' + vlan.id, noun: 'VLAN', vlanId: vlan.id, addLabel: 'Add IPv4 SVI' }; }
-  async function buildSviEditor(s, iface, sviIfIndex, pane) {
-    // The management SVI (carrying this app's connection) is read-only: changing
-    // or removing its address would cut off access to the switch.
-    if (isManagementIf(s, sviIfIndex)) {
-      const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
-      let ipLine = s.target.host;
-      for (const a of ((s.health && s.health.sviAddrs) || [])) { if (String(a.index) === String(s.target.host)) { const m = String(cv(a.rsIpAdEntNetMask) || ''); const p = m ? m.split('.').reduce((n, o) => n + ((parseInt(o, 10) || 0).toString(2).match(/1/g) || []).length, 0) : null; ipLine = s.target.host + (p ? '/' + p : ''); break; } }
-      pane.appendChild(el('div', 'aaa-sub', 'Management interface'));
-      pane.appendChild(el('div', 'card-sub', 'This ' + iface.noun + '\u2019s IPv4 interface (' + ipLine + ') carries this app\u2019s connection to the switch. It is locked to prevent accidentally cutting off access.'));
-      return;
-    }
-    pane.appendChild(el('div', 'card-sub', 'Reading IPv4 interface\u2026'));
-    // Find any user address whose ifIndex matches this SVI, skipping system
-    // (internal/default) owners.
-    let cur = null;   // { ip, mask, owner }
-    let dhcpOn = false;
-    try {
-      const [ifx, masks, owners, dhcp] = await Promise.all([
-        apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.ifIndex, mode: 'getbulk' }),
-        apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.netmask, mode: 'getbulk' }),
-        apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.owner, mode: 'getbulk' }),
-        apiPost('/api/snmp/walk', { target: s.target, oid: DHCP_CL.status, mode: 'getbulk' })
-      ]);
-      const maskByIp = {}, ownerByIp = {};
-      for (const r of ((masks.body && masks.body.results) || [])) maskByIp[String(r.index)] = String(r.display !== undefined ? r.display : r.value);
-      for (const r of ((owners.body && owners.body.results) || [])) ownerByIp[String(r.index)] = parseInt(r.value, 10);
-      for (const r of ((ifx.body && ifx.body.results) || [])) {
-        const ip = String(r.index);
-        const owner = ownerByIp[ip];
-        // Only real user addresses, on this SVI. A DHCP interface without a
-        // lease has a 0.x placeholder - treat that as "DHCP, no address yet"
-        // (dhcpOn below handles the display) rather than a real current address.
-        if (sviIfIndex != null && parseInt(r.value, 10) === parseInt(sviIfIndex, 10) && (owner === 1 || owner === 2) && isRealIp(ip)) {
-          cur = { ip, mask: maskByIp[ip] || null, owner };
-          break;
-        }
-      }
-      // Is DHCP client enabled on this SVI's ifIndex?
-      for (const r of ((dhcp.body && dhcp.body.results) || [])) { if (parseInt(String(r.index), 10) === parseInt(sviIfIndex, 10)) dhcpOn = true; }
-    } catch (e) { /* show the add path */ }
-    clear(pane);
-
-    // No SVI yet: offer an explicit "Add IPv4 SVI" button.
-    if (!cur && !dhcpOn) {
-      pane.appendChild(el('div', 'card-sub', iface.name + ' has no IPv4 interface configured.'));
-      if (sviIfIndex == null) pane.appendChild(el('div', 'sw-err', 'Could not resolve this ' + iface.noun + '\u2019s L3 ifIndex (needed to add an address).'));
-      const addRow = el('div', 'snmp-form-actions'); addRow.style.marginTop = '10px';
-      const addBtn = el('button', 'btn btn-small btn-blue', iface.addLabel || 'Add IPv4 address'); addBtn.type = 'button';
-      addBtn.disabled = sviIfIndex == null;
-      addBtn.addEventListener('click', () => { clear(pane); sviConfigForm(s, iface, sviIfIndex, pane, null, false); });
-      addRow.appendChild(addBtn); pane.appendChild(addRow);
-      return;
-    }
-    // Existing SVI: show the config form pre-filled.
-    sviConfigForm(s, iface, sviIfIndex, pane, cur, dhcpOn);
-  }
-
-
-  // The SVI configuration form - Static (IP + prefix) or DHCP.
-  function sviConfigForm(s, iface, sviIfIndex, pane, cur, dhcpOn) {
-    const form = el('div', 'snmp-form acl-form');
-    const sec = formSection('IPv4 interface');
-    if (cur) sec.body.appendChild(el('div', 'card-sub', 'Current: ' + cur.ip + ' / ' + (cur.mask || '?') + ' (' + (SVI_OWNER[cur.owner] || 'static') + ')'));
-    else if (dhcpOn) sec.body.appendChild(el('div', 'card-sub', 'Current: DHCP (awaiting lease)'));
-    // Mode: Static or DHCP.
-    const modeSel = selectInput([{ label: 'Static', value: 'static' }, { label: 'DHCP', value: 'dhcp' }], dhcpOn ? 'dhcp' : 'static');
-    sec.body.appendChild(field('Addressing', modeSel));
-    const ipIn = el('input'); ipIn.type = 'text'; ipIn.placeholder = '192.168.1.1'; if (cur) ipIn.value = cur.ip;
-    const ipField = field('IP address', ipIn);
-    sec.body.appendChild(ipField);
-    const prefIn = el('input'); prefIn.type = 'number'; prefIn.min = '1'; prefIn.max = '32'; prefIn.value = cur && cur.mask ? String(maskToPref(cur.mask) || 24) : '24';
-    const prefField = field('Prefix length', prefIn);
-    sec.body.appendChild(prefField);
-    const syncMode = () => { const dhcp = modeSel.value === 'dhcp'; ipField.style.display = dhcp ? 'none' : ''; prefField.style.display = dhcp ? 'none' : ''; };
-    modeSel.addEventListener('change', syncMode); syncMode();
-    form.appendChild(sec.sec);
-
-    const { actions, apply } = applyActions(cur || dhcpOn ? 'Update IPv4' : 'Add IPv4');
-    const msg = el('div', 'port-detail-msg');
-    withConfirm(apply, (ev) => {
-      clear(msg);
-      const mode = modeSel.value;
-      if (mode === 'static' && !ipv4ToHex(ipIn.value)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
-      runButtonAction(ev.currentTarget, {
-        failLabel: 'Set IPv4 interface',
-        run: async () => {
-          try {
-            if (mode === 'dhcp') {
-              if (cur && cur.owner === 1) { try { await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 }); } catch (e) { /* ignore */ } }
-              await snmpSet(s, { oid: DHCP_CL.status + '.' + sviIfIndex, type: 'Integer', value: 4 });
-            } else {
-              if (dhcpOn) { try { await snmpSet(s, { oid: DHCP_CL.status + '.' + sviIfIndex, type: 'Integer', value: 6 }); } catch (e) { /* ignore */ } }
-              const ip = (ipIn.value || '').trim();
-              const mask = prefToMask(parseInt(prefIn.value, 10));
-              if (cur && cur.ip !== ip) { try { await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 }); } catch (e) { /* ignore */ } }
-              await snmpSet(s, [
-                { oid: SVI_IP.status + '.' + ip, type: 'Integer', value: 1 },
-                { oid: SVI_IP.ifIndex + '.' + ip, type: 'Integer', value: parseInt(sviIfIndex, 10) },
-                { oid: SVI_IP.netmask + '.' + ip, type: 'IpAddress', value: mask }
-              ]);
-            }
-            return { ok: true };
-          } catch (e) { return { ok: false, error: e.message }; }
-        },
-        ok: (r) => r && r.ok,
-        error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not set the IPv4 interface \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
-        onApplied: () => { markConfigDirty(s, [modeSel, ipIn, prefIn]); if (iface.vlanId != null) s._vlanFlash = iface.vlanId; },
-        settle: () => refreshSvi(s)
-      });
-    });
-    form.appendChild(actions); form.appendChild(msg);
-    // Remove button when something is configured.
-    if (cur || dhcpOn) {
-      const rm = actBtnConfirm('Remove IPv4', (e) => {
-        clear(msg);
-        runButtonAction(e.currentTarget, {
-          failLabel: 'Remove IPv4',
-          run: async () => {
-            try {
-              if (dhcpOn) await snmpSet(s, { oid: DHCP_CL.status + '.' + sviIfIndex, type: 'Integer', value: 6 });
-              if (cur) await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 });
-              return { ok: true };
-            } catch (err) { return { ok: false, error: err.message }; }
-          },
-          ok: (r) => r && r.ok,
-          error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not remove the IPv4 interface \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
-          onApplied: () => markConfigDirty(s),
-          settle: () => refreshSvi(s).then(() => { const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove(); })
-        });
-      }, 'danger', 'Remove this ' + iface.noun + '\u2019s IPv4 interface');
-      const rmRow = el('div', 'snmp-form-actions'); rmRow.style.marginTop = '8px'; rmRow.appendChild(rm);
-      form.appendChild(rmRow);
-    }
-    pane.appendChild(form);
   }
 
   // Refresh only the tables the VLAN view needs (the VLAN table, and the
@@ -5238,54 +5018,9 @@
     return new Promise((res) => { setTimeout(() => { refreshTables(s, tables).then(res, res); }, 900); });
   }
 
-  // Remove an SVI's IPv4 configuration for a given ifIndex: any static address
-  // (rsIpAdEntStatus = invalid(2)) and the DHCP client (rlDhcpClActionStatus =
-  // destroy(6)). Used before deleting a VLAN, and when clearing its IPv4 tab.
-  async function teardownSvi(s, ifIndex) {
-    const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
-    // Remove any address rows that belong to this ifIndex.
-    try {
-      const { body } = await apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.ifIndex, mode: 'getbulk' });
-      for (const r of ((body && body.results) || [])) {
-        if (parseInt(cv(r.value), 10) === parseInt(ifIndex, 10)) {
-          try { await snmpSet(s, { oid: SVI_IP.status + '.' + String(r.index), type: 'Integer', value: 2 }); } catch (e) { /* ignore per-row */ }
-        }
-      }
-    } catch (e) { /* ignore */ }
-    // Disable the DHCP client on this ifIndex, if enabled.
-    try { await snmpSet(s, { oid: DHCP_CL.status + '.' + ifIndex, type: 'Integer', value: 6 }); } catch (e) { /* not enabled */ }
-  }
-
-  // The ifIndex of the SVI carrying our SNMP connection: the address table row
-  // whose IP equals the host we are talking to. Modifying or deleting this SVI
-  // (or its VLAN) would cut the app's own connectivity, so it is protected.
-  // Returns the ifIndex number, or null if not found (then nothing is locked).
-  function managementIfIndex(s) {
-    const host = s && s.target && s.target.host;
-    if (!host) return null;
-    const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
-    for (const a of ((s.health && s.health.sviAddrs) || [])) {
-      if (String(a.index) === String(host)) { const ix = parseInt(cv(a.rsIpAdEntIfIndex), 10); return Number.isFinite(ix) ? ix : null; }
-    }
-    return null;
-  }
-  // True if the given SVI ifIndex is the management interface.
-  function isManagementIf(s, ifIndex) { const m = managementIfIndex(s); return m != null && ifIndex != null && parseInt(ifIndex, 10) === m; }
-
-  // After an SVI/IPv4 change the switch needs a moment to create the L3
-  // interface row (and, for DHCP, to obtain a lease). Refresh the VLAN + SVI
-  // tables twice - soon, and again a few seconds later - so the table reflects
-  // the change without the user having to reload. Light, targeted walks only.
-  // Returns the first refresh's promise, so a write's runButtonAction settle
-  // holds its spinner until the table shows the change (§B6).
-  function refreshSvi(s) {
-    setTimeout(() => refreshTables(s, ['vlans', 'interfaces', 'sviAddrs']), 4500);
-    return new Promise((res) => { setTimeout(() => { refreshTables(s, ['vlans', 'interfaces', 'sviAddrs']).then(res, res); }, 1000); });
-  }
-
   // The "add VLAN" control shown above the VLAN table.
   // Create-VLAN popout: id + name, then (after creation) the editor opens so the
-  // IPv4/ACL tabs are available.
+  // ACL tab is available.
   function openVlanCreate(s) {
     const tabs = [{ label: 'New VLAN', fill: (pane, close) => {
       const form = el('div', 'snmp-form acl-form');
@@ -5294,7 +5029,7 @@
       sec.body.appendChild(field('VLAN id', idIn));
       const nameIn = el('input'); nameIn.type = 'text'; nameIn.maxLength = 32; nameIn.placeholder = 'optional';
       sec.body.appendChild(field('Name', nameIn));
-      sec.body.appendChild(el('div', 'card-sub', 'After the VLAN is created, its editor opens so you can add an IPv4 interface and bind an ACL.'));
+      sec.body.appendChild(el('div', 'card-sub', 'After the VLAN is created, its editor opens so you can bind an ACL. Give it an IPv4 address in IPv4 Addressing.'));
       form.appendChild(sec.sec);
       const { actions, apply } = applyActions('Create VLAN');
       const msg = el('div', 'port-detail-msg');
@@ -5404,19 +5139,12 @@
 
     const anySvi = sviByVlan.size > 0;
     // SVI ifIndex -> IPv4 "addr/mask", from rsIpAddrTable (owner static/dhcp, real IPs).
+    // Read-only here: addresses are set in the IPv4 Addressing panel.
     const ipByIfIndex = new Map();
-    const cellVal = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
-    for (const a of (h.sviAddrs || [])) {
-      const owner = parseInt(cellVal(a.rsIpAdEntOwner), 10);
-      if (owner !== 1 && owner !== 2) continue;
-      const ifx = String(cellVal(a.rsIpAdEntIfIndex)); const ip = String(a.index);
-      if (!ifx) continue;
-      if (owner === 2) ipByIfIndex.set(ifx, isRealIp(ip) ? (ip + ' (DHCP)') : 'DHCP (no lease)');
-      else if (isRealIp(ip)) {
-        const mask = String(cellVal(a.rsIpAdEntNetMask) || '');
-        const pref = mask ? ((mask.split('.').reduce((n, o) => n + ((parseInt(o, 10) || 0).toString(2).match(/1/g) || []).length, 0)) || '') : '';
-        ipByIfIndex.set(ifx, pref ? ip + '/' + pref : ip);
-      }
+    for (const a of ipv4Addresses(s)) {
+      const ifx = String(a.ifIndex);
+      if (a.owner === 2) ipByIfIndex.set(ifx, a.real ? (a.ip + ' (DHCP)') : 'DHCP (no lease)');
+      else ipByIfIndex.set(ifx, a.pref ? a.ip + '/' + a.pref : a.ip);
     }
     const vlanIp = (vlanIndex) => { const svi = sviByVlan.get(String(vlanIndex)); return svi ? (ipByIfIndex.get(String(svi.index)) || '') : ''; };
 
@@ -7292,19 +7020,13 @@
           if (!Number.isNaN(n)) l2l3ByIf.set(String(r.index), L2L3[n] || ('cat ' + n));
         }
         const hasL2L3 = l2l3ByIf.size > 0;
-        // A routed port's own IPv4 address(es), shown in place of its (empty)
-        // VLAN cells. Same source and filter as the VLAN table's IPv4 column:
-        // rsIpAddrTable rows owned static(1)/dhcp(2) - internal/default are
-        // the switch's system addresses.
+        // A routed port's own IPv4 address(es), shown read-only in place of
+        // its (empty) VLAN cells; they are set in the IPv4 Addressing panel.
         const ipByIf = new Map();
-        const cvv = (cell) => cell && (cell.value !== undefined ? cell.value : cell.display);
-        for (const a of (h.sviAddrs || [])) {
-          const owner = parseInt(cvv(a.rsIpAdEntOwner), 10);
-          if ((owner !== 1 && owner !== 2) || !isRealIp(String(a.index))) continue;
-          const ifx = String(cvv(a.rsIpAdEntIfIndex));
-          const mask = String(cvv(a.rsIpAdEntNetMask) || '');
-          const pref = mask ? maskToPref(mask) : null;
-          const text = String(a.index) + (pref != null ? '/' + pref : '');
+        for (const a of ipv4Addresses(s)) {
+          if (!a.real) continue;
+          const ifx = String(a.ifIndex);
+          const text = a.ip + (a.pref != null ? '/' + a.pref : '');
           ipByIf.set(ifx, ipByIf.has(ifx) ? ipByIf.get(ifx) + ', ' + text : text);
         }
 
@@ -10089,13 +9811,350 @@
   }
 
   // =================================================================
-  // 15-routing.js: IP routing and DNS panel.
+  // 15-ipv4-addressing.js: IPv4 Addressing: interface addresses (VLAN SVIs
+  // and routed ports, static or DHCP), IP routing and DNS.
   // =================================================================
 
-  // The VLANs panel: the VLAN list with SVI/IPv4 details, create and edit.
-  // Standalone (its own module) so the Interfaces panel stays focused on ports.
+  // =================================================================
+  // IPv4 interface addresses. One editor for the address of any L3 interface
+  // (a VLAN SVI or a routed port), its DHCP client, and the management lock.
+  // =================================================================
+
+  // SVI IP table (rsIpAddrTable, base 26.1), indexed by the IP address.
+  const SVI_IP = {
+    ifIndex: '1.3.6.1.4.1.9.6.1.101.26.1.1.2',  // rsIpAdEntIfIndex
+    netmask: '1.3.6.1.4.1.9.6.1.101.26.1.1.3',  // rsIpAdEntNetMask
+    status:  '1.3.6.1.4.1.9.6.1.101.26.1.1.6',  // rsIpAdEntStatus (RowStatus)
+    owner:   '1.3.6.1.4.1.9.6.1.101.26.1.1.10'  // rsIpAdEntOwner static(1)/dhcp(2)/internal(3)/default(4)
+  };
+  const SVI_OWNER = { 1: 'static', 2: 'dhcp', 3: 'internal', 4: 'default' };
+  // DHCP client action table (rlDhcpClActionTable, base 76.3), indexed by ifIndex.
+  const DHCP_CL = {
+    status:   '1.3.6.1.4.1.9.6.1.101.76.3.1.2',  // rlDhcpClActionStatus (RowStatus to enable)
+    hostName: '1.3.6.1.4.1.9.6.1.101.76.3.1.3'
+  };
+  // Prefix length -> dotted netmask.
+  function prefToMask(p) { p = Math.max(0, Math.min(32, p | 0)); const m = p === 0 ? 0 : (0xffffffff << (32 - p)) >>> 0; return [24, 16, 8, 0].map((sh) => (m >>> sh) & 0xff).join('.'); }
+  // Dotted netmask -> prefix length.
+  function maskToPref(mask) { const m = String(mask).split('.').map(Number); if (m.length !== 4) return null; let bits = 0; for (const o of m) bits += (o.toString(2).match(/1/g) || []).length; return bits; }
+
+
+  // SVI IP editor: shows the current address (if any) and lets you set/replace
+  // or remove it. Writing a management SVI wrong can cut access, so this reads
+  // first and is explicit about what it will change.
+  // The VLAN IPv4 (SVI) editor. Reads the address table, filters to real user
+  // addresses on THIS VLAN's L3 interface (owner static/dhcp - internal/default
+  // are system addresses and must be ignored, which is what produced the bogus
+  // "0.193.134.170"), and offers Static or DHCP. When the VLAN has no SVI yet it
+  // shows an "Add IPv4 SVI" button rather than a pre-filled form.
+  //
+  // The same editor serves a routed (no switchport) port: an L3 port carries its
+  // address on its own ifIndex in the same rsIpAddrTable, exactly as an SVI
+  // does, so only the wording differs. `iface` says what is being edited:
+  // { name, noun, vlanId? } - see vlanIface() and l3Iface(). The management
+  // lock below applies to both. `done` (optional) runs once a write has
+  // settled - the IPv4 Addressing popouts pass their close.
+  function vlanIface(vlan) { return { name: 'VLAN ' + vlan.id, noun: 'VLAN', vlanId: vlan.id, addLabel: 'Add IPv4 SVI' }; }
+  async function buildSviEditor(s, iface, sviIfIndex, pane, done) {
+    // The management SVI (carrying this app's connection) is read-only: changing
+    // or removing its address would cut off access to the switch.
+    if (isManagementIf(s, sviIfIndex)) {
+      const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
+      let ipLine = s.target.host;
+      for (const a of ((s.health && s.health.sviAddrs) || [])) { if (String(a.index) === String(s.target.host)) { const m = String(cv(a.rsIpAdEntNetMask) || ''); const p = m ? m.split('.').reduce((n, o) => n + ((parseInt(o, 10) || 0).toString(2).match(/1/g) || []).length, 0) : null; ipLine = s.target.host + (p ? '/' + p : ''); break; } }
+      pane.appendChild(el('div', 'aaa-sub', 'Management interface'));
+      pane.appendChild(el('div', 'card-sub', 'This ' + iface.noun + '\u2019s IPv4 interface (' + ipLine + ') carries this app\u2019s connection to the switch. It is locked to prevent accidentally cutting off access.'));
+      return;
+    }
+    pane.appendChild(el('div', 'card-sub', 'Reading IPv4 interface\u2026'));
+    // Find any user address whose ifIndex matches this SVI, skipping system
+    // (internal/default) owners.
+    let cur = null;   // { ip, mask, owner }
+    let dhcpOn = false;
+    try {
+      const [ifx, masks, owners, dhcp] = await Promise.all([
+        apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.ifIndex, mode: 'getbulk' }),
+        apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.netmask, mode: 'getbulk' }),
+        apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.owner, mode: 'getbulk' }),
+        apiPost('/api/snmp/walk', { target: s.target, oid: DHCP_CL.status, mode: 'getbulk' })
+      ]);
+      const maskByIp = {}, ownerByIp = {};
+      for (const r of ((masks.body && masks.body.results) || [])) maskByIp[String(r.index)] = String(r.display !== undefined ? r.display : r.value);
+      for (const r of ((owners.body && owners.body.results) || [])) ownerByIp[String(r.index)] = parseInt(r.value, 10);
+      for (const r of ((ifx.body && ifx.body.results) || [])) {
+        const ip = String(r.index);
+        const owner = ownerByIp[ip];
+        // Only real user addresses, on this SVI. A DHCP interface without a
+        // lease has a 0.x placeholder - treat that as "DHCP, no address yet"
+        // (dhcpOn below handles the display) rather than a real current address.
+        if (sviIfIndex != null && parseInt(r.value, 10) === parseInt(sviIfIndex, 10) && (owner === 1 || owner === 2) && isRealIp(ip)) {
+          cur = { ip, mask: maskByIp[ip] || null, owner };
+          break;
+        }
+      }
+      // Is DHCP client enabled on this SVI's ifIndex?
+      for (const r of ((dhcp.body && dhcp.body.results) || [])) { if (parseInt(String(r.index), 10) === parseInt(sviIfIndex, 10)) dhcpOn = true; }
+    } catch (e) { /* show the add path */ }
+    clear(pane);
+
+    // No SVI yet: offer an explicit "Add IPv4 SVI" button.
+    if (!cur && !dhcpOn) {
+      pane.appendChild(el('div', 'card-sub', iface.name + ' has no IPv4 interface configured.'));
+      if (sviIfIndex == null) pane.appendChild(el('div', 'sw-err', 'Could not resolve this ' + iface.noun + '\u2019s L3 ifIndex (needed to add an address).'));
+      const addRow = el('div', 'snmp-form-actions'); addRow.style.marginTop = '10px';
+      const addBtn = el('button', 'btn btn-small btn-blue', iface.addLabel || 'Add IPv4 address'); addBtn.type = 'button';
+      addBtn.disabled = sviIfIndex == null;
+      addBtn.addEventListener('click', () => { clear(pane); sviConfigForm(s, iface, sviIfIndex, pane, null, false, done); });
+      addRow.appendChild(addBtn); pane.appendChild(addRow);
+      return;
+    }
+    // Existing SVI: show the config form pre-filled.
+    sviConfigForm(s, iface, sviIfIndex, pane, cur, dhcpOn, done);
+  }
+
+
+  // The SVI configuration form - Static (IP + prefix) or DHCP.
+  function sviConfigForm(s, iface, sviIfIndex, pane, cur, dhcpOn, done) {
+    const form = el('div', 'snmp-form acl-form');
+    const sec = formSection('IPv4 interface');
+    if (cur) sec.body.appendChild(el('div', 'card-sub', 'Current: ' + cur.ip + ' / ' + (cur.mask || '?') + ' (' + (SVI_OWNER[cur.owner] || 'static') + ')'));
+    else if (dhcpOn) sec.body.appendChild(el('div', 'card-sub', 'Current: DHCP (awaiting lease)'));
+    // Mode: Static or DHCP.
+    const modeSel = selectInput([{ label: 'Static', value: 'static' }, { label: 'DHCP', value: 'dhcp' }], dhcpOn ? 'dhcp' : 'static');
+    sec.body.appendChild(field('Addressing', modeSel));
+    const ipIn = el('input'); ipIn.type = 'text'; ipIn.placeholder = '192.168.1.1'; if (cur) ipIn.value = cur.ip;
+    const ipField = field('IP address', ipIn);
+    sec.body.appendChild(ipField);
+    const prefIn = el('input'); prefIn.type = 'number'; prefIn.min = '1'; prefIn.max = '32'; prefIn.value = cur && cur.mask ? String(maskToPref(cur.mask) || 24) : '24';
+    const prefField = field('Prefix length', prefIn);
+    sec.body.appendChild(prefField);
+    const syncMode = () => { const dhcp = modeSel.value === 'dhcp'; ipField.style.display = dhcp ? 'none' : ''; prefField.style.display = dhcp ? 'none' : ''; };
+    modeSel.addEventListener('change', syncMode); syncMode();
+    form.appendChild(sec.sec);
+
+    const { actions, apply } = applyActions(cur || dhcpOn ? 'Update IPv4' : 'Add IPv4');
+    const msg = el('div', 'port-detail-msg');
+    withConfirm(apply, (ev) => {
+      clear(msg);
+      const mode = modeSel.value;
+      if (mode === 'static' && !ipv4ToHex(ipIn.value)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
+      runButtonAction(ev.currentTarget, {
+        failLabel: 'Set IPv4 interface',
+        run: async () => {
+          try {
+            if (mode === 'dhcp') {
+              if (cur && cur.owner === 1) { try { await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 }); } catch (e) { /* ignore */ } }
+              await snmpSet(s, { oid: DHCP_CL.status + '.' + sviIfIndex, type: 'Integer', value: 4 });
+            } else {
+              if (dhcpOn) { try { await snmpSet(s, { oid: DHCP_CL.status + '.' + sviIfIndex, type: 'Integer', value: 6 }); } catch (e) { /* ignore */ } }
+              const ip = (ipIn.value || '').trim();
+              const mask = prefToMask(parseInt(prefIn.value, 10));
+              if (cur && cur.ip !== ip) { try { await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 }); } catch (e) { /* ignore */ } }
+              await snmpSet(s, [
+                { oid: SVI_IP.status + '.' + ip, type: 'Integer', value: 1 },
+                { oid: SVI_IP.ifIndex + '.' + ip, type: 'Integer', value: parseInt(sviIfIndex, 10) },
+                { oid: SVI_IP.netmask + '.' + ip, type: 'IpAddress', value: mask }
+              ]);
+            }
+            return { ok: true };
+          } catch (e) { return { ok: false, error: e.message }; }
+        },
+        ok: (r) => r && r.ok,
+        error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not set the IPv4 interface \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+        onApplied: () => { markConfigDirty(s, [modeSel, ipIn, prefIn]); if (iface.vlanId != null) s._vlanFlash = iface.vlanId; },
+        settle: () => refreshSvi(s).then(() => { if (done) done(); })
+      });
+    });
+    form.appendChild(actions); form.appendChild(msg);
+    // Remove button when something is configured.
+    if (cur || dhcpOn) {
+      const rm = actBtnConfirm('Remove IPv4', (e) => {
+        clear(msg);
+        runButtonAction(e.currentTarget, {
+          failLabel: 'Remove IPv4',
+          run: () => removeIfAddress(s, sviIfIndex, cur, dhcpOn),
+          ok: (r) => r && r.ok,
+          error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not remove the IPv4 interface \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+          onApplied: () => markConfigDirty(s),
+          settle: () => refreshSvi(s).then(() => { if (done) { done(); return; } const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove(); })
+        });
+      }, 'danger', 'Remove this ' + iface.noun + '\u2019s IPv4 interface');
+      const rmRow = el('div', 'snmp-form-actions'); rmRow.style.marginTop = '8px'; rmRow.appendChild(rm);
+      form.appendChild(rmRow);
+    }
+    pane.appendChild(form);
+  }
+
+  // Remove one interface's IPv4 configuration: its DHCP client (destroy(6))
+  // when dhcpOn, then its static address row cur.ip (invalid(2)) when cur.
+  // Returns { ok, error } for runButtonAction. Unlike teardownSvi it stops at
+  // and reports the first rejection, because the user asked for this change.
+  async function removeIfAddress(s, ifIndex, cur, dhcpOn) {
+    try {
+      if (dhcpOn) await snmpSet(s, { oid: DHCP_CL.status + '.' + ifIndex, type: 'Integer', value: 6 });
+      if (cur) await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 });
+      return { ok: true };
+    } catch (err) { return { ok: false, error: err.message }; }
+  }
+
+  // Remove an SVI's IPv4 configuration for a given ifIndex: any static address
+  // (rsIpAdEntStatus = invalid(2)) and the DHCP client (rlDhcpClActionStatus =
+  // destroy(6)). Used before deleting a VLAN, and before a routed port goes back to a switchport.
+  async function teardownSvi(s, ifIndex) {
+    const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
+    // Remove any address rows that belong to this ifIndex.
+    try {
+      const { body } = await apiPost('/api/snmp/walk', { target: s.target, oid: SVI_IP.ifIndex, mode: 'getbulk' });
+      for (const r of ((body && body.results) || [])) {
+        if (parseInt(cv(r.value), 10) === parseInt(ifIndex, 10)) {
+          try { await snmpSet(s, { oid: SVI_IP.status + '.' + String(r.index), type: 'Integer', value: 2 }); } catch (e) { /* ignore per-row */ }
+        }
+      }
+    } catch (e) { /* ignore */ }
+    // Disable the DHCP client on this ifIndex, if enabled.
+    try { await snmpSet(s, { oid: DHCP_CL.status + '.' + ifIndex, type: 'Integer', value: 6 }); } catch (e) { /* not enabled */ }
+  }
+
+  // The ifIndex of the SVI carrying our SNMP connection: the address table row
+  // whose IP equals the host we are talking to. Modifying or deleting this SVI
+  // (or its VLAN) would cut the app's own connectivity, so it is protected.
+  // Returns the ifIndex number, or null if not found (then nothing is locked).
+  function managementIfIndex(s) {
+    const host = s && s.target && s.target.host;
+    if (!host) return null;
+    const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
+    for (const a of ((s.health && s.health.sviAddrs) || [])) {
+      if (String(a.index) === String(host)) { const ix = parseInt(cv(a.rsIpAdEntIfIndex), 10); return Number.isFinite(ix) ? ix : null; }
+    }
+    return null;
+  }
+  // True if the given SVI ifIndex is the management interface.
+  function isManagementIf(s, ifIndex) { const m = managementIfIndex(s); return m != null && ifIndex != null && parseInt(ifIndex, 10) === m; }
+
+  // After an SVI/IPv4 change the switch needs a moment to create the L3
+  // interface row (and, for DHCP, to obtain a lease). Refresh the VLAN + SVI
+  // tables twice - soon, and again a few seconds later - so the table reflects
+  // the change without the user having to reload. Light, targeted walks only.
+  // Returns the first refresh's promise, so a write's runButtonAction settle
+  // holds its spinner until the table shows the change (§B6).
+  function refreshSvi(s) {
+    setTimeout(() => refreshTables(s, ['vlans', 'interfaces', 'sviAddrs']), 4500);
+    return new Promise((res) => { setTimeout(() => { refreshTables(s, ['vlans', 'interfaces', 'sviAddrs']).then(res, res); }, 1000); });
+  }
+
+  // What an L3 interface is called, from its ifIndex: a VLAN SVI (its row in
+  // the interface table is named after the VLAN id, as vlanSviIfIndex reads
+  // it) or a port (named like gi1/0/3). Returns an iface for buildSviEditor.
+  function l3Iface(s, ifIndex) {
+    const h = s.health || {};
+    const cv = (c) => (c == null ? '' : String(c.display !== undefined && c.display !== null ? c.display : (c.value !== undefined ? c.value : c)));
+    const row = (h.interfaces || []).find((r) => String(r.index) === String(ifIndex));
+    const nm = row ? cv(row.rlifPresentName).trim() : '';
+    if (/^\d+$/.test(nm) && (h.vlans || []).some((v) => String(v.index) === nm)) return vlanIface({ id: Number(nm) });
+    if (nm) return { name: 'Port ' + nm, noun: 'port' };
+    return { name: 'ifIndex ' + ifIndex, noun: 'interface' };
+  }
+
+  // The user IPv4 addresses on the switch's L3 interfaces: rsIpAddrTable rows
+  // owned static(1) or dhcp(2) - internal(3)/default(4) are the switch's own
+  // system addresses. A DHCP interface without a lease shows a 0.x
+  // placeholder, reported as no address yet. Same source and filter as the
+  // VLAN table's IPv4 column and the Interfaces table's routed-port address.
+  function ipv4Addresses(s) {
+    const cv = (c) => (c == null ? '' : (c.value !== undefined ? c.value : (c.display !== undefined ? c.display : c)));
+    const out = [];
+    for (const a of ((s.health && s.health.sviAddrs) || [])) {
+      const owner = parseInt(cv(a.rsIpAdEntOwner), 10);
+      if (owner !== 1 && owner !== 2) continue;
+      const ip = String(a.index);
+      const real = isRealIp(ip);
+      if (owner === 1 && !real) continue;
+      const ifIndex = parseInt(cv(a.rsIpAdEntIfIndex), 10);
+      if (!Number.isFinite(ifIndex)) continue;
+      const mask = String(cv(a.rsIpAdEntNetMask) || '');
+      out.push({ ip, real, owner, ifIndex, mask, pref: real && mask ? maskToPref(mask) : null });
+    }
+    return out;
+  }
+
+  // The interfaces an address can be added to: every VLAN, and every routed
+  // (no switchport) port, that has no user address yet. A VLAN's SVI ifIndex
+  // may not be known until it is read (ifIndex null -> vlanSviIfIndex).
+  function ipv4AddCandidates(s) {
+    const h = s.health || {};
+    const cv = (c) => (c == null ? '' : String(c.value !== undefined ? c.value : (c.display !== undefined && c.display !== null ? c.display : c)));
+    const used = new Set(ipv4Addresses(s).map((a) => a.ifIndex));
+    const sviByVlan = new Map();
+    for (const r of (h.interfaces || [])) {
+      const nm = cv(r.rlifPresentName).trim();
+      if (/^\d+$/.test(nm)) sviByVlan.set(nm, parseInt(r.index, 10));
+    }
+    const out = [];
+    for (const v of (h.vlans || [])) {
+      const ifx = sviByVlan.has(String(v.index)) ? sviByVlan.get(String(v.index)) : null;
+      if (ifx != null && (used.has(ifx) || isManagementIf(s, ifx))) continue;
+      out.push({ iface: vlanIface({ id: Number(v.index) }), ifIndex: ifx });
+    }
+    for (const r of (h.portL2L3 || [])) {
+      if (parseInt(cv(r.vlanSwitchPortModeCategory), 10) !== 2) continue;   // 2 = l3 routed
+      const ifx = parseInt(r.index, 10);
+      if (!Number.isFinite(ifx) || used.has(ifx) || isManagementIf(s, ifx)) continue;
+      out.push({ iface: l3Iface(s, ifx), ifIndex: ifx });
+    }
+    return out;
+  }
+
+  // Edit one interface's address: the shared editor in its own popout, which
+  // closes once a change has settled (the table then shows the result).
+  function openIpv4Editor(s, iface, ifIndex) {
+    openTabbedPopout(s, iface.name + ' \u00b7 IPv4', [{ label: 'IPv4', fill: (pane, close) => {
+      buildSviEditor(s, iface, ifIndex, pane, close);
+    } }], []);
+  }
+
+  // Add an address: pick the interface, then the shared Static/DHCP form.
+  function openIpv4AddForm(s) {
+    const cands = ipv4AddCandidates(s);
+    openTabbedPopout(s, 'Add IPv4 address', [{ label: 'Add IPv4 address', fill: (pane, close) => {
+      if (!cands.length) {
+        pane.appendChild(el('div', 'card-sub', 'Every VLAN and routed port already has an IPv4 address. Create a VLAN, or make a port routed on its Switchport tab, to add another.'));
+        return;
+      }
+      const pick = el('div', 'snmp-form acl-form');
+      const sec = formSection('Interface');
+      const sel = selectInput(cands.map((c, i) => ({ label: c.iface.name, value: String(i) })), '0');
+      sec.body.appendChild(field('Interface', sel));
+      pick.appendChild(sec.sec);
+      pane.appendChild(pick);
+      const formWrap = el('div');
+      pane.appendChild(formWrap);
+      let token = 0;   // a newer pick wins over a slower ifIndex read
+      const show = async () => {
+        const mine = ++token;
+        const c = cands[parseInt(sel.value, 10)];
+        clear(formWrap);
+        let ifx = c.ifIndex;
+        if (ifx == null && c.iface.vlanId != null) {
+          formWrap.appendChild(el('div', 'card-sub', 'Reading IPv4 interface\u2026'));
+          ifx = await vlanSviIfIndex(s, c.iface.vlanId);
+          if (mine !== token) return;
+          clear(formWrap);
+        }
+        if (ifx == null) { formWrap.appendChild(el('div', 'sw-err', 'Could not resolve this ' + c.iface.noun + '\u2019s L3 ifIndex (needed to add an address).')); return; }
+        // A VLAN read just now may turn out to carry the management address:
+        // the shared editor then shows the lock instead of a form.
+        if (isManagementIf(s, ifx)) { buildSviEditor(s, c.iface, ifx, formWrap, close); return; }
+        sviConfigForm(s, c.iface, ifx, formWrap, null, false, close);
+      };
+      sel.addEventListener('change', show);
+      show();
+    } }], []);
+  }
+
   // ===========================================================================
-  // IP Routing & DNS panel. Read + write: global L3 status, the forwarding
+  // IPv4 Addressing panel (panel key 'routing', kept so saved dashboard
+  // layouts still place it). Read + write: the IPv4 interfaces section above
+  // (every VLAN SVI and routed port address), global L3 status, the forwarding
   // table (paginated), editable static routes, DNS client status, nameservers
   // and static host mappings. Uses the keyed-table engine and runButtonAction
   // like every other module. OIDs are the standard ipForwarding/ipCidrRouteTable
@@ -10156,6 +10215,45 @@
     };
     const emptyNote = (msg) => { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', msg)); };
     const refresh = () => routingRefresh(s);   // single shared refresh (standard §5)
+
+    // ---- IPv4 interfaces: the address of every VLAN SVI and routed port ----
+    // From sviAddrs (periodic walk), so nothing extra is fetched. A row opens
+    // that interface's editor (static or DHCP); Delete removes the address or
+    // turns its DHCP client off. The management interface is locked (§B6).
+    const addrs = ipv4Addresses(s);
+    section('IPv4 interfaces', addrs.length ? addrs.length + ' address(es)' : '', 'Add IPv4 address', () => openIpv4AddForm(s));
+    if (addrs.length) {
+      const arows = addrs.map((a) => {
+        const iface = l3Iface(s, a.ifIndex);
+        const cells = [
+          { v: iface.name, click: s.target ? { open: () => openIpv4Editor(s, iface, a.ifIndex) } : undefined },
+          { v: a.real ? a.ip : '\u2014' },
+          { v: a.pref != null ? '/' + a.pref : '' },
+          { v: a.owner === 2 ? (a.real ? 'dhcp' : 'dhcp (no lease)') : 'static' } ];
+        if (s.target) {
+          if (isManagementIf(s, a.ifIndex)) {
+            const locked = el('span', 'card-sub'); locked.textContent = '\uD83D\uDD12 locked';
+            locked.title = 'This address carries this app\u2019s connection to the switch; changing or removing it could cut off access, so it is locked.';
+            cells.push({ cellNode: locked, sig: 'locked' });
+          } else {
+            const dhcp = a.owner === 2;
+            const del = actGroup([actBtnConfirm('Delete', (e) => {
+              runButtonAction(e.currentTarget, {
+                failLabel: 'Delete address',
+                run: () => removeIfAddress(s, a.ifIndex, dhcp ? null : { ip: a.ip }, dhcp),
+                ok: (r) => r && r.ok,
+                error: (r) => (r && r.error) || 'the switch rejected it',
+                onApplied: () => markConfigDirty(s),
+                settle: () => refreshSvi(s)
+              });
+            }, 'danger', dhcp ? 'Turn off DHCP on ' + iface.name : 'Delete ' + a.ip + ' from ' + iface.name)]);
+            cells.push({ cellNode: del, sig: 'del' });
+          }
+        }
+        return { key: 'ip:' + a.ip + '@' + a.ifIndex, cells: cells };
+      });
+      mountInto(body, s, p, 'ipv4Addrs', ['Interface', 'Address', 'Prefix', 'Source'].concat(s.target ? [''] : []), arows);
+    } else { emptyNote('No IPv4 addresses configured.'); }
 
     // ---- Global L3 status ----
     // The pill reads a scalar, so its VALUE can change on a reconcile even though
