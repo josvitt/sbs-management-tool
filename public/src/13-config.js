@@ -592,22 +592,10 @@
       const go = el('button', 'btn btn-amber', 'Save running to startup');
       go.type = 'button'; go.style.width = 'auto';
       go.title = 'Copies running-config over startup-config on the switch';
-      const confirmRow = el('div', 'cfg-confirm');
-      confirmRow.style.display = 'none';
-      confirmRow.appendChild(el('span', 'card-sub',
-        'Overwrite the startup configuration on ' + s.host + ' with the running configuration?'));
-      const yes = el('button', 'btn btn-danger', 'Yes, overwrite startup');
-      yes.type = 'button'; yes.style.width = 'auto';
-      const no = el('button', 'btn', 'Cancel');
-      no.type = 'button'; no.style.width = 'auto';
-      confirmRow.appendChild(yes); confirmRow.appendChild(no);
-
-      go.addEventListener('click', () => { go.style.display = 'none'; confirmRow.style.display = 'flex'; });
-      no.addEventListener('click', () => { confirmRow.style.display = 'none'; go.style.display = ''; });
-      yes.addEventListener('click', () => syncConfigs(s));
+      // Two taps (B8): the first arms the button, the second overwrites startup.
+      withConfirm(go, () => syncConfigs(s), { danger: true, confirmText: 'Tap again to overwrite startup' });
 
       bar.appendChild(go);
-      bar.appendChild(confirmRow);
       host.appendChild(bar);
     }
     host.appendChild(diffPre(diff));

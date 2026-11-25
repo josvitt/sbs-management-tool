@@ -194,6 +194,16 @@
           .concat(editable ? [r.key ? snmpDeleteCell(s, 'Delete recipient', 'recipient-delete-apply', { key: r.key }, ['recipients'], 'Delete this recipient') : { v: '' }] : []) })));
     }
 
+    // The credential this app connects with cannot be deleted (the switch
+    // refuses, and it would cut the app off), so its row shows the standard
+    // lock with the reason instead of offering Delete (B6).
+    const inUseCell = (row) => {
+      if (!row.inUse) return null;
+      const locked = el('span', 'card-sub', '\uD83D\uDD12 in use');
+      locked.title = 'This app connects to the switch with this credential, so it cannot be deleted here.';
+      return { cellNode: locked, sig: 'locked' };
+    };
+
     // ---- Communities ----
     // Traps and Status are not shown: Traps is only filled for the legacy
     // station-restricted community table (unused here), and a community is
@@ -210,7 +220,7 @@
           const key = 'comm:' + (c.key ? c.key.source + ':' + c.key.index : c.community);
           const first = (editable && c.key) ? { v: c.community, click: { open: () => openSnmpCommunityForm(s, key) } } : { v: c.community };
           return { key, cells: [first, { v: c.station || 'any' }, { v: c.access || '' }, { v: c.view || '\u2014' }]
-            .concat(editable ? [c.key ? snmpDeleteCell(s, 'Delete community', 'community-delete-apply', { key: c.key }, ['communities'], 'Delete this community') : { v: '' }] : []) };
+            .concat(editable ? [inUseCell(c) || (c.key ? snmpDeleteCell(s, 'Delete community', 'community-delete-apply', { key: c.key }, ['communities'], 'Delete this community') : { v: '' })] : []) };
         }));
     }
 
@@ -241,7 +251,7 @@
       else mountInto(body, s, p, 'snmp:usr', ['User', 'Auth', 'Privacy', 'Group', 'Status'].concat(act),
         users.map((u) => ({ key: 'usr:' + (u.key ? u.key.index : u.name), cells: [
           { v: u.name }, { v: u.auth }, { v: u.priv }, { v: u.group }, { v: u.status }]
-          .concat(editable ? [u.key ? snmpDeleteCell(s, 'Delete user', 'user-delete-apply', { key: u.key }, ['users'], 'Delete this user') : { v: '' }] : []) })));
+          .concat(editable ? [inUseCell(u) || (u.key ? snmpDeleteCell(s, 'Delete user', 'user-delete-apply', { key: u.key }, ['users'], 'Delete this user') : { v: '' })] : []) })));
     }
   }
 

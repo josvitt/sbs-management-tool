@@ -9,6 +9,15 @@ const log = require('../logger');
 const snmpConfig = require('../snmp-config');
 const { buildSnmpSession, snmpConfigBundle } = require('../snmp-core');
 
+// Flag the community or SNMPv3 user this app is connected with, so the panel
+// can leave out its Delete: the switch refuses to delete the credential in use.
+function markInUse(result, listKey, field, current) {
+  if (current && result && Array.isArray(result[listKey])) {
+    for (const row of result[listKey]) if (row && row[field] === current) row.inUse = true;
+  }
+  return result;
+}
+
 module.exports = function register(app) {
   // SNMP configuration (recipients, communities, VACM groups, users,
   // system identity) — the write side and its config-specific reads.
@@ -38,9 +47,9 @@ module.exports = function register(app) {
       switch (action) {
         case 'access': result = await snmpConfig.accessCheck(S, meta); break;
         case 'recipients': result = await snmpConfig.listRecipients(S, { all: body.all }); break;
-        case 'communities': result = await snmpConfig.listCommunities(S); break;
+        case 'communities': result = markInUse(await snmpConfig.listCommunities(S), 'communities', 'community', meta.version !== '3' && meta.community); break;
         case 'groups': result = await snmpConfig.listGroups(S); break;
-        case 'users': result = await snmpConfig.listUsers(S); break;
+        case 'users': result = markInUse(await snmpConfig.listUsers(S), 'users', 'name', meta.version === '3' && meta.user); break;
         case 'views': result = await snmpConfig.listViewNames(S); break;
         case 'target-check': result = await snmpConfig.checkTargetRows(S); break;
         case 'target-row-delete-apply': {
@@ -72,3 +81,4 @@ module.exports = function register(app) {
     }
   });
 };
+module.exports.markInUse = markInUse;

@@ -95,7 +95,6 @@ body { display: flex; flex-direction: column; }
 }
 .tab-close:hover { color: var(--red); background: rgba(226,96,79,0.15); }
 
-
 /* Sits immediately after the last tab: a target, not a label. */
 .new-btn {
   font-family: var(--mono); font-size: 15px; line-height: 1;
@@ -935,7 +934,6 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
 }
 .f-cfg-file { margin-top: 8px; color: var(--muted); font-size: 11px; }
 
-
 /* ---------- Topology ---------- */
 /* A palette of its own: the diagram needs more distinguishable colours
    than a dashboard does, and they should read as one family. */
@@ -1104,19 +1102,8 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
 .snmp-lvl-label { color: var(--text); font-size: 12px; margin-top: 4px; }
 .snmp-lvl-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .acl-fsec-body .snmp-lvl-row .snmp-field select { padding: 6px 6px; }
-.snmp-msg { font-size: 13px; padding: 8px 11px; border-radius: 6px; }
-.snmp-msg.ok { background: rgba(102,187,106,0.12); border: 1px solid var(--green); color: var(--text); }
-.snmp-msg.bad { background: rgba(229,115,115,0.12); border: 1px solid var(--red); color: var(--text); }
+
 .snmp-field-check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
-
-/* ---- Inline row editor (AAA server edit) ---- */
-.snmp-edit-row > td { padding: 0 !important; background: var(--panel-2); }
-.snmp-edit-host { padding: 12px; border-top: 2px solid var(--blue); }
-.snmp-edit-host .snmp-form { margin: 0; border: 0; background: transparent; padding: 0; }
-
-/* ---- Details identity edit form ---- */
-#sysid-form { max-width: 520px; }
-#sysid-form .snmp-form-grid { grid-template-columns: 1fr; gap: 8px; }
 
 /* ---- Interface detail popout (click a port in the Interfaces table) ---- */
 .port-link {
@@ -1191,56 +1178,19 @@ input:-webkit-autofill, input:-webkit-autofill:focus {
 /* Space out action buttons in table action cells (flash files, captures). */
 .port-actions .btn + .btn { margin-left: 6px; }
 
-/* Newly added flash file — green outline that fades after a few seconds. */
-.data-table tr.flash-new td {
-  background: rgba(72, 187, 120, 0.14);
-  box-shadow: inset 0 0 0 1px var(--green, #48bb78);
-  transition: background 0.8s ease, box-shadow 0.8s ease;
-}
-
 /* Event source checkboxes in the Events tools bar. */
 .event-sources { display: inline-flex; align-items: center; gap: 12px; margin-right: 6px; }
 .event-sources .check-label { font-size: 12px; white-space: nowrap; }
 
-/* ---- AAA server blocks (RADIUS / TACACS) in the Auth panel ---- */
-.aaa-server { margin: 4px 0; padding: 6px 8px; background: var(--panel-2);
-  border: 1px solid var(--panel-border); border-radius: 6px; font-size: 12px; }
-.aaa-server > summary { cursor: pointer; display: flex; align-items: center; gap: 10px; list-style: none; }
-.aaa-server > summary::-webkit-details-marker { display: none; }
-.aaa-server > summary::before { content: '\25B8'; color: var(--muted); font-size: 10px; }
-.aaa-server[open] > summary::before { content: '\25BE'; }
-.aaa-name { font-family: var(--mono); color: var(--text); }
-.aaa-sum { color: var(--muted); font-size: 11px; }
+/* ---- AAA section sub-headings in the Auth panel ---- */
+
 .aaa-sub { margin: 8px 0 4px; font-size: 10px; text-transform: uppercase;
   letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
-.aaa-server .port-detail-grid { margin-top: 6px; max-width: 420px; }
 
-/* ---- AAA server add/edit forms ---- */
-.aaa-add { margin: 4px 0 12px; }
-.aaa-form { margin: 6px 0 12px; padding: 10px; background: var(--panel-2);
-  border: 1px solid var(--panel-border); border-radius: 8px; }
-
-/* ---- AAA key show/hide + inline edit ---- */
+/* ---- AAA key field with its show/hide button ---- */
 .key-row { display: flex; gap: 6px; align-items: center; width: 100%; min-width: 0; }
 .key-row input { flex: 1 1 auto; min-width: 0; }
 .key-row .btn { flex: 0 0 auto; white-space: nowrap; }
-.key-show { white-space: nowrap; }
-.aaa-inline-row > td { background: var(--panel-2); padding: 0; border-top: 1px solid var(--amber); }
-.aaa-inline-row .aaa-form { margin: 0; border-radius: 0; border: none; background: transparent; padding: 12px; }
-.inapp-confirm { margin: 6px 0; }
-
-/* More breathing room for the AAA form action buttons. */
-.aaa-form .snmp-form-actions { margin-top: 12px; gap: 10px; padding-top: 4px; }
-.aaa-form .snmp-form-grid { gap: 10px 14px; }
-.aaa-editor-host { margin-top: 4px; }
-
-/* ---- AAA in-place row editing ---- */
-tr.aaa-editing > td { background: var(--panel-2); vertical-align: middle; }
-.cell-input { width: 100%; max-width: 120px; padding: 3px 5px; font-size: 11px;
-  background: var(--panel); border: 1px solid var(--panel-border); color: var(--text); border-radius: 4px; }
-.cell-ports { display: flex; align-items: center; gap: 2px; }
-.cell-key { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.cell-gk { display: inline-flex; align-items: center; gap: 3px; font-size: 10px; color: var(--muted); }
 
 /* ============================================================
    Unified table row-action buttons (Edit / Delete, etc.)
@@ -1284,8 +1234,7 @@ tr.aaa-editing > td { background: var(--panel-2); vertical-align: middle; }
 .tbl-add-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Greyed (read-only) form inputs — used where a field is shown but not editable. */
-.snmp-form input:disabled, .snmp-form select:disabled,
-.aaa-form input:disabled, .aaa-form select:disabled {
+.snmp-form input:disabled, .snmp-form select:disabled {
   opacity: 0.5; cursor: not-allowed; background: var(--panel);
 }
 
@@ -1310,15 +1259,9 @@ tr.aaa-editing > td { background: var(--panel-2); vertical-align: middle; }
 .port-detail-settings select:disabled, .port-detail-settings input:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* Port-channel member editor. */
-.ch-editor { margin: 8px 0 14px; }
 .ch-members { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 4px 10px; margin: 6px 0; }
 .ch-member { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; white-space: nowrap; }
 .ch-member input:disabled + span { opacity: 0.4; }
-
-.ch-edit-host { margin-top: 4px; }
-.ch-edit-host .aaa-form { margin-top: 6px; }
-
-.ch-debug-row { margin: 6px 0 10px; }
 
 /* 802.1X global settings section. */
 .d1xg { margin: 4px 0 12px; }

@@ -8,11 +8,12 @@
   // has no mounted keyed tables yet (caller should fall back to a full repaint).
   // panelIsConverted lists the keys that use keyed tables for every table they
   // render; a converted panel is safe to reconcile without a full repaint.
-  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg']);   // filled in as each is converted
-  // A converted panel may still have unkeyed sections (auth's AAA servers). When
-  // a refresh changes a table those read, full-repaint instead of reconciling.
+  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg', 'stp', 'flash', 'capture']);
+  // A converted panel may still have sections built on a full paint only (auth's
+  // 802.1X editor). When a refresh changes a table those read, full-repaint
+  // instead of reconciling.
   const PANEL_FULL_REPAINT_TABLES = {
-    auth: ['radius', 'radiusServers', 'radiusStats', 'tacacs', 'tacacsServers', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode']
+    auth: ['radius', 'tacacs', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode']
     // (routing's scalar-driven status pills update in place during reconcile -
     // see paintRoutingPanel - so it does not need a forced full repaint.)
   };
@@ -491,75 +492,23 @@
     ['Out queue len', 'rlifPresentOutQLen', 'ifOutQLen']
   ];
 
-  // A generic read-only detail popout: a title, a list of [label, value] pairs,
-  // and optional named sub-sections each with their own pairs. Reused for
-  // per-host 802.1X counters and similar.
-  // Reusable edit popout with the same tabbed layout as the interface detail:
-  // a "Configuration" tab (filled by fillConfig(pane)) and, when fillCounters
-  // is provided, a "Counters" tab. Used so every table opens the SAME kind of
-  // popout on row-click. fillConfig / fillCounters receive the pane element to
-  // append into. Returns nothing; manages its own close.
-  function openEditPopout(s, title, fillConfig, fillCounters, opts) {
-    opts = opts || {};
-    const prev = document.querySelector('.port-detail-back');
-    if (prev) prev.remove();
-    const back = el('div', 'port-detail-back');
-    const pop = el('div', 'port-detail');
-    const close = () => back.remove();
-    back.addEventListener('click', (e) => { if (e.target === back) close(); });
-    const head = el('div', 'port-detail-head');
-    head.appendChild(el('h3', '', title));
-    const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
-    x.addEventListener('click', close); head.appendChild(x);
-    pop.appendChild(head);
-
-    const hasCounters = typeof fillCounters === 'function';
-    if (hasCounters) {
-      const tabs = el('div', 'pd-tabs');
-      const cfgBtn = el('button', 'pd-tab active', opts.configLabel || 'Configuration'); cfgBtn.type = 'button';
-      const ctrBtn = el('button', 'pd-tab', opts.countersLabel || 'Counters'); ctrBtn.type = 'button';
-      tabs.appendChild(cfgBtn); tabs.appendChild(ctrBtn); pop.appendChild(tabs);
-      const cfgPane = el('div', 'pd-pane');
-      const ctrPane = el('div', 'pd-pane'); ctrPane.style.display = 'none';
-      pop.appendChild(cfgPane); pop.appendChild(ctrPane);
-      const show = (cfg) => { cfgPane.style.display = cfg ? '' : 'none'; ctrPane.style.display = cfg ? 'none' : ''; cfgBtn.classList.toggle('active', cfg); ctrBtn.classList.toggle('active', !cfg); };
-      cfgBtn.addEventListener('click', () => show(true));
-      ctrBtn.addEventListener('click', () => show(false));
-      fillConfig(cfgPane, close);
-      fillCounters(ctrPane, close);
-    } else {
-      const pane = el('div', 'pd-pane');
-      pop.appendChild(pane);
-      fillConfig(pane, close);
-    }
-    back.appendChild(pop);
-    document.body.appendChild(back);
-  }
-
+  // A read-only detail pop-out: a title, a list of [label, value] pairs, and
+  // optional named sub-sections each with their own pairs (per-host 802.1X
+  // counters, a port channel without write access). The standard tabbed
+  // pop-out with one Details tab, so it closes with Esc like every other.
   function openDetailDialog(s, title, pairs, sections) {
-    const prev = document.querySelector('.port-detail-back');
-    if (prev) prev.remove();
-    const back = el('div', 'port-detail-back');
-    const pop = el('div', 'port-detail');
-    const close = () => back.remove();
-    back.addEventListener('click', (e) => { if (e.target === back) close(); });
-    const head = el('div', 'port-detail-head');
-    head.appendChild(el('h3', '', title));
-    const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
-    x.addEventListener('click', close); head.appendChild(x);
-    pop.appendChild(head);
     const grid = (ps) => {
       const dl = el('dl', 'port-detail-grid');
       for (const [k, v] of ps) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
       return dl;
     };
-    pop.appendChild(grid(pairs));
-    if (sections) for (const name in sections) {
-      pop.appendChild(el('div', 'port-detail-sub', name));
-      pop.appendChild(grid(sections[name]));
-    }
-    back.appendChild(pop);
-    document.body.appendChild(back);
+    openTabbedPopout(s, title, [{ label: 'Details', fill: (pane) => {
+      pane.appendChild(grid(pairs));
+      if (sections) for (const name in sections) {
+        pane.appendChild(el('div', 'port-detail-sub', name));
+        pane.appendChild(grid(sections[name]));
+      }
+    } }], []);
   }
 
   // A popout with any number of tabs. tabs: [{ label, fill(pane, close), onShow }].
@@ -571,9 +520,12 @@
     if (prev) prev.remove();
     const back = el('div', 'port-detail-back');
     const pop = el('div', 'port-detail');
-    const close = () => { for (const t of (popTimers || [])) clearInterval(t); back.remove(); };
+    // Esc closes it (A5). The listener goes with the pop-out however it closes,
+    // so a later Esc cannot close the next one opened.
+    const esc = (e) => { if (e.key === 'Escape') close(); };
+    const close = () => { for (const t of (popTimers || [])) clearInterval(t); back.remove(); document.removeEventListener('keydown', esc); };
     back.addEventListener('click', (e) => { if (e.target === back) close(); });
-    document.addEventListener('keydown', function esc(e) { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); } });
+    document.addEventListener('keydown', esc);
     const head = el('div', 'port-detail-head');
     head.appendChild(el('h3', '', title));
     const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';

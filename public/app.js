@@ -2456,14 +2456,18 @@
     interfaces: ['interfaces', 'poe', 'lagAgg', 'lagMembers', 'lagCreation', 'lagPortKey', 'bridgePorts', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode', 'vlans', 'vlansCurrent', 'portModes', 'portL2L3', 'portAccessVlan', 'portNativeVlan', 'sviAddrs'],
     vlans: ['vlans', 'vlansCurrent', 'interfaces', 'sviAddrs', 'portModes', 'portL2L3', 'voiceOUI', 'voiceLocalSrc', 'scalars'],
     summary: ['vlans', 'interfaces', 'sviAddrs', 'scalars', 'poe'],
-    auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs'],
+    auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked', 'radius', 'tacacs', 'radiusServers', 'radiusStats', 'tacacsServers'],
     connected: ['macTable', 'interfaces', 'bridgePorts', 'dot1xHosts'],
-    stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts'],
+    stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts', 'mstpInstances',
+          'pvstPorts', 'pvstVlans', 'pvstInconsistencies', 'stpxInconsistencies'],
     routing: ['sviAddrs', 'interfaces', 'vlans', 'portL2L3', 'routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],
     acl: ['aclNames', 'aclAces', 'aclTuples'],
-    // SNMP configuration has its own loader (17-snmp-config.js); no health
-    // table feeds it, so a table refresh never repaints it.
-    snmpcfg: []
+    // SNMP configuration, Flash files and Packet capture have their own
+    // loaders (17-snmp-config.js, 16-flash-capture.js); no health table feeds
+    // them, so a table refresh never repaints them.
+    snmpcfg: [],
+    flash: [],
+    capture: []
   };
   function panelDependsOn(key, changedTables) {
     const deps = PANEL_TABLE_DEPS[key];
@@ -2497,35 +2501,6 @@
         try { rec.run(s); } catch (e) { /* a view error must not break the refresh */ }
       }
     }
-  }
-
-  // ---- Self-managed module refresh (standard B1 family (c), B5) ----
-  // The keyed-panel modules refresh through refreshTables, which preserves scroll
-  // for them. The self-managed config modules (capture, flash) own
-  // their own fetch + DOM rebuild, so each one used to hand-roll the same
-  // "capture scroll, clear, rebuild, restore scroll" dance - and each was a place
-  // the scroll-preservation fix had to be applied separately. These two helpers
-  // own that dance once:
-  //
-  //   selfManagedRender(s, renderFn)  - runs renderFn (which clears and rebuilds a
-  //     container) with scroll captured before and restored after, so a rebuild
-  //     never jumps the page. Use this to wrap the body of any render function
-  //     that does clear()+rebuild in a self-managed module.
-  //
-  //   selfManagedReload(s, loaderFn)  - awaits loaderFn (the module's async
-  //     fetch+render) and returns a promise, so a write's runButtonAction settle
-  //     can wait for the reload to finish before showing Done (spinner holds until
-  //     the UI reflects the change, exactly like refreshTables does for keyed
-  //     panels). loaderFn is expected to preserve its own scroll via
-  //     selfManagedRender at its render step.
-  function selfManagedRender(s, renderFn) {
-    const restore = scrollKeeper(s);
-    try { renderFn(); } finally { restore(); }
-  }
-  function selfManagedReload(s, loaderFn) {
-    if (typeof loaderFn !== 'function') return Promise.resolve();
-    try { return Promise.resolve(loaderFn()).catch(() => {}); }
-    catch (e) { return Promise.resolve(); }
   }
 
   function refreshTables(s, tables) {
@@ -2744,14 +2719,12 @@
     // Syslog comes from the receiver in this app, not from the switch.
     if (p.key === 'events') { loadEvents(s, p); return; }
     if (p.key === 'auth') { loadSessions(s); }
-    // Interactive, write-driven panels don't come from the health poll; a
-    // refresh just re-paints them rather than walking the whole switch.
-    if (p.key === 'capture' || p.key === 'flash') { if (p._body) paintPanelBody(s, p); return; }
-    // SNMP configuration re-runs its own loader (a server-computed view, not
-    // health tables) and reconciles in place.
-    if (p.key === 'snmpcfg') {
+    // SNMP configuration, Flash files and Packet capture re-run their own
+    // loaders (server endpoints, not health tables) and reconcile in place.
+    const ownLoader = { snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad }[p.key];
+    if (ownLoader) {
       if (btn) { btn.disabled = true; btn.classList.add('spin'); }
-      snmpLoad(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });
+      ownLoader(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });
       return;
     }
 
@@ -2842,7 +2815,7 @@
   //   { v, pill }                    -> coloured status pill
   //   { v, click:{open} }            -> row-opens-detail link cell
   //   { actions }                    -> port action buttons (via portActionsCell)
-  //   { vlanDelete } / { rowActions }-> module-specific action cells
+  //   { vlanDelete }                 -> VLAN delete cell
   //   { cellNode }                   -> a caller-built DOM node (buttons, etc.)
   // Value cells diff by their value; node-bearing cells (cellNode/actions/...)
   // carry an explicit `sig` string the caller sets to whatever determines their
@@ -2888,12 +2861,6 @@
       td.appendChild(c.cellNode);
       return td;
     }
-    if (c && c.rowActions) {
-      const td = el('td', 'port-actions');
-      td.addEventListener('click', (e) => e.stopPropagation());
-      if (s._aaaRowAction) s._aaaRowAction(td, c.rowActions);
-      return td;
-    }
     if (c && c.click) {
       const td = el('td', 'col-value');
       td.appendChild(el('span', 'port-link', c.v === undefined || c.v === null ? '' : c.v));
@@ -2922,7 +2889,7 @@
     if (typeof c !== 'object') return 't:' + c;
     // Cells carrying a live DOM node diff by a caller-supplied sig; without one
     // they rebuild every reconcile (safe default).
-    if (c.actions || c.cellNode || c.vlanDelete || c.rowActions || (c.node instanceof Node)) {
+    if (c.actions || c.cellNode || c.vlanDelete || (c.node instanceof Node)) {
       return 'n:' + (c.sig !== undefined ? c.sig : ('\u0000rand' + Math.random()));
     }
     const kind = c.pill ? 'p' : (c.click ? 'c' : 'v');
@@ -3149,10 +3116,8 @@
     return cellArrays.map((cells, i) => ({ key: String(keyFn(dataRows[i], i)), cells: cells }));
   }
 
-  // A one-shot keyed table for panels that manage their OWN container and
-  // rebuild it wholesale on their own refresh (SNMP config, ACL) - they don't
-  // participate in the panel reconcile system, so they just need the standard
-  // table markup. Rows are plain cell-arrays (cells may be values or DOM nodes,
+  // A one-shot keyed table outside the panels (the config history list): it is
+  // built once and never reconciled, so it just needs the standard markup. Rows are plain cell-arrays (cells may be values or DOM nodes,
   // the legacy snmpTable style). onRowClick(i, tr) is supported for edit rows.
   // Returns the node; keeps _tbody/_colspan/_rowByKey for editor anchoring.
   function plainTable(s, cols, rows, onRowClick) {
@@ -3171,11 +3136,12 @@
   // has no mounted keyed tables yet (caller should fall back to a full repaint).
   // panelIsConverted lists the keys that use keyed tables for every table they
   // render; a converted panel is safe to reconcile without a full repaint.
-  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg']);   // filled in as each is converted
-  // A converted panel may still have unkeyed sections (auth's AAA servers). When
-  // a refresh changes a table those read, full-repaint instead of reconciling.
+  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg', 'stp', 'flash', 'capture']);
+  // A converted panel may still have sections built on a full paint only (auth's
+  // 802.1X editor). When a refresh changes a table those read, full-repaint
+  // instead of reconciling.
   const PANEL_FULL_REPAINT_TABLES = {
-    auth: ['radius', 'radiusServers', 'radiusStats', 'tacacs', 'tacacsServers', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode']
+    auth: ['radius', 'tacacs', 'dot1xPortCfg', 'dot1xPortMethod', 'dot1xHostMode']
     // (routing's scalar-driven status pills update in place during reconcile -
     // see paintRoutingPanel - so it does not need a forced full repaint.)
   };
@@ -3654,75 +3620,23 @@
     ['Out queue len', 'rlifPresentOutQLen', 'ifOutQLen']
   ];
 
-  // A generic read-only detail popout: a title, a list of [label, value] pairs,
-  // and optional named sub-sections each with their own pairs. Reused for
-  // per-host 802.1X counters and similar.
-  // Reusable edit popout with the same tabbed layout as the interface detail:
-  // a "Configuration" tab (filled by fillConfig(pane)) and, when fillCounters
-  // is provided, a "Counters" tab. Used so every table opens the SAME kind of
-  // popout on row-click. fillConfig / fillCounters receive the pane element to
-  // append into. Returns nothing; manages its own close.
-  function openEditPopout(s, title, fillConfig, fillCounters, opts) {
-    opts = opts || {};
-    const prev = document.querySelector('.port-detail-back');
-    if (prev) prev.remove();
-    const back = el('div', 'port-detail-back');
-    const pop = el('div', 'port-detail');
-    const close = () => back.remove();
-    back.addEventListener('click', (e) => { if (e.target === back) close(); });
-    const head = el('div', 'port-detail-head');
-    head.appendChild(el('h3', '', title));
-    const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
-    x.addEventListener('click', close); head.appendChild(x);
-    pop.appendChild(head);
-
-    const hasCounters = typeof fillCounters === 'function';
-    if (hasCounters) {
-      const tabs = el('div', 'pd-tabs');
-      const cfgBtn = el('button', 'pd-tab active', opts.configLabel || 'Configuration'); cfgBtn.type = 'button';
-      const ctrBtn = el('button', 'pd-tab', opts.countersLabel || 'Counters'); ctrBtn.type = 'button';
-      tabs.appendChild(cfgBtn); tabs.appendChild(ctrBtn); pop.appendChild(tabs);
-      const cfgPane = el('div', 'pd-pane');
-      const ctrPane = el('div', 'pd-pane'); ctrPane.style.display = 'none';
-      pop.appendChild(cfgPane); pop.appendChild(ctrPane);
-      const show = (cfg) => { cfgPane.style.display = cfg ? '' : 'none'; ctrPane.style.display = cfg ? 'none' : ''; cfgBtn.classList.toggle('active', cfg); ctrBtn.classList.toggle('active', !cfg); };
-      cfgBtn.addEventListener('click', () => show(true));
-      ctrBtn.addEventListener('click', () => show(false));
-      fillConfig(cfgPane, close);
-      fillCounters(ctrPane, close);
-    } else {
-      const pane = el('div', 'pd-pane');
-      pop.appendChild(pane);
-      fillConfig(pane, close);
-    }
-    back.appendChild(pop);
-    document.body.appendChild(back);
-  }
-
+  // A read-only detail pop-out: a title, a list of [label, value] pairs, and
+  // optional named sub-sections each with their own pairs (per-host 802.1X
+  // counters, a port channel without write access). The standard tabbed
+  // pop-out with one Details tab, so it closes with Esc like every other.
   function openDetailDialog(s, title, pairs, sections) {
-    const prev = document.querySelector('.port-detail-back');
-    if (prev) prev.remove();
-    const back = el('div', 'port-detail-back');
-    const pop = el('div', 'port-detail');
-    const close = () => back.remove();
-    back.addEventListener('click', (e) => { if (e.target === back) close(); });
-    const head = el('div', 'port-detail-head');
-    head.appendChild(el('h3', '', title));
-    const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
-    x.addEventListener('click', close); head.appendChild(x);
-    pop.appendChild(head);
     const grid = (ps) => {
       const dl = el('dl', 'port-detail-grid');
       for (const [k, v] of ps) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
       return dl;
     };
-    pop.appendChild(grid(pairs));
-    if (sections) for (const name in sections) {
-      pop.appendChild(el('div', 'port-detail-sub', name));
-      pop.appendChild(grid(sections[name]));
-    }
-    back.appendChild(pop);
-    document.body.appendChild(back);
+    openTabbedPopout(s, title, [{ label: 'Details', fill: (pane) => {
+      pane.appendChild(grid(pairs));
+      if (sections) for (const name in sections) {
+        pane.appendChild(el('div', 'port-detail-sub', name));
+        pane.appendChild(grid(sections[name]));
+      }
+    } }], []);
   }
 
   // A popout with any number of tabs. tabs: [{ label, fill(pane, close), onShow }].
@@ -3734,9 +3648,12 @@
     if (prev) prev.remove();
     const back = el('div', 'port-detail-back');
     const pop = el('div', 'port-detail');
-    const close = () => { for (const t of (popTimers || [])) clearInterval(t); back.remove(); };
+    // Esc closes it (A5). The listener goes with the pop-out however it closes,
+    // so a later Esc cannot close the next one opened.
+    const esc = (e) => { if (e.key === 'Escape') close(); };
+    const close = () => { for (const t of (popTimers || [])) clearInterval(t); back.remove(); document.removeEventListener('keydown', esc); };
     back.addEventListener('click', (e) => { if (e.target === back) close(); });
-    document.addEventListener('keydown', function esc(e) { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); } });
+    document.addEventListener('keydown', esc);
     const head = el('div', 'port-detail-head');
     head.appendChild(el('h3', '', title));
     const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
@@ -3966,7 +3883,7 @@
       form.appendChild(sec.sec);
       const { actions, apply } = applyActions('Add static MAC');
       const msg = el('div', 'port-detail-msg');
-      withConfirm(apply, (ev) => {
+      apply.addEventListener('click', (ev) => {
         clear(msg);
         const mac = (macIn.value || '').trim();
         if (!isValidMac(mac)) { msg.appendChild(el('div', 'sw-err', 'Enter a MAC like AA:BB:CC:DD:EE:FF.')); return; }
@@ -4264,7 +4181,7 @@
 
     const { actions, apply, msg } = applyActions('Apply');
     const voiceVid = () => parseInt((s.health && s.health.scalars && (s.health.scalars.vlanVoiceAdminVid || {}).value), 10);
-    withConfirm(apply, (ev) => {
+    apply.addEventListener('click', (ev) => {
       clear(msg);
       const newVoice = parseInt(voiceSel.value, 10);
       const newQos = parseInt(voiceQosSel.value, 10);
@@ -4992,7 +4909,7 @@
       form.appendChild(sec.sec);
       const { actions, apply } = applyActions('Save name');
       const msg = el('div', 'port-detail-msg');
-      withConfirm(apply, (ev) => {
+      apply.addEventListener('click', (ev) => {
         clear(msg);
         runButtonAction(ev.currentTarget, {
           failLabel: 'Rename VLAN',
@@ -5053,7 +4970,7 @@
       form.appendChild(sec.sec);
       const { actions, apply } = applyActions('Create VLAN');
       const msg = el('div', 'port-detail-msg');
-      withConfirm(apply, (ev) => {
+      apply.addEventListener('click', (ev) => {
         const id = parseInt(idIn.value, 10);
         clear(msg);
         if (!Number.isFinite(id) || id < 2 || id > 4094) { msg.appendChild(el('div', 'sw-err', 'Enter a VLAN id between 2 and 4094.')); return; }
@@ -5406,34 +5323,6 @@
   // 09-aaa.js: 802.1X global settings and AAA (RADIUS/TACACS+) servers.
   // =================================================================
 
-  // Open an inline editor directly under a table row (the AAA server edit).
-  // Returns the host <div> inside a full-width cell. Any existing inline editor
-  // is closed first.
-  function openRowEditor(tr, colspan) {
-    closeRowEditors(tr.closest('table'));
-    const editTr = el('tr', 'snmp-edit-row');
-    const td = el('td'); td.colSpan = colspan;
-    const host = el('div', 'snmp-edit-host');
-    td.appendChild(host); editTr.appendChild(td);
-    tr.insertAdjacentElement('afterend', editTr);
-    host.scrollIntoView({ block: 'nearest' });
-    return host;
-  }
-  function closeRowEditors(scope) {
-    const root = scope || document;
-    root.querySelectorAll('.snmp-edit-row').forEach((r) => r.remove());
-  }
-
-  // AAA server inventory (RADIUS + TACACS+) for the Authentication panel. Each
-  // server is one summary row with an expander revealing the deep detail:
-  // timeouts/retries/deadtime, shared-key status, and (RADIUS) the full RFC
-  // 4668 statistics. The shared key itself is write-only on the switch, so we
-  // show whether a key is set, not its value.
-  // AAA server inventory (RADIUS + TACACS+) for the Authentication panel,
-  // rendered as standard tables with column headers. Each server row is
-  // clickable to open a detail popout with the deep data (timeouts, deadtime,
-  // shared-key status, and the full RADIUS statistics). The shared key is
-  // write-only on the switch, so only whether one is set is ever shown.
   // Global 802.1X settings for the Sessions & authentication panel: port-based
   // auth enable, guest VLAN id/timeout, and the notification (trap) toggles -
   // all scalar read-write objects. Shown always; editable controls write via
@@ -5650,419 +5539,281 @@
           return refreshScalars(s, changedScalars).then(() => { setTimeout(() => repaintPanel(s, 'auth'), 1900); });
         }
       });
-    });
+    // Switching port-based authentication on or off changes access on every
+    // 802.1X port, so that one change asks for a second tap; the rest apply
+    // on the first (B8).
+    }, { when: () => (sysSel.value === 'on') !== isOn, confirmText: () => (sysSel.value === 'on' ? 'Enable 802.1X?' : 'Disable 802.1X?') });
     wrap.appendChild(actions); wrap.appendChild(msg);
     body.appendChild(wrap);
   }
 
-  function buildAaaServers(s, body, h, section, p) {
-    const dv2 = (cell) => (cell && (cell.display !== undefined && cell.display !== null && cell.display !== '')
-      ? cell.display : (cell && cell.value !== undefined ? cell.value : ''));
-    const RADIUS_USAGE = { 1: 'login', 2: '802.1X', 3: 'all', 4: 'wireless' };
-
-    // InetAddress columns arrive as raw bytes (hex). Decode to a readable IP.
-    const inetAddr = (cell) => {
-      let raw = (cell && cell.value !== undefined && cell.value !== null && cell.value !== '')
-        ? cell.value : dv2(cell);
-      if (raw === '' || raw === null || raw === undefined) return '';
-      let str = String(raw).replace(/\s*\(hex\)\s*$/i, '');
-      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(str) || str.indexOf(':') >= 0) return str;
-      const hex = str.replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '');
-      if (hex.length === 8) return [0, 2, 4, 6].map((i) => parseInt(hex.substr(i, 2), 16)).join('.');
-      if (hex.length === 32) return (hex.match(/.{4}/g) || []).join(':').replace(/\b0+(\w)/g, '$1');
-      return str;
-    };
-    const keyStatus = (useGlobalCell, keyCell) => {
-      if (/true|1|yes/i.test(String(dv2(useGlobalCell)))) return 'global default';
-      const k = dv2(keyCell);
-      const hex = String(k).replace(/[^0-9a-fA-F]/g, '');
-      return (k !== '' && k !== null && k !== undefined && !/^0+$/.test(hex)) ? 'set' : 'none';
-    };
-
-    const statsByAddr = new Map();
-    for (const r of (h.radiusStats || [])) {
-      const addr = inetAddr(r.radiusAuthServerAddress);
-      if (addr) statsByAddr.set(String(addr), r);
-    }
-
-    const radius = h.radiusServers || [];
-    const tacacs = h.tacacsServers || [];
-    // Show the section when there are servers, or when the operator can add one.
-    const editableEarly = (s._snmp && s._snmp.editable) || s._aaaEditable;
-    if (!radius.length && !tacacs.length && !editableEarly) return;
-
-    const sc = (k) => (h.scalars && h.scalars[k]);
-    const isOn = (k) => sc(k) && /true|enable|1|yes/i.test(String(sc(k).display || sc(k).value));
-
-    // A detail popout, reusing the generic key/value dialog look.
-    const openDetail = (title, pairs, statsRow) => {
-      const prev = document.querySelector('.port-detail-back');
-      if (prev) prev.remove();
-      const back = el('div', 'port-detail-back');
-      const pop = el('div', 'port-detail');
-      const close = () => back.remove();
-      back.addEventListener('click', (e) => { if (e.target === back) close(); });
-      const head = el('div', 'port-detail-head');
-      head.appendChild(el('h3', '', title));
-      const x = el('button', 'port-detail-x', '\u00d7'); x.type = 'button';
-      x.addEventListener('click', close); head.appendChild(x);
-      pop.appendChild(head);
-      const grid = (ps) => {
-        const dl = el('dl', 'port-detail-grid');
-        for (const [k, v] of ps) {
-          if (v === undefined || v === null || v === '') continue;
-          dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v)));
-        }
-        return dl;
-      };
-      pop.appendChild(grid(pairs));
-      if (statsRow) {
-        pop.appendChild(el('div', 'port-detail-sub', 'RADIUS statistics'));
-        pop.appendChild(grid([
-          ['Round-trip (ms)', dv2(statsRow.radiusAuthClientRoundTripTime)],
-          ['Access-Requests', dv2(statsRow.radiusAuthClientAccessRequests)],
-          ['Accepts', dv2(statsRow.radiusAuthClientAccessAccepts)],
-          ['Rejects', dv2(statsRow.radiusAuthClientAccessRejects)],
-          ['Challenges', dv2(statsRow.radiusAuthClientAccessChallenges)],
-          ['Retransmissions', dv2(statsRow.radiusAuthClientAccessRetransmissions)],
-          ['Timeouts', dv2(statsRow.radiusAuthClientTimeouts)],
-          ['Pending', dv2(statsRow.radiusAuthClientPendingRequests)],
-          ['Bad authenticators', dv2(statsRow.radiusAuthClientBadAuthenticators)],
-          ['Malformed responses', dv2(statsRow.radiusAuthClientMalformedAccessResponses)],
-          ['Unknown types', dv2(statsRow.radiusAuthClientUnknownTypes)],
-          ['Packets dropped', dv2(statsRow.radiusAuthClientPacketsDropped)]
-        ]));
-      }
-      back.appendChild(pop);
-      document.body.appendChild(back);
-    };
-
-    // --- write support: add / edit / delete ---
-    // Write access is "full DefaultSuper" credential. The SNMP config panel
-    // learns this when it loads; if it hasn't, fetch it here (once, cached) and
-    // repaint when it arrives, so the add/edit/delete controls appear without
-    // needing to visit the SNMP panel first.
-    let editable = (s._snmp && s._snmp.editable) || s._aaaEditable;
-    if (editable === undefined && !s._aaaAccessPending) {
+  // ---- AAA servers (RADIUS + TACACS+) ----
+  // Keyed tables (B2/B3) in the Sessions & authentication panel, reconciled in
+  // place like the rest of it. A row opens the server in the standard pop-out:
+  // its settings (an editor, or read-only without write access) and, for
+  // RADIUS, its RFC 4668 counters. The shared key is write-only on the switch,
+  // so only whether one is set is ever shown.
+  const RADIUS_USAGE = { 1: 'login', 2: '802.1X', 3: 'all', 4: 'wireless' };
+  const AAA_TABLES = ['radiusServers', 'radiusStats', 'tacacsServers'];
+  function aaaDv(cell) {
+    return (cell && (cell.display !== undefined && cell.display !== null && cell.display !== ''))
+      ? cell.display : (cell && cell.value !== undefined ? cell.value : '');
+  }
+  // InetAddress columns arrive as raw bytes (hex). Decode to a readable IP.
+  function aaaInetAddr(cell) {
+    const raw = (cell && cell.value !== undefined && cell.value !== null && cell.value !== '') ? cell.value : aaaDv(cell);
+    if (raw === '' || raw === null || raw === undefined) return '';
+    const str = String(raw).replace(/\s*\(hex\)\s*$/i, '');
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(str) || str.indexOf(':') >= 0) return str;
+    const hex = str.replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '');
+    if (hex.length === 8) return [0, 2, 4, 6].map((i) => parseInt(hex.substr(i, 2), 16)).join('.');
+    if (hex.length === 32) return (hex.match(/.{4}/g) || []).join(':').replace(/\b0+(\w)/g, '$1');
+    return str;
+  }
+  function aaaKeyStatus(useGlobalCell, keyCell) {
+    if (/true|1|yes/i.test(String(aaaDv(useGlobalCell)))) return 'global default';
+    const k = aaaDv(keyCell);
+    const hex = String(k).replace(/[^0-9a-fA-F]/g, '');
+    return (k !== '' && k !== null && k !== undefined && !/^0+$/.test(hex)) ? 'set' : 'none';
+  }
+  // The servers as the table, the pop-out and the writes read them.
+  function aaaModel(h) {
+    h = h || {};
+    const stats = new Map();
+    for (const r of (h.radiusStats || [])) { const a = aaaInetAddr(r.radiusAuthServerAddress); if (a) stats.set(String(a), r); }
+    const radius = (h.radiusServers || []).map((r) => {
+      const addr = aaaInetAddr(r.rlRadiusServerInetAddress);
+      return { addr, authPort: aaaDv(r.rlRadiusServerInetAuthPortNumber), acctPort: aaaDv(r.rlRadiusServerInetAcctPortNumber),
+        priority: aaaDv(r.rlRadiusServerInetPriority),
+        usage: RADIUS_USAGE[Number(aaaDv(r.rlRadiusServerInetUsage))] || aaaDv(r.rlRadiusServerInetUsage),
+        timeout: aaaDv(r.rlRadiusServerInetTimeout), retries: aaaDv(r.rlRadiusServerInetRetries),
+        deadtime: aaaDv(r.rlRadiusServerInetDeadtime), source: aaaDv(r.rlRadiusServerInetSource),
+        key: aaaKeyStatus(r.rlRadiusServerInetUseGlobalDefaultKey, r.rlRadiusServerInetKey),
+        useGlobalKey: /true|1|yes/i.test(String(aaaDv(r.rlRadiusServerInetUseGlobalDefaultKey))),
+        stats: stats.get(String(addr)) || null };
+    });
+    const tacacs = (h.tacacsServers || []).map((r) => {
+      const statusRaw = String(aaaDv(r.rlTacacsServerInetConnectionStatus));
+      return { addr: aaaInetAddr(r.rlTacacsServerInetAddress), port: aaaDv(r.rlTacacsServerInetPortNumber),
+        status: statusRaw, connected: /connected\(0\)|^0$|^connected$/i.test(statusRaw) && !/not/i.test(statusRaw),
+        type: aaaDv(r.rlTacacsServerInetConnectionType), priority: aaaDv(r.rlTacacsServerInetPriority),
+        timeout: aaaDv(r.rlTacacsServerInetTimeout),
+        key: aaaKeyStatus(r.rlTacacsServerInetUseGlobalDefaultKey, r.rlTacacsServerInetKey),
+        useGlobalKey: /true|1|yes/i.test(String(aaaDv(r.rlTacacsServerInetUseGlobalDefaultKey))) };
+    });
+    return { radius, tacacs };
+  }
+  // Whether this credential may change the switch's config (a full SNMP Admin).
+  // Learned from the SNMP configuration panel when it has loaded; otherwise
+  // asked once here, and the panel repainted when the answer arrives.
+  function aaaEditable(s) {
+    const known = (s._snmp && s._snmp.editable) || s._aaaEditable;
+    if (known === undefined && !s._aaaAccessPending && s.target) {
       s._aaaAccessPending = true;
       snmpCfgPost(s, 'access').then((access) => {
         s._aaaEditable = !!(access && access.ok && access.level === 'full');
         s._aaaAccessPending = false;
-        const p = s.panels.find((x) => x.key === 'auth');
-        if (p && p._body) paintPanelBody(s, p);
+        repaintPanel(s, 'auth');
       }).catch(() => { s._aaaAccessPending = false; });
     }
-    editable = editable || false;
-    // Pre-emptive cleartext-key note: is this session SNMPv3 authPriv?
+    return !!known;
+  }
+  // The session negotiates privacy, so a shared key typed here is encrypted.
+  function aaaIsV3Priv(s) {
     const t = s.target || {};
-    const isV3Priv = String(t.version) === '3' && t.v3 && String(t.v3.level) === 'authPriv';
+    return String(t.version) === '3' && !!t.v3 && String(t.v3.level) === 'authPriv';
+  }
+  function aaaRefresh(s) { return refreshTables(s, AAA_TABLES); }
+  // One add/edit/delete. A 409 carries the server's warning that the shared key
+  // would cross the network in cleartext; the caller asks before resending.
+  async function aaaWrite(s, url, payload) {
+    s.writeBusy = true;
+    try {
+      const { status, body } = await apiPost(url, Object.assign({ target: s.target }, payload));
+      if (status === 409 && body && body.warning) return { ok: false, warning: body.warning, error: body.warning };
+      if (body && body.ok) return { ok: true };
+      return { ok: false, error: (body && body.error) || 'the switch rejected it' };
+    } catch (e) {
+      return { ok: false, error: 'lost contact with the local server: ' + e.message };
+    } finally { s.writeBusy = false; }
+  }
 
-    // A field row helper for the add/edit forms.
-    const inp = (type, val, ph) => { const i = el('input'); i.type = type; if (val != null) i.value = val; if (ph) i.placeholder = ph; return i; };
-
-    // In-app confirm: renders a message with Confirm / Cancel buttons into a
-    // host element and resolves true/false. No browser dialog.
-    const inAppConfirm = (host, message, confirmLabel) => new Promise((resolve) => {
-      for (const old of Array.from(host.querySelectorAll('.inapp-confirm'))) old.remove();
-      const box = el('div', 'inapp-confirm');
-      box.appendChild(el('div', 'sw-warn', message));
-      const row = el('div', 'snmp-form-actions');
-      const yes = el('button', 'btn btn-small btn-danger', confirmLabel || 'Confirm'); yes.type = 'button';
-      const no = el('button', 'btn btn-small', 'Cancel'); no.type = 'button';
-      yes.addEventListener('click', () => { box.remove(); resolve(true); });
-      no.addEventListener('click', () => { box.remove(); resolve(false); });
-      row.appendChild(yes); row.appendChild(no); box.appendChild(row);
-      host.appendChild(box);
-    });
-
-    // Submit an add/edit. If the server replies that the key would be sent in
-    // cleartext (409 + warning), show an in-app confirm rather than a browser
-    // prompt, then resend with confirm=true.
-    const submit = (url, payload, host, onOk) => {
-      const go = (confirmed) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(Object.assign({ target: s.target, confirm: confirmed }, payload)) })
-        .then((r) => r.json().then((b) => ({ status: r.status, b })))
-        .then(({ status, b }) => {
-          if (status === 409 && b.warning && !confirmed) {
-            return inAppConfirm(host, b.warning + ' Send the key anyway?', 'Send anyway')
-              .then((ok) => { if (ok) return go(true); });
-          }
-          if (b && b.ok) { onOk(); markConfigDirty(s); refreshPanel(s, s.panels.find((p) => p.key === 'auth')); }
-          else { clearErr(host); host.appendChild(el('div', 'sw-err', (b && b.error) || 'Failed.')); }
-        })
-        .catch((e) => { clearErr(host); host.appendChild(el('div', 'sw-err', e.message)); });
-      s.writeBusy = true;
-      Promise.resolve(go(false)).finally(() => { s.writeBusy = false; });
-    };
-
-    // Delete with an in-app confirm rendered next to the row's action cell.
-    // The Delete button confirms itself (two-tap), so this deletes directly and
-    // refreshes just the auth panel.
-    const delDirect = (url, payload) => {
-      s.writeBusy = true;
-      fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(Object.assign({ target: s.target }, payload)) })
-        .then((r) => r.json()).then((b) => {
-          s.writeBusy = false;
-          if (b && b.ok) { markConfigDirty(s); refreshPanel(s, s.panels.find((p) => p.key === 'auth')); }
-          else { appLog('error', 'Delete failed', { message: (b && b.error) || 'unknown' }); toast('Delete failed: ' + ((b && b.error) || 'the switch rejected it'), 'error'); }
-        }).catch((e) => { s.writeBusy = false; appLog('error', 'Delete error', { message: e.message }); toast('Delete failed: ' + e.message, 'error'); });
-    };
-
-    // Build an add/edit form for RADIUS or TACACS.
-    const serverForm = (kind, host, existing) => {
-      const wrap = el('div', 'aaa-form');
-      if (!isV3Priv) wrap.appendChild(el('div', 'sw-warn',
-        'This session is not SNMPv3 with privacy — a shared key entered here is sent in cleartext.'));
-      const grid = el('div', 'snmp-form-grid');
-      const addr = inp('text', existing ? existing.address : '', 'e.g. 192.168.1.3');
-      if (existing) addr.disabled = true;   // address is the key; edit keeps it fixed
-      grid.appendChild(field('Server IP', addr));
-      let authPort, acctPort, port, usageSel;
-      if (kind === 'radius') {
-        authPort = inp('number', existing ? existing.authPort : 1812); grid.appendChild(field('Auth port', authPort));
-        acctPort = inp('number', existing ? existing.acctPort : 1813); grid.appendChild(field('Acct port', acctPort));
-        usageSel = el('select'); for (const u of ['all', 'login', '802.1x', 'wireless']) { const o = el('option', '', u); o.value = u; usageSel.appendChild(o); }
-        if (existing && existing.usage) usageSel.value = existing.usage;
-        grid.appendChild(field('Usage', usageSel));
-      } else {
-        port = inp('number', existing ? existing.port : 49); grid.appendChild(field('Port', port));
+  function buildAaaServers(s, body, h, section, p) {
+    const editable = aaaEditable(s);
+    const model = aaaModel(h);
+    const sc = (k) => (h.scalars && h.scalars[k]);
+    const isOn = (k) => sc(k) && /true|enable|1|yes/i.test(String(sc(k).display || sc(k).value));
+    if (!s._ktReconcile) p._aaaNotes = {};
+    // A section with its count note kept in a stable node, so a reconcile
+    // refreshes it in place (B2).
+    const head = (name, title, note, addLabel, onAdd) => {
+      if (!s._ktReconcile) {
+        section(title, ' ');
+        const st = body.lastChild;
+        const n = st && st.querySelector && st.querySelector('.st-note');
+        if (n) p._aaaNotes[name] = n;
+        if (addLabel && editable) body.appendChild(addControl(addLabel, onAdd));
       }
-      const prio = inp('number', existing ? existing.priority : 0); grid.appendChild(field('Priority', prio));
-      const timeout = inp('number', existing ? existing.timeout : '', 'optional'); grid.appendChild(field('Timeout (s)', timeout));
-      const globalKey = el('input'); globalKey.type = 'checkbox'; globalKey.checked = existing ? !!existing.useGlobalKey : false;
-      const gkWrap = el('label', 'snmp-field-check'); gkWrap.appendChild(globalKey); gkWrap.appendChild(el('span', '', 'Use global default key'));
-      const key = inp('password', '', existing ? '(unchanged)' : 'shared secret');
-      // Key field with a show/hide toggle so the operator can verify what they
-      // typed without re-entering it.
-      const keyField = el('div', 'snmp-field');
-      keyField.appendChild(el('label', '', 'Shared key'));
-      const keyRow = el('div', 'key-row');
-      const showToggle = el('button', 'btn btn-small key-show', 'Show'); showToggle.type = 'button';
-      showToggle.addEventListener('click', () => {
-        const shown = key.type === 'text';
-        key.type = shown ? 'password' : 'text';
-        showToggle.textContent = shown ? 'Show' : 'Hide';
+      const n = p._aaaNotes && p._aaaNotes[name];
+      if (n) n.textContent = note;
+    };
+    const delCell = (kind, url, payload, addr) => ({ cellNode: actGroup([actBtnConfirm('Delete', (e) => {
+      runButtonAction(e.currentTarget, {
+        failLabel: 'Delete ' + (kind === 'radius' ? 'RADIUS' : 'TACACS+') + ' server',
+        run: () => aaaWrite(s, url, payload),
+        ok: (r) => r && r.ok,
+        error: (r) => (r && r.error) || 'the switch rejected it',
+        onApplied: () => markConfigDirty(s),
+        settle: () => aaaRefresh(s)
       });
-      keyRow.appendChild(key); keyRow.appendChild(showToggle);
-      keyField.appendChild(keyRow);
-      const syncKey = () => { keyField.style.display = globalKey.checked ? 'none' : ''; };
-      globalKey.addEventListener('change', syncKey); syncKey();
-      grid.appendChild(gkWrap);
-      grid.appendChild(keyField);
-      wrap.appendChild(grid);
+    }, 'danger', 'Delete server ' + addr)]), sig: 'del' });
 
-      const cancel = el('button', 'btn btn-small', 'Cancel'); cancel.type = 'button';
-      cancel.addEventListener('click', () => wrap.remove());
-      const { actions, apply: save } = applyActions(existing ? 'Save' : 'Add', { extra: [cancel] });
-      save.addEventListener('click', () => {
-        const a = (addr.value || '').trim();
-        if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(a)) { clearErr(wrap); wrap.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
-        const common = { address: a, edit: !!existing, priority: parseInt(prio.value, 10),
-          timeout: timeout.value === '' ? undefined : parseInt(timeout.value, 10),
-          useGlobalKey: globalKey.checked, key: globalKey.checked ? undefined : (key.value || undefined) };
-        if (kind === 'radius') {
-          submit('/api/aaa/radius', Object.assign(common, {
-            authPort: parseInt(authPort.value, 10) || 1812, acctPort: parseInt(acctPort.value, 10) || 1813,
-            usage: usageSel.value }), wrap, () => wrap.remove());
-        } else {
-          submit('/api/aaa/tacacs', Object.assign(common, { port: parseInt(port.value, 10) || 49 }), wrap, () => wrap.remove());
-        }
-      });
-      wrap.appendChild(actions);
-      host.appendChild(wrap);
-    };
-    const clearErr = (node) => { for (const e of Array.from(node.querySelectorAll('.sw-err'))) e.remove(); };
-
-    // Remove any open inline AAA editor/add-form/confirm anywhere in the panel,
-    // so only one is ever shown.
-    const closeAaaEditors = () => {
-      for (const n of Array.from(body.querySelectorAll('.aaa-inline-row'))) n.remove();
-      for (const n of Array.from(body.querySelectorAll('.aaa-form'))) n.remove();
-      for (const n of Array.from(body.querySelectorAll('.inapp-confirm'))) n.remove();
-      // Mark any in-place editing rows as no longer editing (a repaint, if one
-      // follows, rebuilds them clean).
-      for (const tr of Array.from(body.querySelectorAll('tr.aaa-editing'))) {
-        tr._editing = false; tr.classList.remove('aaa-editing');
-      }
-    };
-    s._aaaCloseEditors = closeAaaEditors;
-
-
-    // Build an edit form into a row-editor host (the proven SNMP-groups pattern:
-    // openRowEditor inserts a <tr> after the row and returns a div to fill).
-    // Edit form rendered into a row-editor host (openRowEditor inserts a <tr>
-    // after the row and returns a div to fill).
-    const editForm = (kind, host, cur, tr, onCancel) => {
-      const form = el('div', 'snmp-form');
-      form.appendChild(el('h5', '', 'Edit ' + (kind === 'radius' ? 'RADIUS' : 'TACACS+') + ' server ' + cur.address));
-      if (!isV3Priv) form.appendChild(el('div', 'sw-warn',
-        'This session is not SNMPv3 with privacy — a shared key entered here is sent in cleartext.'));
-      const grid = el('div', 'snmp-form-grid');
-      // A number input rejects a value it can't parse (e.g. "1,812" or
-      // "1812 (auth)"), silently showing empty - so pull the numeric part out
-      // of whatever the display string is before assigning it.
-      const num = (v) => {
-        const i = el('input'); i.type = 'number';
-        if (v != null && v !== '') {
-          const m = String(v).replace(/,/g, '').match(/-?\d+(\.\d+)?/);
-          if (m) i.value = m[0];
-        }
-        return i;
-      };
-      let authPort, acctPort, port, usageSel;
-      if (kind === 'radius') {
-        authPort = num(cur.authPort); grid.appendChild(field('Auth port', authPort));
-        acctPort = num(cur.acctPort); grid.appendChild(field('Acct port', acctPort));
-        usageSel = el('select'); for (const u of ['all', 'login', '802.1X', 'wireless']) { const o = el('option', '', u); o.value = u; usageSel.appendChild(o); }
-        // Pre-select the current usage, matching case-insensitively so "802.1X"
-        // from the switch lines up with the option regardless of letter case.
-        if (cur.usage) {
-          const want = String(cur.usage).toLowerCase();
-          for (const o of usageSel.options) { if (o.value.toLowerCase() === want) { usageSel.value = o.value; break; } }
-        }
-        grid.appendChild(field('Usage', usageSel));
-      } else {
-        port = num(cur.port); grid.appendChild(field('Port', port));
-      }
-      const prio = num(cur.priority); grid.appendChild(field('Priority', prio));
-      const timeout = num(cur.timeout); grid.appendChild(field('Timeout (s)', timeout));
-      const gk = el('input'); gk.type = 'checkbox'; gk.checked = !!cur.useGlobalKey;
-      const gkWrap = el('label', 'snmp-field-check'); gkWrap.appendChild(gk); gkWrap.appendChild(el('span', '', 'Use global default key'));
-      const key = el('input'); key.type = 'password'; key.placeholder = '(unchanged)';
-      const keyField = el('div', 'snmp-field'); keyField.appendChild(el('label', '', 'Shared key'));
-      const keyRow = el('div', 'key-row');
-      const showBtn = el('button', 'btn btn-small', 'Show'); showBtn.type = 'button';
-      showBtn.addEventListener('click', () => { const sh = key.type === 'text'; key.type = sh ? 'password' : 'text'; showBtn.textContent = sh ? 'Show' : 'Hide'; });
-      keyRow.appendChild(key); keyRow.appendChild(showBtn); keyField.appendChild(keyRow);
-      const syncKey = () => { keyField.style.display = gk.checked ? 'none' : ''; };
-      gk.addEventListener('change', syncKey); syncKey();
-      grid.appendChild(gkWrap); grid.appendChild(keyField);
-      form.appendChild(grid);
-      const cancel = el('button', 'btn btn-small secondary', 'Cancel'); cancel.type = 'button';
-      cancel.addEventListener('click', () => { if (onCancel) onCancel(); else if (tr) closeRowEditors(tr.closest('table')); });
-      const { actions, apply: save } = applyActions('Save', { extra: [cancel] });
-      save.addEventListener('click', () => {
-        const common = { address: cur.address, edit: true, priority: parseInt(prio.value, 10),
-          timeout: timeout.value === '' ? undefined : parseInt(timeout.value, 10),
-          useGlobalKey: gk.checked, key: gk.checked ? undefined : (key.value || undefined) };
-        if (kind === 'radius') submit('/api/aaa/radius', Object.assign(common, {
-          authPort: parseInt(authPort.value, 10) || 1812, acctPort: parseInt(acctPort.value, 10) || 1813, usage: usageSel.value }), host, () => {});
-        else submit('/api/aaa/tacacs', Object.assign(common, { port: parseInt(port.value, 10) || 49 }), host, () => {});
-      });
-      form.appendChild(actions);
-      host.appendChild(form);
-    };
-
-    // Edit/Delete buttons for a row, using the row-editor host (the detail popout
-    // stays available via the clickable address cell).
-    const rowActionsCell = (kind, addr, extra) => {
-      const btns = [];
-      // Editing is via row-click (opens the edit popout); the row action is
-      // delete only, unless a caller explicitly wants the inline Edit too.
-      if (!extra.deleteOnly) btns.push(actBtn('Edit', (e) => { const tr = e.target.closest('tr');
-        editForm(kind, openRowEditor(tr, tr.children.length), Object.assign({ address: addr }, extra.cur), tr); }, '', 'Edit this server'));
-      btns.push(actBtnConfirm('Delete', (e) => { const tr = e.target.closest('tr');
-        delDirect(extra.delUrl, extra.delPayload); }, 'danger', 'Delete this server'));
-      return actGroup(btns);
-    };
-    // Read-only key/value grid for a server popout when the session can't edit.
-    const aaaReadonly = (pairs) => {
-      const dl = el('dl', 'port-detail-grid');
-      for (const [k, v] of pairs) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
-      return dl;
-    };
-    // RADIUS live-stats grid (RFC 4668 counters) for the Counters tab.
-    const radiusStatsGrid = (stats) => {
-      const wrap = el('div');
-      wrap.appendChild(el('div', 'port-detail-sub', 'RADIUS statistics'));
-      const dl = el('dl', 'port-detail-grid');
-      for (const [k, v] of Object.entries(stats || {})) {
-        if (k === 'index') continue;
-        const val = (v && typeof v === 'object') ? (v.display !== undefined ? v.display : v.value) : v;
-        if (val === undefined || val === null || val === '') continue;
-        dl.appendChild(el('dt', '', k.replace(/^radiusAuthClient/, '').replace(/([A-Z])/g, ' $1').trim())); dl.appendChild(el('dd', '', String(val)));
-      }
-      wrap.appendChild(dl);
-      return wrap;
-    };
-
-    if (radius.length || editable) {
-      section('RADIUS servers', radius.length + (isOn('rlAAARadiusEnabled') ? ' \u00b7 enabled' : ' \u00b7 disabled'));
-      if (radius.length) mountInto(body, s, p, 'radius',
+    // Shown when there are servers, or when the operator can add one.
+    if (model.radius.length || editable) {
+      head('radius', 'RADIUS servers', model.radius.length + (isOn('rlAAARadiusEnabled') ? ' \u00b7 enabled' : ' \u00b7 disabled'),
+        'Add RADIUS server', () => openAaaServer(s, 'radius', null));
+      if (model.radius.length) mountInto(body, s, p, 'radius',
         ['Address', 'Auth port', 'Acct port', 'Priority', 'Usage', 'Timeout', 'Retries', 'Key'].concat(editable ? [''] : []),
-        radius.map((r) => {
-          const addr = inetAddr(r.rlRadiusServerInetAddress);
-          const authPort = dv2(r.rlRadiusServerInetAuthPortNumber);
-          const acctPort = dv2(r.rlRadiusServerInetAcctPortNumber);
-          const usage = RADIUS_USAGE[Number(dv2(r.rlRadiusServerInetUsage))] || dv2(r.rlRadiusServerInetUsage);
-          const key = keyStatus(r.rlRadiusServerInetUseGlobalDefaultKey, r.rlRadiusServerInetKey);
-          const stats = statsByAddr.get(String(addr));
-          const cur = { address: addr, authPort, acctPort, priority: dv2(r.rlRadiusServerInetPriority), usage,
-            timeout: dv2(r.rlRadiusServerInetTimeout),
-            useGlobalKey: /true|1|yes/i.test(String(dv2(r.rlRadiusServerInetUseGlobalDefaultKey))) };
-          // Row-click opens the standard edit popout: Config tab = the edit form
-          // (when editable, else a read-only view), Counters tab = RADIUS stats.
-          const openIt = () => openEditPopout(s, 'RADIUS \u00b7 ' + addr,
-            (pane, close) => { if (editable) editForm('radius', pane, cur, null, close); else pane.appendChild(aaaReadonly([
-              ['Address', addr], ['Auth port', authPort], ['Acct port', acctPort],
-              ['Priority', dv2(r.rlRadiusServerInetPriority)], ['Usage', usage],
-              ['Timeout (s)', dv2(r.rlRadiusServerInetTimeout)], ['Retries', dv2(r.rlRadiusServerInetRetries)],
-              ['Deadtime (min)', dv2(r.rlRadiusServerInetDeadtime)], ['Source', dv2(r.rlRadiusServerInetSource)],
-              ['Shared key', key]])); },
-            stats ? (pane) => pane.appendChild(radiusStatsGrid(stats)) : null);
-          const row = [
-            { click: { open: openIt }, v: addr },
-            { v: authPort }, { v: acctPort }, { v: dv2(r.rlRadiusServerInetPriority) }, { v: usage },
-            { v: dv2(r.rlRadiusServerInetTimeout) }, { v: dv2(r.rlRadiusServerInetRetries) }, { v: key }
-          ];
-          if (editable) row.push({ cellNode: rowActionsCell('radius', addr, { cur, deleteOnly: true,
-            delUrl: '/api/aaa/radius/delete', delPayload: { address: addr, authPort, acctPort } }), sig: 'ra' });
-          return { key: 'radius:' + addr, cells: row };
-        }));
-      if (editable) {
-        body.appendChild(addControl('Add RADIUS server', (host) => {
-          const open = host.querySelector('.aaa-form'); if (s._aaaCloseEditors) s._aaaCloseEditors();
-          if (!open) serverForm('radius', host, null); else host.querySelector('.aaa-form').remove();
-        }));
-      }
+        model.radius.map((r) => ({ key: 'radius:' + r.addr, cells: [
+          { v: r.addr, click: { open: () => openAaaServer(s, 'radius', r.addr) } },
+          { v: r.authPort }, { v: r.acctPort }, { v: r.priority }, { v: r.usage }, { v: r.timeout }, { v: r.retries }, { v: r.key }]
+          .concat(editable ? [delCell('radius', '/api/aaa/radius/delete', { address: r.addr, authPort: r.authPort, acctPort: r.acctPort }, r.addr)] : []) })));
+      else if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'No RADIUS servers configured.'));
     }
-
-    if (tacacs.length || editable) {
-      section('TACACS+ servers', tacacs.length + (isOn('rlAAATacacsEnabled') ? ' \u00b7 enabled' : ' \u00b7 disabled'));
-      if (tacacs.length) mountInto(body, s, p, 'tacacs',
+    if (model.tacacs.length || editable) {
+      head('tacacs', 'TACACS+ servers', model.tacacs.length + (isOn('rlAAATacacsEnabled') ? ' \u00b7 enabled' : ' \u00b7 disabled'),
+        'Add TACACS+ server', () => openAaaServer(s, 'tacacs', null));
+      if (model.tacacs.length) mountInto(body, s, p, 'tacacs',
         ['Address', 'Port', 'State', 'Priority', 'Timeout', 'Key'].concat(editable ? [''] : []),
-        tacacs.map((r) => {
-          const addr = inetAddr(r.rlTacacsServerInetAddress);
-          const port = dv2(r.rlTacacsServerInetPortNumber);
-          const statusRaw = String(dv2(r.rlTacacsServerInetConnectionStatus));
-          const connected = /connected\(0\)|^0$|^connected$/i.test(statusRaw) && !/not/i.test(statusRaw);
-          const key = keyStatus(r.rlTacacsServerInetUseGlobalDefaultKey, r.rlTacacsServerInetKey);
-          const cur = { address: addr, port, priority: dv2(r.rlTacacsServerInetPriority), timeout: dv2(r.rlTacacsServerInetTimeout),
-            useGlobalKey: /true|1|yes/i.test(String(dv2(r.rlTacacsServerInetUseGlobalDefaultKey))) };
-          const openIt = () => openEditPopout(s, 'TACACS+ \u00b7 ' + addr,
-            (pane, close) => { if (editable) editForm('tacacs', pane, cur, null, close); else pane.appendChild(aaaReadonly([
-              ['Address', addr], ['Port', port], ['Connection', dv2(r.rlTacacsServerInetConnectionStatus)],
-              ['Type', dv2(r.rlTacacsServerInetConnectionType)], ['Priority', dv2(r.rlTacacsServerInetPriority)],
-              ['Timeout (s)', dv2(r.rlTacacsServerInetTimeout)], ['Shared key', key]])); },
-            null);
-          const row = [
-            { click: { open: openIt }, v: addr },
-            { v: port }, { pill: true, v: connected ? 'connected' : 'not connected' },
-            { v: dv2(r.rlTacacsServerInetPriority) }, { v: dv2(r.rlTacacsServerInetTimeout) }, { v: key }
-          ];
-          if (editable) row.push({ cellNode: rowActionsCell('tacacs', addr, { cur, deleteOnly: true,
-            delUrl: '/api/aaa/tacacs/delete', delPayload: { address: addr } }), sig: 'ta' });
-          return { key: 'tacacs:' + addr, cells: row };
-        }));
-      if (editable) {
-        body.appendChild(addControl('Add TACACS+ server', (host) => {
-          const open = host.querySelector('.aaa-form'); if (s._aaaCloseEditors) s._aaaCloseEditors();
-          if (!open) serverForm('tacacs', host, null); else host.querySelector('.aaa-form').remove();
-        }));
-      }
+        model.tacacs.map((r) => ({ key: 'tacacs:' + r.addr, cells: [
+          { v: r.addr, click: { open: () => openAaaServer(s, 'tacacs', r.addr) } },
+          { v: r.port }, { pill: true, v: r.connected ? 'connected' : 'not connected' },
+          { v: r.priority }, { v: r.timeout }, { v: r.key }]
+          .concat(editable ? [delCell('tacacs', '/api/aaa/tacacs/delete', { address: r.addr }, r.addr)] : []) })));
+      else if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'No TACACS+ servers configured.'));
     }
+  }
 
+  // Open a server (addr) or the add form (addr null) in the standard pop-out,
+  // read from the current tables so it always shows what the switch holds now.
+  function openAaaServer(s, kind, addr) {
+    const model = aaaModel(s.health);
+    const list = kind === 'radius' ? model.radius : model.tacacs;
+    const cur = addr ? list.find((x) => x.addr === addr) : null;
+    if (addr && !cur) return;
+    const label = kind === 'radius' ? 'RADIUS' : 'TACACS+';
+    const title = cur ? label + ' \u00b7 ' + cur.addr : 'Add ' + label + ' server';
+    const tabs = [];
+    if (aaaEditable(s)) tabs.push({ label: 'Server', fill: (pane, close) => aaaServerForm(s, kind, cur, pane, close) });
+    else {
+      tabs.push({ label: 'Server', fill: (pane) => {
+        const dl = el('dl', 'port-detail-grid');
+        const pairs = kind === 'radius'
+          ? [['Address', cur.addr], ['Auth port', cur.authPort], ['Acct port', cur.acctPort], ['Priority', cur.priority],
+            ['Usage', cur.usage], ['Timeout (s)', cur.timeout], ['Retries', cur.retries], ['Deadtime (min)', cur.deadtime],
+            ['Source', cur.source], ['Shared key', cur.key]]
+          : [['Address', cur.addr], ['Port', cur.port], ['Connection', cur.status], ['Type', cur.type],
+            ['Priority', cur.priority], ['Timeout (s)', cur.timeout], ['Shared key', cur.key]];
+        for (const [k, v] of pairs) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
+        pane.appendChild(dl);
+      } });
+    }
+    if (cur && cur.stats) {
+      tabs.push({ label: 'Counters', fill: (pane) => {
+        const dl = el('dl', 'port-detail-grid');
+        for (const [k, v] of Object.entries(cur.stats)) {
+          if (k === 'index') continue;
+          const val = (v && typeof v === 'object') ? (v.display !== undefined ? v.display : v.value) : v;
+          if (val === undefined || val === null || val === '') continue;
+          dl.appendChild(el('dt', '', k.replace(/^radiusAuthClient/, '').replace(/^radiusAuthServer/, 'Server ').replace(/([A-Z])/g, ' $1').trim()));
+          dl.appendChild(el('dd', '', String(val)));
+        }
+        pane.appendChild(dl);
+      } });
+    }
+    openTabbedPopout(s, title, tabs, []);
+  }
+
+  // The add/edit form (A5/B6/B8): one tap to save, except that a shared key
+  // which would travel in cleartext asks for a second tap first.
+  function aaaServerForm(s, kind, cur, pane, close) {
+    const form = el('div', 'snmp-form acl-form');
+    const v3Priv = aaaIsV3Priv(s);
+    // A number input rejects a value it can't parse ("1,812"), so keep only
+    // the numeric part of what the switch displays.
+    const num = (v, ph) => {
+      const i = el('input'); i.type = 'number'; if (ph) i.placeholder = ph;
+      const m = v != null && v !== '' ? String(v).replace(/,/g, '').match(/-?\d+(\.\d+)?/) : null;
+      if (m) i.value = m[0];
+      return i;
+    };
+    const sec = formSection('Server');
+    const addr = textInput(cur ? cur.addr : '', 'e.g. 192.168.1.3');
+    if (cur) addr.disabled = true;   // the address is the row's identity
+    sec.body.appendChild(field('Server IP', addr));
+    let authPort, acctPort, port, usageSel;
+    if (kind === 'radius') {
+      authPort = num(cur ? cur.authPort : 1812); sec.body.appendChild(field('Auth port', authPort));
+      acctPort = num(cur ? cur.acctPort : 1813); sec.body.appendChild(field('Acct port', acctPort));
+      const want = String((cur && cur.usage) || 'all').toLowerCase();
+      usageSel = selectInput(['all', 'login', '802.1X', 'wireless'].map((u) => ({ label: u, value: u })), '');
+      for (const o of usageSel.options) if (o.value.toLowerCase() === want) usageSel.value = o.value;
+      sec.body.appendChild(field('Usage', usageSel));
+    } else {
+      port = num(cur ? cur.port : 49); sec.body.appendChild(field('Port', port));
+    }
+    const prio = num(cur ? cur.priority : 0); sec.body.appendChild(field('Priority', prio));
+    const timeout = num(cur ? cur.timeout : '', 'optional'); sec.body.appendChild(field('Timeout (s)', timeout));
+    form.appendChild(sec.sec);
+
+    const keySec = formSection('Shared key');
+    if (!v3Priv) keySec.body.appendChild(el('div', 'sw-warn', 'This session is not SNMPv3 with privacy, so a shared key entered here is sent in cleartext.'));
+    const gk = el('input'); gk.type = 'checkbox'; gk.checked = !!(cur && cur.useGlobalKey);
+    const gkWrap = el('label', 'snmp-field-check'); gkWrap.appendChild(gk); gkWrap.appendChild(el('span', '', 'Use global default key'));
+    keySec.body.appendChild(gkWrap);
+    const key = el('input'); key.type = 'password'; key.placeholder = cur ? '(unchanged)' : 'shared secret';
+    const keyRow = el('div', 'key-row');
+    const show = el('button', 'btn btn-small', 'Show'); show.type = 'button';
+    show.addEventListener('click', () => { const shown = key.type === 'text'; key.type = shown ? 'password' : 'text'; show.textContent = shown ? 'Show' : 'Hide'; });
+    keyRow.appendChild(key); keyRow.appendChild(show);
+    const keyField = field('Key', keyRow);
+    keySec.body.appendChild(keyField);
+    const syncKey = () => { keyField.style.display = gk.checked ? 'none' : ''; };
+    gk.addEventListener('change', syncKey); syncKey();
+    form.appendChild(keySec.sec);
+
+    const keyTyped = () => !gk.checked && !!key.value;
+    let warned = false;   // the server said the key would go in cleartext
+    const { actions, apply, msg } = applyActions(cur ? 'Save' : 'Add server');
+    withConfirm(apply, (ev) => {
+      clear(msg);
+      const a = (addr.value || '').trim();
+      if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(a)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
+      const payload = { address: a, edit: !!cur, priority: parseInt(prio.value, 10),
+        timeout: timeout.value === '' ? undefined : parseInt(timeout.value, 10),
+        useGlobalKey: gk.checked, key: gk.checked ? undefined : (key.value || undefined),
+        confirm: warned || (keyTyped() && !v3Priv) };
+      if (kind === 'radius') Object.assign(payload, { authPort: parseInt(authPort.value, 10) || 1812, acctPort: parseInt(acctPort.value, 10) || 1813, usage: usageSel.value });
+      else payload.port = parseInt(port.value, 10) || 49;
+      const label = (cur ? 'Save ' : 'Add ') + (kind === 'radius' ? 'RADIUS' : 'TACACS+') + ' server';
+      runButtonAction(ev.currentTarget, {
+        failLabel: label, spinLabel: cur ? 'Saving\u2026' : 'Adding\u2026',
+        run: () => aaaWrite(s, '/api/aaa/' + kind, payload),
+        ok: (r) => r && r.ok,
+        error: (r) => {
+          if (r && r.warning) { warned = true; msg.appendChild(el('div', 'sw-warn', r.warning + ' Tap ' + apply.dataset.restLabel + ' again to send it anyway.')); return 'the key would be sent in cleartext'; }
+          const e = (r && r.error) || 'the switch rejected it';
+          msg.appendChild(el('div', 'sw-err', label + ' failed: ' + e));
+          return e;
+        },
+        onApplied: () => markConfigDirty(s),
+        settle: () => aaaRefresh(s).then(() => close())
+      });
+    }, { when: () => keyTyped() && !v3Priv && !warned, confirmText: 'Send key in cleartext?' });
+    apply.dataset.restLabel = cur ? 'Save' : 'Add server';
+    form.appendChild(actions); form.appendChild(msg);
+    pane.appendChild(form);
+    if (!cur) addr.focus();
   }
 
   // =================================================================
@@ -6303,7 +6054,7 @@
       const chIfxNum = parseInt(aggIdx, 10);
       const openIt = () => {
         if (!editable) { detail(); return; }
-        if (!Number.isFinite(chIfxNum)) { openEditPopout(s, 'Port channel ' + chName, (pane, close) => editChannel(c, agg, members, pane, close)); return; }
+        if (!Number.isFinite(chIfxNum)) { openTabbedPopout(s, 'Port channel ' + chName, [{ label: 'Membership', fill: (pane, close) => editChannel(c, agg, members, pane, close) }], []); return; }
         const chDetail = buildChannelDetail(s, h, chIfxNum, chName, { mode, memNames, memberKeyInfo });
         const membershipTab = { label: 'Membership', fill: (pane, close) => { editChannel(c, agg, members, pane, close); } };
         openPortDetail(s, chDetail, { title: 'Port channel ' + chName, leadingTabs: [membershipTab] });
@@ -6331,7 +6082,7 @@
             });
           }, adminUp ? 'danger' : '', (adminUp ? 'Administratively disable ' : 'Re-enable ') + chName));
         }
-        acts.push(actBtnConfirm('Clear', (e) => clearChannel(c, members), 'danger', 'Remove all members and unconfigure'));
+        if (members.length) acts.push(actBtnConfirm('Clear', (e) => clearChannel(e.currentTarget, members), 'danger', 'Remove all members from ' + chName));
         // sig captures what the action buttons depend on: the channel's admin
         // state (Shut/No-shut label) and whether it has members (Clear present).
         const chRow2 = (s.health && s.health.interfaces || []).find((x) => String(x.index) === aggIdx);
@@ -6343,24 +6094,12 @@
     });
     mountInto(body, s, p, 'channels', cols,
       rows.map((cells) => ({ key: cells._key, cells: cells })));
-    // Editors render into this host, placed immediately below the channel table.
-    // On reconcile the host already exists; reuse it rather than appending a
-    // second one (which would strand an open editor).
-    let chEditHost = s._ktReconcile ? body.querySelector('.ch-edit-host') : null;
-    if (!chEditHost) { chEditHost = el('div', 'ch-edit-host'); if (!s._ktReconcile) body.appendChild(chEditHost); }
-
-    // --- editors ---
-    function closeChEditors() { clear(chEditHost); }
-
-    function editChannel(c, agg, currentMembers, pane, popClose) {
+    // The Membership editor: a tab in the channel's pop-out (A5).
+    function editChannel(c, agg, currentMembers, host, popClose) {
       const aggIdx = String(c.index);
-      const aggKey = agg ? parseInt(dv2(agg.dot3adAggActorAdminKey), 10) : NaN;
-      // Render into the popout pane when given one; else the old inline host.
-      const inPopout = !!pane;
-      if (!inPopout) closeChEditors();
-      const host = pane || el('div', 'ch-editor aaa-form');
-      if (!inPopout) host.appendChild(el('h5', '', 'Edit port channel ' + (nameByIdx.get(aggIdx) || aggIdx)));
-      const grid = el('div', 'snmp-form-grid');
+      const form = el('div', 'snmp-form acl-form');
+      const modeSec = formSection('Mode');
+      const grid = modeSec.body;
       // Mode: static or LACP - the only two modes a port channel has here
       // (CLI "channel-group N mode on|auto"). There is no "off": a channel with
       // no members is simply empty, and the members' actor state is written as
@@ -6372,12 +6111,13 @@
       // wrote when members were added under it.
       const curStates = currentMembers.map((p) => String(portState.get(String(p)) || '').replace(/0x|\s|\(hex\)|"/gi, ''));
       modeSel.value = curStates.some((st) => st && !/^0*$/.test(st)) ? 'lacp' : 'static';
-      { const f = el('div', 'snmp-field'); f.appendChild(el('label', '', 'Mode')); f.appendChild(modeSel); grid.appendChild(f); }
-      host.appendChild(grid);
+      grid.appendChild(field('Mode', modeSel));
+      form.appendChild(modeSec.sec);
 
       // Members: a checkbox list of physical ports (those not already in a
       // different channel). Current members pre-checked.
-      host.appendChild(el('div', 'aaa-sub', 'Member ports'));
+      const memSec = formSection('Member ports');
+      memSec.body.classList.add('acl-stack');
       const memWrap = el('div', 'ch-members');
       const cur = new Set(currentMembers.map(String));
       const physPorts = (h.interfaces || []).filter((r) => {
@@ -6400,12 +6140,12 @@
         lab.appendChild(cb); lab.appendChild(el('span', '', dv(r.rlifPresentName) || pIdx));
         memWrap.appendChild(lab); checks.push(cb);
       }
-      host.appendChild(memWrap);
+      memSec.body.appendChild(memWrap);
+      form.appendChild(memSec.sec);
 
-      // Cancel is a muted button: green means "do this" (MODULE-STANDARD A2).
-      const cancel = el('button', 'tbl-act-btn', 'Cancel'); cancel.type = 'button';
-      cancel.addEventListener('click', () => { if (inPopout && popClose) popClose(); else closeChEditors(); });
-      const { actions, apply: save, msg } = applyActions('Save', { extra: [cancel] });
+      // Changing membership or mode re-forms a live link, so Save asks for a
+      // second tap (B8: the click is drastic).
+      const { actions, apply: save, msg } = applyActions('Save');
       withConfirm(save, (ev) => {
         clear(msg);
         const mode = modeSel.value;
@@ -6487,43 +6227,34 @@
           ok: (r) => r && r.ok,
           error: (r) => { msg.appendChild(el('div', 'sw-err', 'Change failed: ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
           onApplied: () => { markConfigDirty(s, modeSel); },
+          // LACP takes a few seconds to re-form the channel, so the spinner
+          // holds for the first read-back; a short-handed channel is read once
+          // more a little later.
           settle: () => {
             const expect = want.size;
-            const check = (attempt) => refreshLagTables(s).then((memCount) => {
-              if (memCount < expect && attempt < 2) setTimeout(() => check(attempt + 1), 5000);
+            return new Promise((res) => setTimeout(res, 4000)).then(() => refreshLagTables(s)).then((memCount) => {
+              if (memCount < expect) setTimeout(() => refreshLagTables(s), 5000);
             });
-            setTimeout(() => check(1), 4000);
-            return Promise.resolve();
           }
         });
       });
-      host.appendChild(actions); host.appendChild(msg);
-      if (!inPopout) { chEditHost.appendChild(host); chEditHost.scrollIntoView({ block: 'nearest' }); }
+      form.appendChild(actions); form.appendChild(msg);
+      host.appendChild(form);
     }
 
-    function clearChannel(c, members) {
-      closeChEditors();
-      const aggIdx = String(c.index);
-      const host = el('div', 'ch-editor aaa-form');
-      host.appendChild(el('div', 'sw-warn', 'Remove all members and unconfigure port channel ' + (nameByIdx.get(aggIdx) || aggIdx) + '?'));
-      const row = el('div', 'snmp-form-actions');
-      const yes = actBtn('Clear', async () => {
-        // Take every member out (leaveChannel: state + key in one SET). The
-        // creation-table flags are NotWritable, so membership is managed
-        // purely through the ports' actor key and state.
-        const steps = [];
-        for (const p of members) steps.push(...leaveChannel(p));
-        if (steps.length) {
-          const r = await setVb(steps);
-          if (!r.ok || r.b.error) { toast('Could not clear the channel: ' + (r.b.error || 'the switch rejected it'), 'error'); return; }
-          markConfigDirty(s);   // members removed -> running differs from startup
-        }
-        closeChEditors();
-        setTimeout(() => refreshLagTables(s), 2000);   // clearing is immediate; one light read
-      }, 'danger');
-      const no = actBtn('Cancel', closeChEditors);
-      row.appendChild(yes); row.appendChild(no); host.appendChild(row);
-      chEditHost.appendChild(host); chEditHost.scrollIntoView({ block: 'nearest' });
+    // Clear: take every member out (leaveChannel: state + key in one SET).
+    // The two-tap Delete-style button already confirmed it (B6).
+    function clearChannel(btn, members) {
+      const steps = [];
+      for (const pIdx of members) steps.push(...leaveChannel(pIdx));
+      runButtonAction(btn, {
+        failLabel: 'Clear port channel',
+        run: () => setVb(steps),
+        ok: (r) => r && r.ok && !(r.b && r.b.error),
+        error: (r) => (r && r.b && r.b.error) || 'the switch rejected it',
+        onApplied: () => markConfigDirty(s),
+        settle: () => new Promise((res) => setTimeout(res, 2000)).then(() => refreshLagTables(s))
+      });
     }
   }
 
@@ -6561,8 +6292,8 @@
     if (key === 'acl') { paintAclPanel(s, body, p); return; }
     if (key === 'routing') { paintRoutingPanel(s, body, p); return; }
     if (key === 'vlans') { paintVlanPanel(s, body, p); return; }
-    if (key === 'capture') { paintCapturePanel(s, body); return; }
-    if (key === 'flash') { paintFlashPanel(s, body); return; }
+    if (key === 'capture') { paintCapturePanel(s, body, p); return; }
+    if (key === 'flash') { paintFlashPanel(s, body, p); return; }
     const h = s.health;
     if (!h) { body.appendChild(el('div', 'card-sub', 'No SNMP data yet.')); return; }
     const sc = (k) => (h.scalars[k] ? h.scalars[k].display : null);
@@ -6606,7 +6337,7 @@
           const pen = el('button', 'hero-edit-btn', '\u270E');
           pen.title = 'Edit name, location and contact';
           pen.type = 'button';
-          pen.addEventListener('click', (e) => { e.stopPropagation(); editSysIdentity(s, pen); });
+          pen.addEventListener('click', (e) => { e.stopPropagation(); editSysIdentity(s); });
           nameRow.appendChild(pen);
         }
         main.appendChild(nameRow);
@@ -7406,13 +7137,11 @@
               { v: dv(r.port) }, { v: dv(r.mac) }]), h.dot1xLocked, (r) => String(dv(r.port)) + '|' + String(dv(r.mac))));
         }
 
-        // --- AAA servers (RADIUS + TACACS+) --- not yet keyed; skipped on
-        // reconcile (a full repaint still renders them, and a change to their
-        // tables forces a full repaint via PANEL_FULL_REPAINT_TABLES).
-        if (!s._ktReconcile) {
-          buildDot1xGlobal(s, body, h, section);
-          buildAaaServers(s, body, h, section, p);
-        }
+        // --- 802.1X global settings (an editor: built on a full paint only;
+        // a change to the scalars it shows repaints the panel) and the AAA
+        // servers (keyed tables, reconciled in place) ---
+        if (!s._ktReconcile) buildDot1xGlobal(s, body, h, section);
+        buildAaaServers(s, body, h, section, p);
 
         if (!s._ktReconcile && !body.children.length) {
           body.appendChild(el('div', 'empty-state',
@@ -7598,198 +7327,198 @@
         };
         const perInstance = mode === 'pvst' || mode === 'mstp';
         const isDisabled = (v) => !v || /^(dsbl|disabled|unknown|broken)/i.test(String(v));
-
-        // --- what mode, and the global picture ---
-        const headline = el('div', 'stp-head');
-        const facts = el('div', 'stp-facts');
-        const fact = (k, v) => {
-          if (v === undefined || v === null || v === '') return;
-          const row = el('div', 'kv-row');
-          row.appendChild(el('div', 'k', k));
-          row.appendChild(el('div', 'v', v));
-          facts.appendChild(row);
-        };
         const detect = h.stpDetect || {};
-        fact('Mode', (MODE_LABEL[mode] || mode) +
-          (detect.disagrees && detect.reportedVersion
-            ? '  \u00b7  the switch reports "' + detect.reportedVersion + '"' : ''));
-        fact('This bridge', (sc('dot1dStpPriority') ? sc('dot1dStpPriority') + '  ' : '') +
-          (sc('dot1dBaseBridgeAddress') || ''));
-        if (mode === 'mstp') {
-          fact('MST region', sc('rldot1sMstpConfigurationName'));
-          fact('Region digest', sc('rldot1sMstpConfigurationDigest'));
-          fact('Max hops', sc('rldot1sMstpDesignatedMaxHopes'));
-        }
-        if (!perInstance) {
-          fact('Root bridge', sc('dot1dStpDesignatedRoot'));
-          fact('Root port', sc('dot1dStpRootPort'));
-          fact('Cost to root', sc('dot1dStpRootCost'));
-          fact('Topology changes', sc('dot1dStpTopChanges'));
-          fact('Last change', sc('dot1dStpTimeSinceTopologyChange'));
-          fact('Timers in force', [sc('dot1dStpHelloTime') && 'hello ' + sc('dot1dStpHelloTime'),
-            sc('dot1dStpMaxAge') && 'max age ' + sc('dot1dStpMaxAge'),
-            sc('dot1dStpForwardDelay') && 'forward delay ' + sc('dot1dStpForwardDelay')]
-            .filter(Boolean).join('  \u00b7  '));
-        }
         const instances = mode === 'pvst' ? h.pvstVlans : (mode === 'mstp' ? h.mstpInstances : []);
-        if (detect.disagrees) {
-          // Worth stating plainly: the mode shown was worked out from the
-          // tables the switch populates, not from what it says it runs.
-          fact('Detected from', (detect.pvstVlanRows ? detect.pvstVlanRows + ' per-VLAN row(s)' : '') +
-            (detect.mstpInstanceRows ? (detect.pvstVlanRows ? ', ' : '') +
-              detect.mstpInstanceRows + ' MST instance row(s)' : '') +
-            ' returned by the switch');
-        }
-        if (perInstance) {
-          const rooted = instances.filter((r) => String(dv(r.isRoot)) === 'yes').length;
-          fact('Instances', instances.length + (mode === 'pvst' ? ' VLAN(s)' : ' MST instance(s)') +
-            (rooted ? '  \u00b7  root for ' + rooted : ''));
-        }
-        if (!perInstance) {
-          headline.appendChild(el('div', 'hero-badge sev-' + (h.summary.stpIsRoot ? 'info' : 'ok'),
-            h.summary.stpIsRoot ? 'This switch is root' : 'Non-root bridge'));
-        }
-        headline.appendChild(facts);
-        body.appendChild(headline);
+        const pv = mode === 'pvst';
+        const instId = (inst) => String(dv(pv ? inst.rlBrgPvstOperVlanId : inst.rldot1sMstpInstanceId, inst.index));
+        const showCommon = !(perInstance && instances.length);
 
-        // --- per VLAN / per instance, the way the CLI prints it ---
-        if (perInstance && instances.length) {
-          const portsByKey = new Map();
-          const source = mode === 'pvst' ? h.pvstPorts : h.mstpPorts;
-          const keyOf = (r) => String(dv(mode === 'pvst' ? r.vlan : r.instance));
-          for (const r of source) {
-            const k = keyOf(r);
+        // Ports per instance, and which of them are participating. A port is
+        // participating only if its *state* says so: switches report
+        // "designated" against disabled ports and even against slots that do
+        // not exist, and the CLI lists a port as active only on its Sts column.
+        // Ports that did not resolve to a real interface are slots in the
+        // switch's ifIndex space, not ports, and never belong in a table.
+        const roleOf = (r) => dv(pv ? r.rlBrgPvstOperPortRole : r.rldot1sMStpInstancePortRole);
+        const stateOf = (r) => dv(pv ? r.rlBrgPvstOperPortState : r.rldot1sMstpInstancePortState);
+        const portsByKey = new Map();
+        if (perInstance) {
+          for (const r of (pv ? h.pvstPorts : h.mstpPorts)) {
+            const k = String(dv(pv ? r.vlan : r.instance));
             if (!portsByKey.has(k)) portsByKey.set(k, []);
             portsByKey.get(k).push(r);
           }
+        }
+        const instPorts = (id) => {
+          const everything = portsByKey.get(id) || [];
+          const all = everything.filter((r) => r.realPort !== false);
+          return { all, active: all.filter((r) => !isDisabled(stateOf(r))), phantom: everything.length - all.length };
+        };
+        const commonActive = h.stpPorts.filter((r) => !isDisabled(dv(r.dot1dStpPortState)));
+        const commonHidden = showCommon && h.stpPorts.length > commonActive.length && !s._stpShowDisabled;
+        const omitted = showCommon ? (h.stpPortsOmitted || 0) : 0;
 
-          const roleOf = (r) => dv(mode === 'pvst' ? r.rlBrgPvstOperPortRole : r.rldot1sMStpInstancePortRole);
-          const stateOf = (r) => dv(mode === 'pvst' ? r.rlBrgPvstOperPortState : r.rldot1sMstpInstancePortState);
-          const costOf = (r) => dv(mode === 'pvst' ? r.rlBrgPvstOperPortPathCost : r.rldot1sMstpInstancePortPathCost);
-
-          for (const inst of instances) {
-            const id = String(dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanId : inst.rldot1sMstpInstanceId, inst.index));
-            const wrap = el('div', 'stp-instance');
-            const head = el('div', 'stp-instance-head');
-            head.appendChild(el('span', 'stp-instance-name', (mode === 'pvst' ? 'VLAN ' : 'Instance ') + id));
-            const amRoot = String(dv(inst.isRoot)) === 'yes';
-            head.appendChild(el('span', 'stp-instance-badge' + (amRoot ? ' root' : ''),
-              amRoot ? 'this switch is the root' : 'root elsewhere'));
-            wrap.appendChild(head);
-
-            const kv = el('div', 'stp-instance-facts');
-            const f2 = (k, v) => {
-              if (v === undefined || v === null || v === '') return;
-              const row = el('div', 'kv-row');
-              row.appendChild(el('div', 'k', k));
-              row.appendChild(el('div', 'v', v));
-              kv.appendChild(row);
-            };
-            f2('Root ID', dv(mode === 'pvst'
-              ? inst.rlBrgPvstOperVlanDesignatedRoot : inst.rldot1sMstpInstanceDesignatedRoot));
-            if (!amRoot) {
-              f2('Root port', dv(inst.rootPort));
-              f2('Path cost', dv(mode === 'pvst'
-                ? inst.rlBrgPvstOperVlanRootCost : inst.rldot1sMstpInstanceRootCost));
-            }
-            f2('Bridge priority', dv(mode === 'pvst'
-              ? inst.rlBrgPvstOperVlanPriority : inst.rldot1sMstpInstancePriority));
-            f2('Timers', [
-              dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanHelloTime : inst.rldot1sMstpInstanceHelloTime) &&
-                'hello ' + dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanHelloTime : inst.rldot1sMstpInstanceHelloTime),
-              dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanMaxAge : inst.rldot1sMstpInstanceMaxAge) &&
-                'max age ' + dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanMaxAge : inst.rldot1sMstpInstanceMaxAge),
-              dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanForwardDelay : inst.rldot1sMstpInstanceForwardDelay) &&
-                'forward delay ' + dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanForwardDelay : inst.rldot1sMstpInstanceForwardDelay)
-            ].filter(Boolean).join('  \u00b7  '));
-            const tc = dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanTopChanges : inst.rldot1sMstpInstanceTopChanges);
-            const ts = dv(mode === 'pvst'
-              ? inst.rlBrgPvstOperVlanTimeSinceTopologyChange : inst.rldot1sMstpInstanceTimeSinceTopologyChange);
-            f2('Topology changes', tc !== '' && tc !== undefined
-              ? tc + (ts ? '  \u00b7  last ' + ts : '') : undefined);
-            wrap.appendChild(kv);
-
-            // Only ports doing something. A 24-port switch times five VLANs
-            // is 120 rows of "Dsbl" that say nothing.
-            // Ports that did not resolve to a real interface are slots in
-            // the switch's ifIndex space, not ports; they never belong in
-            // a per-VLAN table.
-            const everything = portsByKey.get(id) || [];
-            const all = everything.filter((r) => r.realPort !== false);
-            const phantom = everything.length - all.length;
-            // A port is participating only if its *state* says so. Role
-            // alone is not enough: switches report "designated" against
-            // ports that are disabled, and even against slots that do not
-            // exist, which is contradictory -- a disabled port has no
-            // role. The CLI agrees: it shows an idle port as "Dsbl Dsbl",
-            // and lists a port as active only on the Sts column.
-            const active = all.filter((r) => !isDisabled(stateOf(r)));
-            if (active.length) {
-              const t = el('table', 'data-table');
-              const hr = document.createElement('tr');
-              for (const x of ['Port', 'Role', 'State', 'Cost', 'Priority', 'Edge', 'BPDUs in', 'BPDUs out']) {
-                hr.appendChild(el('th', '', x));
-              }
-              t.appendChild(hr);
-              for (const r of active) {
-                const tr = document.createElement('tr');
-                tr.appendChild(el('td', 'col-value', dv(r.port)));
-                const rt = document.createElement('td');
-                rt.appendChild(el('span', 'pill ' + stateClass(String(roleOf(r))), roleOf(r)));
-                tr.appendChild(rt);
-                const stt = document.createElement('td');
-                stt.appendChild(el('span', 'pill ' + stateClass(String(stateOf(r))), stateOf(r)));
-                tr.appendChild(stt);
-                tr.appendChild(el('td', 'col-value', costOf(r)));
-                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst'
-                  ? r.rlBrgPvstOperPortPriority : r.rldot1sMstpInstancePortPriority)));
-                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst' ? r.rlBrgPvstOperPortEdgePort : '')));
-                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst'
-                  ? r.rlBrgPvstOperPortBpduReceived : r.rldot1sMStpInstancePortBpduReceived)));
-                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst'
-                  ? r.rlBrgPvstOperPortBpduSent : r.rldot1sMStpInstancePortBpduSent)));
-                t.appendChild(tr);
-              }
-              wrap.appendChild(t);
-              if (all.length > active.length || phantom) {
-                wrap.appendChild(el('div', 'panel-note',
-                  (all.length - active.length) + ' disabled port(s) not shown' +
-                  (phantom ? ', and ' + phantom + ' entr(y/ies) for interfaces this switch does not have' : '') +
-                  '.'));
-              }
-            } else {
-              wrap.appendChild(el('div', 'panel-note',
-                'No ports are participating in this instance' +
-                (all.length ? ' (' + all.length + ' disabled' +
-                  (phantom ? ', ' + phantom + ' non-existent' : '') + ').' : '.')));
-            }
-            body.appendChild(wrap);
+        // Keyed paint (B2): the layout is built on a full paint only. Its
+        // shape - the mode, the instances, which of them have a table, and
+        // which notes exist - is the signature; when a refresh changes it the
+        // pass is structural and the panel repaints. Otherwise tables
+        // reconcile row by row and the text blocks update in their own nodes.
+        const sig = JSON.stringify([mode, perInstance, showCommon, !!s._stpShowDisabled,
+          instances.map((i) => instId(i) + ':' + (instPorts(instId(i)).active.length ? 't' : 'n')),
+          h.pvstInconsistencies.length > 0, h.stpPorts.length > 0, commonHidden, omitted > 0]);
+        if (s._ktReconcile && p._stpSig !== sig) { s._ktStructural = true; return; }
+        if (!s._ktReconcile) { p._stpSig = sig; p._stpLive = {}; }
+        // A block whose text changes with each refresh: built once, then
+        // refilled in place only when its content differs.
+        const live = (key, parent, cls, fill) => {
+          const fresh = el('div', cls);
+          fill(fresh);
+          // An empty block (a note with nothing to say this time) is hidden.
+          if (!s._ktReconcile) { fresh.hidden = !fresh.firstChild; p._stpLive[key] = fresh; parent.appendChild(fresh); return fresh; }
+          const node = p._stpLive[key];
+          if (node && node.innerHTML !== fresh.innerHTML) {
+            clear(node);
+            while (fresh.firstChild) node.appendChild(fresh.firstChild);
+            node.hidden = !node.firstChild;
           }
-        }
+          return node || fresh;
+        };
+        const kvRows = (box, pairs) => {
+          for (const [k, v] of pairs) {
+            if (v === undefined || v === null || v === '') continue;
+            const row = el('div', 'kv-row');
+            row.appendChild(el('div', 'k', k));
+            row.appendChild(el('div', 'v', v));
+            box.appendChild(row);
+          }
+        };
+        const sectionTitle = (key, title, note) => {
+          if (!s._ktReconcile) {
+            const st = el('div', 'section-title', title);
+            const n = el('span', 'st-note', note);
+            p._stpLive[key] = n;
+            st.appendChild(n);
+            body.appendChild(st);
+          } else if (p._stpLive[key] && p._stpLive[key].textContent !== note) {
+            p._stpLive[key].textContent = note;
+          }
+        };
 
-        if (perInstance && !instances.length) {
-          body.appendChild(el('div', 'panel-note',
-            'No per-VLAN or per-instance spanning-tree rows were returned, so only the common ' +
-            'instance is shown below.'));
-        }
-        if (!perInstance) {
+        // --- what mode, and the global picture ---
+        live('head', body, 'stp-head', (head) => {
+          if (!perInstance) {
+            head.appendChild(el('div', 'hero-badge sev-' + (h.summary.stpIsRoot ? 'info' : 'ok'),
+              h.summary.stpIsRoot ? 'This switch is root' : 'Non-root bridge'));
+          }
+          const facts = el('div', 'stp-facts');
+          const pairs = [
+            ['Mode', (MODE_LABEL[mode] || mode) + (detect.disagrees && detect.reportedVersion
+              ? '  ·  the switch reports "' + detect.reportedVersion + '"' : '')],
+            ['This bridge', (sc('dot1dStpPriority') ? sc('dot1dStpPriority') + '  ' : '') + (sc('dot1dBaseBridgeAddress') || '')]
+          ];
+          if (mode === 'mstp') {
+            pairs.push(['MST region', sc('rldot1sMstpConfigurationName')],
+              ['Region digest', sc('rldot1sMstpConfigurationDigest')],
+              ['Max hops', sc('rldot1sMstpDesignatedMaxHopes')]);
+          }
+          if (!perInstance) {
+            pairs.push(['Root bridge', sc('dot1dStpDesignatedRoot')], ['Root port', sc('dot1dStpRootPort')],
+              ['Cost to root', sc('dot1dStpRootCost')], ['Topology changes', sc('dot1dStpTopChanges')],
+              ['Last change', sc('dot1dStpTimeSinceTopologyChange')],
+              ['Timers in force', [sc('dot1dStpHelloTime') && 'hello ' + sc('dot1dStpHelloTime'),
+                sc('dot1dStpMaxAge') && 'max age ' + sc('dot1dStpMaxAge'),
+                sc('dot1dStpForwardDelay') && 'forward delay ' + sc('dot1dStpForwardDelay')].filter(Boolean).join('  ·  ')]);
+          }
+          if (detect.disagrees) {
+            // Worth stating plainly: the mode shown was worked out from the
+            // tables the switch populates, not from what it says it runs.
+            pairs.push(['Detected from', (detect.pvstVlanRows ? detect.pvstVlanRows + ' per-VLAN row(s)' : '') +
+              (detect.mstpInstanceRows ? (detect.pvstVlanRows ? ', ' : '') + detect.mstpInstanceRows + ' MST instance row(s)' : '') +
+              ' returned by the switch']);
+          }
+          if (perInstance) {
+            const rooted = instances.filter((r) => String(dv(r.isRoot)) === 'yes').length;
+            pairs.push(['Instances', instances.length + (pv ? ' VLAN(s)' : ' MST instance(s)') +
+              (rooted ? '  ·  root for ' + rooted : '')]);
+          }
+          kvRows(facts, pairs);
+          head.appendChild(facts);
+        });
+
+        // --- per VLAN / per instance, the way the CLI prints it ---
+        // Only ports doing something: a 24-port switch times five VLANs is
+        // 120 rows of "Dsbl" that say nothing.
+        if (perInstance) {
+          for (const inst of instances) {
+            const id = instId(inst);
+            const k = 'inst:' + id;
+            let wrap = p._stpLive[k + ':wrap'];
+            if (!s._ktReconcile) { wrap = el('div', 'stp-instance'); p._stpLive[k + ':wrap'] = wrap; body.appendChild(wrap); }
+            const amRoot = String(dv(inst.isRoot)) === 'yes';
+            live(k + ':head', wrap, 'stp-instance-head', (head) => {
+              head.appendChild(el('span', 'stp-instance-name', (pv ? 'VLAN ' : 'Instance ') + id));
+              head.appendChild(el('span', 'stp-instance-badge' + (amRoot ? ' root' : ''),
+                amRoot ? 'this switch is the root' : 'root elsewhere'));
+            });
+            const pick = (pvstCol, mstpCol) => dv(pv ? inst[pvstCol] : inst[mstpCol]);
+            const hello = pick('rlBrgPvstOperVlanHelloTime', 'rldot1sMstpInstanceHelloTime');
+            const maxAge = pick('rlBrgPvstOperVlanMaxAge', 'rldot1sMstpInstanceMaxAge');
+            const fwd = pick('rlBrgPvstOperVlanForwardDelay', 'rldot1sMstpInstanceForwardDelay');
+            const tc = pick('rlBrgPvstOperVlanTopChanges', 'rldot1sMstpInstanceTopChanges');
+            const ts = pick('rlBrgPvstOperVlanTimeSinceTopologyChange', 'rldot1sMstpInstanceTimeSinceTopologyChange');
+            live(k + ':facts', wrap, 'stp-instance-facts', (kv) => kvRows(kv, [
+              ['Root ID', pick('rlBrgPvstOperVlanDesignatedRoot', 'rldot1sMstpInstanceDesignatedRoot')],
+              ['Root port', amRoot ? '' : dv(inst.rootPort)],
+              ['Path cost', amRoot ? '' : pick('rlBrgPvstOperVlanRootCost', 'rldot1sMstpInstanceRootCost')],
+              ['Bridge priority', pick('rlBrgPvstOperVlanPriority', 'rldot1sMstpInstancePriority')],
+              ['Timers', [hello && 'hello ' + hello, maxAge && 'max age ' + maxAge, fwd && 'forward delay ' + fwd].filter(Boolean).join('  ·  ')],
+              ['Topology changes', tc !== '' && tc !== undefined ? tc + (ts ? '  ·  last ' + ts : '') : undefined]
+            ]));
+            const { all, active, phantom } = instPorts(id);
+            if (active.length) {
+              mountInto(wrap, s, p, 'stp:' + k, ['Port', 'Role', 'State', 'Cost', 'Priority', 'Edge', 'BPDUs in', 'BPDUs out'],
+                active.map((r) => ({ key: 'port:' + dv(r.port), cells: [
+                  { v: dv(r.port) },
+                  { pill: true, v: roleOf(r) },
+                  { pill: true, v: stateOf(r) },
+                  { v: dv(pv ? r.rlBrgPvstOperPortPathCost : r.rldot1sMstpInstancePortPathCost) },
+                  { v: dv(pv ? r.rlBrgPvstOperPortPriority : r.rldot1sMstpInstancePortPriority) },
+                  { v: dv(pv ? r.rlBrgPvstOperPortEdgePort : '') },
+                  { v: dv(pv ? r.rlBrgPvstOperPortBpduReceived : r.rldot1sMStpInstancePortBpduReceived) },
+                  { v: dv(pv ? r.rlBrgPvstOperPortBpduSent : r.rldot1sMStpInstancePortBpduSent) }] })));
+              live(k + ':note', wrap, 'panel-note', (n) => {
+                if (all.length > active.length || phantom) {
+                  n.textContent = (all.length - active.length) + ' disabled port(s) not shown' +
+                    (phantom ? ', and ' + phantom + ' entr(y/ies) for interfaces this switch does not have' : '') + '.';
+                }
+              });
+            } else {
+              live(k + ':note', wrap, 'panel-note', (n) => {
+                n.textContent = 'No ports are participating in this instance' +
+                  (all.length ? ' (' + all.length + ' disabled' + (phantom ? ', ' + phantom + ' non-existent' : '') + ').' : '.');
+              });
+            }
+          }
+          if (!instances.length && !s._ktReconcile) {
+            body.appendChild(el('div', 'panel-note',
+              'No per-VLAN or per-instance spanning-tree rows were returned, so only the common ' +
+              'instance is shown below.'));
+          }
+        } else {
           const probed = [];
           if (detect.pvstVlanRows !== undefined) probed.push('rlBrgPvstOperVlanTable: ' + detect.pvstVlanRows + ' rows');
           if (detect.mstpInstanceRows !== undefined) probed.push('rldot1sMstpInstanceTable: ' + detect.mstpInstanceRows + ' rows');
-          if (probed.length) {
-            body.appendChild(el('div', 'panel-note',
-              'No per-VLAN or per-instance tables are populated on this switch (' +
-              probed.join(', ') + '), so the common instance below is the whole picture.'));
-          }
+          live('probed', body, 'panel-note', (n) => {
+            if (probed.length) {
+              n.textContent = 'No per-VLAN or per-instance tables are populated on this switch (' +
+                probed.join(', ') + '), so the common instance below is the whole picture.';
+            }
+          });
         }
 
         // --- inconsistencies always matter ---
         if (h.pvstInconsistencies.length) {
-          if (!s._ktReconcile) {
-            const st = el('div', 'section-title', 'Spanning-tree inconsistencies');
-            st.appendChild(el('span', 'st-note', 'ports blocked by a protection feature'));
-            body.appendChild(st);
-          }
+          sectionTitle('incons', 'Spanning-tree inconsistencies', 'ports blocked by a protection feature');
           mountInto(body, s, p, 'pvstInconsistencies', ['Port', 'VLAN', 'State'],
             h.pvstInconsistencies.map((r, i) => ({ key: 'pvst:' + (dv(r.port) || '') + '|' + (dv(r.vlan) || '') + '|' + i, cells: [
               { v: dv(r.port) }, { v: dv(r.vlan) }, { pill: true, v: dv(r.state) }] })));
@@ -7801,17 +7530,13 @@
         // port disabled, so it is left out entirely rather than displayed
         // with a caveat -- a table of misleading values plus an
         // explanation is still a table of misleading values.
-        const showCommon = !(perInstance && instances.length);
         if (showCommon && h.stpPorts.length) {
-          const active = h.stpPorts.filter((r) => !isDisabled(dv(r.dot1dStpPortState)));
-          if (!s._ktReconcile) {
-            const st = el('div', 'section-title', 'Ports');
-            st.appendChild(el('span', 'st-note', active.length
-              ? active.length + ' active of ' + h.stpPorts.length
-              : 'all ' + h.stpPorts.length + ' ports report disabled'));
-            body.appendChild(st);
-          }
-          const krowFor = (r) => ({ key: 'stp:' + (dv(r.port) || r.index), cells: [
+          sectionTitle('ports', 'Ports', commonActive.length
+            ? commonActive.length + ' active of ' + h.stpPorts.length
+            : 'all ' + h.stpPorts.length + ' ports report disabled');
+          const showList = s._stpShowDisabled ? h.stpPorts : commonActive;
+          mountInto(body, s, p, 'stpPorts', ['Port', 'State', 'Enabled', 'Cost', 'Priority', 'Edge', 'P2P',
+            'Designated bridge', 'Transitions'], showList.map((r) => ({ key: 'stp:' + (dv(r.port) || r.index), cells: [
             { v: dv(r.port) },
             { pill: true, v: dv(r.dot1dStpPortState) },
             { v: dv(r.dot1dStpPortEnable) },
@@ -7820,22 +7545,15 @@
             { v: dv(r.edge) },
             { v: dv(r.p2p) },
             { v: dv(r.dot1dStpPortDesignatedBridge) },
-            { v: dv(r.dot1dStpPortForwardTransitions) }] });
-          const headers = ['Port', 'State', 'Enabled', 'Cost', 'Priority', 'Edge', 'P2P',
-            'Designated bridge', 'Transitions'];
-          // Active ports shown; the disabled ones (if any) reveal via the
-          // engine's own "Show all" by including them past the cap... but here
-          // the hidden set is a filter, not a cap, so a toggle flips the source.
-          const showList = s._stpShowDisabled ? h.stpPorts : (active.length ? active : []);
-          mountInto(body, s, p, 'stpPorts', headers, showList.map(krowFor));
-          if (!s._ktReconcile && h.stpPorts.length > active.length && !s._stpShowDisabled) {
-            const note = el('div', 'panel-note',
-              (h.stpPorts.length - active.length) + ' disabled port(s) hidden.  ');
-            const show = el('button', 'raw-toggle', 'Show disabled ports');
-            show.type = 'button';
-            show.addEventListener('click', () => { s._stpShowDisabled = true; repaintPanel(s, 'stp'); });
-            note.appendChild(show);
-            body.appendChild(note);
+            { v: dv(r.dot1dStpPortForwardTransitions) }] })));
+          if (commonHidden) {
+            live('hidden', body, 'panel-note', (n) => {
+              n.appendChild(document.createTextNode((h.stpPorts.length - commonActive.length) + ' disabled port(s) hidden.  '));
+              const show = el('button', 'raw-toggle', 'Show disabled ports');
+              show.type = 'button';
+              show.addEventListener('click', () => { s._stpShowDisabled = true; repaintPanel(s, 'stp'); });
+              n.appendChild(show);
+            });
           }
         } else if (showCommon && !s._ktReconcile) {
           body.appendChild(el('div', 'panel-note',
@@ -7843,12 +7561,12 @@
             'disabled, or this model does not implement dot1dStpPortTable.'));
         }
 
-        const omitted = showCommon ? (h.stpPortsOmitted || 0) : 0;
         if (omitted) {
-          body.appendChild(el('div', 'panel-note',
-            omitted.toLocaleString() + ' row(s) hidden: the switch answers for every slot in its ' +
-            'ifIndex space, including stack members that are not fitted and port-channels that do ' +
-            'not exist. Only interfaces present in rlifPresentTable are shown.'));
+          live('omitted', body, 'panel-note', (n) => {
+            n.textContent = omitted.toLocaleString() + ' row(s) hidden: the switch answers for every slot in its ' +
+              'ifIndex space, including stack members that are not fitted and port-channels that do ' +
+              'not exist. Only interfaces present in rlifPresentTable are shown.';
+          });
         }
         return;
       }
@@ -7885,69 +7603,64 @@
   const SYS_EDIT_OIDS = {
     name: '1.3.6.1.2.1.1.5.0', location: '1.3.6.1.2.1.1.6.0', contact: '1.3.6.1.2.1.1.4.0'
   };
-  function editSysIdentity(s, anchor) {
+  // Edit the system name, location and contact in the standard pop-out (A5):
+  // one tap to save (B8), the failure as the red line under the button.
+  function editSysIdentity(s) {
     if (!s.target) return;
     const h = s.health;
     const cur = (k) => {
       const v = h && h.scalars && h.scalars[k] ? h.scalars[k].display : '';
       return (v && v !== '(empty)') ? v : '';
     };
-    // Render a small inline form inside the hero's main column, below the
-    // name/details, so it sits in normal flow rather than becoming a stray
-    // flex item in the (wrapping) .hero row.
-    const heroMain = anchor && anchor.closest('.hero-main');
-    const host = heroMain || (anchor && anchor.closest('.hero'));
-    let form = document.getElementById('sysid-form');
-    if (form) form.remove();
-    form = el('div', 'snmp-form'); form.id = 'sysid-form'; form.style.marginTop = '10px';
-    form.appendChild(el('h5', '', 'Edit identity'));
-    const defs = [
-      ['name', 'System name', SYS_EDIT_OIDS.name, cur('sysName')],
-      ['location', 'Location', SYS_EDIT_OIDS.location, cur('sysLocation')],
-      ['contact', 'Contact', SYS_EDIT_OIDS.contact, cur('sysContact')]
-    ];
-    const grid = el('div', 'snmp-form-grid');
-    const inputs = {};
-    for (const [key, label, oid, value] of defs) {
-      const inp = textInput(value);
-      inputs[key] = { inp, oid, current: value, label };
-      grid.appendChild(field(label, inp));
-    }
-    form.appendChild(grid);
-    const msg = el('div'); form.appendChild(msg);
-    const actions = el('div', 'snmp-form-actions');
-    const save = el('button', 'btn btn-small', 'Save');
-    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
-    cancel.addEventListener('click', () => form.remove());
-    withConfirm(save, (ev) => {
-      const changes = Object.values(inputs).filter((f) => f.inp.value !== f.current)
-        .map((f) => ({ label: f.label, oid: f.oid, value: f.inp.value }));
-      if (!changes.length) { form.remove(); return; }
-      runButtonAction(ev.currentTarget, {
-        failLabel: 'Save identity', spinLabel: 'Saving\u2026',
-        run: async () => {
-          for (const ch of changes) {
+    openTabbedPopout(s, 'Switch identity', [{ label: 'Identity', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const sec = formSection('Identity');
+      sec.body.classList.add('acl-stack');
+      const defs = [
+        ['name', 'System name', SYS_EDIT_OIDS.name, cur('sysName')],
+        ['location', 'Location', SYS_EDIT_OIDS.location, cur('sysLocation')],
+        ['contact', 'Contact', SYS_EDIT_OIDS.contact, cur('sysContact')]
+      ];
+      const inputs = {};
+      for (const [key, label, oid, value] of defs) {
+        const inp = textInput(value);
+        inputs[key] = { inp, oid, current: value, label };
+        sec.body.appendChild(field(label, inp));
+      }
+      form.appendChild(sec.sec);
+      const { actions, apply, msg } = applyActions('Save');
+      apply.addEventListener('click', (ev) => {
+        clear(msg);
+        const changes = Object.values(inputs).filter((f) => f.inp.value !== f.current)
+          .map((f) => ({ label: f.label, oid: f.oid, value: f.inp.value }));
+        if (!changes.length) { close(); return; }
+        runButtonAction(ev.currentTarget, {
+          failLabel: 'Save identity', spinLabel: 'Saving\u2026',
+          run: async () => {
+            s.writeBusy = true;
             try {
-              const { body: j } = await apiPost('/api/snmp-config/status-set-apply', { target: s.target, cfg: { oid: ch.oid, value: ch.value } });
-              if (!j || !j.ok) return { ok: false, error: ch.label + ': ' + ((j && j.error) || 'failed') };
-              if (!j.applied.ok) { const d = (j.applied.log && j.applied.log[0] && j.applied.log[0].detail) || 'change failed'; return { ok: false, error: ch.label + ' could not be changed: ' + d }; }
-            } catch (e) { return { ok: false, error: 'Lost contact: ' + e.message }; }
+              for (const ch of changes) {
+                const { body: j } = await apiPost('/api/snmp-config/status-set-apply', { target: s.target, cfg: { oid: ch.oid, value: ch.value } });
+                if (!j || !j.ok) return { ok: false, error: ch.label + ': ' + ((j && j.error) || 'failed') };
+                if (!j.applied.ok) { const d = (j.applied.log && j.applied.log[0] && j.applied.log[0].detail) || 'change failed'; return { ok: false, error: ch.label + ' could not be changed: ' + d }; }
+              }
+              return { ok: true };
+            } catch (e) { return { ok: false, error: 'lost contact with the local server: ' + e.message }; }
+            finally { s.writeBusy = false; }
+          },
+          ok: (r) => r && r.ok,
+          error: (r) => { const e = (r && r.error) || 'failed'; msg.appendChild(el('div', 'sw-err', 'Save identity failed: ' + e)); return e; },
+          onApplied: () => markConfigDirty(s),
+          settle: () => {
+            const panel = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === 'summary');
+            return Promise.resolve(panel ? refreshPanel(s, panel) : startHealth(s)).then(() => close());
           }
-          return { ok: true };
-        },
-        ok: (r) => r && r.ok,
-        error: (r) => { msg.className = 'snmp-msg bad'; msg.textContent = (r && r.error) || 'failed'; return (r && r.error) || 'failed'; },
-        onApplied: () => markConfigDirty(s),
-        settle: () => {
-          const panel = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === 'summary');
-          if (panel) return Promise.resolve(refreshPanel(s, panel)); else { startHealth(s); return Promise.resolve(); }
-        }
+        });
       });
-    });
-    actions.appendChild(save); actions.appendChild(cancel);
-    form.appendChild(actions);
-    if (host) host.appendChild(form); else if (anchor) anchor.parentElement.appendChild(form);
-    inputs.name.inp.focus();
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+      inputs.name.inp.focus();
+    } }], []);
   }
 
   // =================================================================
@@ -8448,27 +8161,13 @@
 
     const go = el('button', 'btn btn-amber', 'Configure this switch');
     go.type = 'button'; go.style.width = 'auto';
-    const confirm = el('div', 'cfg-confirm');
-    confirm.style.display = 'none';
-
-    go.addEventListener('click', () => {
-      clear(confirm);
-      confirm.appendChild(el('span', 'card-sub',
-        'Add ' + cfg.ourAddress + ':' + ((cfg.receiver && cfg.receiver.port) || 514) +
-        ' to the syslog collectors on ' + s.host + '? This writes to the switch.'));
-      const yes = el('button', 'btn btn-danger', 'Yes, configure it');
-      yes.type = 'button'; yes.style.width = 'auto';
-      const no = el('button', 'btn', 'Cancel');
-      no.type = 'button'; no.style.width = 'auto';
-      no.addEventListener('click', () => { confirm.style.display = 'none'; go.style.display = ''; });
-      yes.addEventListener('click', () => configureSyslog(s, sev.value));
-      confirm.appendChild(yes); confirm.appendChild(no);
-      confirm.style.display = 'flex';
-      go.style.display = 'none';
+    // Two taps (B8): the first arms the button, the second writes.
+    withConfirm(go, () => configureSyslog(s, sev.value), {
+      danger: true,
+      confirmText: () => 'Tap again to add ' + cfg.ourAddress + ':' + ((cfg.receiver && cfg.receiver.port) || 514) + ' to ' + s.host
     });
     row.appendChild(go);
     box.appendChild(row);
-    box.appendChild(confirm);
     return box;
   }
 
@@ -9092,22 +8791,10 @@
       const go = el('button', 'btn btn-amber', 'Save running to startup');
       go.type = 'button'; go.style.width = 'auto';
       go.title = 'Copies running-config over startup-config on the switch';
-      const confirmRow = el('div', 'cfg-confirm');
-      confirmRow.style.display = 'none';
-      confirmRow.appendChild(el('span', 'card-sub',
-        'Overwrite the startup configuration on ' + s.host + ' with the running configuration?'));
-      const yes = el('button', 'btn btn-danger', 'Yes, overwrite startup');
-      yes.type = 'button'; yes.style.width = 'auto';
-      const no = el('button', 'btn', 'Cancel');
-      no.type = 'button'; no.style.width = 'auto';
-      confirmRow.appendChild(yes); confirmRow.appendChild(no);
-
-      go.addEventListener('click', () => { go.style.display = 'none'; confirmRow.style.display = 'flex'; });
-      no.addEventListener('click', () => { confirmRow.style.display = 'none'; go.style.display = ''; });
-      yes.addEventListener('click', () => syncConfigs(s));
+      // Two taps (B8): the first arms the button, the second overwrites startup.
+      withConfirm(go, () => syncConfigs(s), { danger: true, confirmText: 'Tap again to overwrite startup' });
 
       bar.appendChild(go);
-      bar.appendChild(confirmRow);
       host.appendChild(bar);
     }
     host.appendChild(diffPre(diff));
@@ -10146,7 +9833,7 @@
         onApplied: () => { markConfigDirty(s, [modeSel, ipIn, prefIn]); if (iface.vlanId != null) s._vlanFlash = iface.vlanId; },
         settle: () => refreshSvi(s).then(() => { if (done) done(); })
       });
-    });
+    }, { when: () => !!(cur || dhcpOn), confirmText: 'Tap again to change the address' });
     form.appendChild(actions); form.appendChild(msg);
     // Remove button when something is configured.
     if (cur || dhcpOn) {
@@ -10848,386 +10535,334 @@
   // 16-flash-capture.js: Flash files and packet capture (OPC) panels.
   // =================================================================
 
-  // delete it (rlFileRowStatus destroy). Delete is suppressed for directory
-  // entries and anything the switch marks non-writable (system files).
-  function paintFlashPanel(s, body) {
-    clear(body);
-    if (!s.target) { body.appendChild(el('div', 'card-sub', 'Connect with SNMP to browse flash.')); return; }
+  // Both are keyed panels with their own loader (standard B1 family b2), like
+  // SNMP configuration: the rows come from a server endpoint read on demand
+  // (/api/flash/list, /api/opc/list), not from the health walk. The paint
+  // follows B2: scaffolding on a full paint, mountInto tables with stable
+  // keys, counts in stable nodes, and a load or a write reconciles in place.
+  //
+  // s._flash = { data, fetchedAt, loading, highlight }
+  // s._capture = { data, fetchedAt, loading }
+  // data is the endpoint's reply; data.error is set when it failed.
 
-    const fmtSize = (n) => {
-      const v = Number(n); if (!Number.isFinite(v)) return String(n);
-      if (v >= 1048576) return (v / 1048576).toFixed(1) + ' MB';
-      if (v >= 1024) return (v / 1024).toFixed(1) + ' KB';
-      return v + ' B';
-    };
-
-    const title = el('div', 'section-title', 'Flash files');
-    const note = el('span', 'st-note', ''); title.appendChild(note);
-    body.appendChild(title);
-
-    const listBody = el('div', 'flash-files'); listBody.style.marginTop = '8px'; body.appendChild(listBody);
-    const msg = el('div', 'sw-msg'); body.appendChild(msg);
-
-    // Download a flash file over TFTP (flash -> this app -> browser).
-    const download = (fileName) => {
-      clear(msg);
-      s.writeBusy = true;
-      return fetch('/api/opc/fetch-flash', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: s.target, flashFileName: fileName }) })
-        .then((r) => r.json().then((b) => ({ ok: r.ok, b })))
-        .then(({ ok, b }) => {
-          s.writeBusy = false;
-          if (ok && b.ok && b.pcapBase64) {
-            const bytes = atob(b.pcapBase64);
-            const arr = new Uint8Array(bytes.length);
-            for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-            const blob = new Blob([arr], { type: 'application/octet-stream' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url; a.download = String(fileName).replace(/^flash:\/\//i, '').replace(/^flash:/i, '');
-            document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
-            return true;
-          }
-          // Only surface a message on failure.
-          clear(msg); msg.appendChild(el('div', 'sw-err', 'Download failed: ' + (b.error || 'unknown error')));
-          return false;
-        })
-        .catch((e) => { s.writeBusy = false; clear(msg); msg.appendChild(el('div', 'sw-err', 'Download failed: ' + e.message)); return false; });
-    };
-
-    // The Delete button confirms itself (two-tap), so this acts directly.
-    const doDeleteFlash = (f) => {
-      clear(msg); s.writeBusy = true;
-      return fetch('/api/flash/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: s.target, fileName: f.name }) })
-        .then((r) => r.json().then((bb) => ({ ok: r.ok, bb })))
-        .then(({ ok, bb }) => {
-          s.writeBusy = false;
-          // No success text — the file just disappears from the reloaded list.
-          if (ok && bb.ok) { load(); return true; }
-          clear(msg); msg.appendChild(el('div', 'sw-err', 'Delete failed: ' + (bb.error || 'unknown error')));
-          return false;
-        })
-        .catch((e) => { s.writeBusy = false; clear(msg); msg.appendChild(el('div', 'sw-err', 'Delete failed: ' + e.message)); return false; });
-    };
-
-    const load = (highlightName) => {
-      clear(listBody); clear(msg);
-      listBody.appendChild(el('div', 'card-sub', 'Listing flash\u2026'));
-      fetch('/api/flash/list', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: s.target }) })
-        .then((r) => r.json())
-        .then((b) => {
-          clear(listBody);
-          // Normalise the name to highlight (strip any flash:// prefix so it
-          // matches the listing's bare names).
-          const hl = highlightName ? String(highlightName).replace(/^flash:\/\//i, '').replace(/^flash:/i, '') : null;
-          if (!b || b.error) { listBody.appendChild(el('div', 'card-sub', 'Could not list flash: ' + ((b && b.error) || 'error'))); return; }
-          const files = b.files || [];
-          note.textContent = files.length + ' entr' + (files.length === 1 ? 'y' : 'ies') +
-            (b.flash && b.flash.free != null ? '  \u00b7  ' + fmtSize(b.flash.free) + ' free of ' + fmtSize(b.flash.total) : '');
-          if (!files.length) { listBody.appendChild(el('div', 'card-sub', 'No files found.')); return; }
-          // Render the file list through plainTable (the keyed render helper) so
-          // it diffs cells and stays consistent with every other data table
-          // (standard A5/B3), instead of a hand-built <table>.
-          const cols = ['Name', 'Perm', 'Size', 'Modified', ''];
-          const rows = files.map((f) => {
-            const permKnown = (f.permByte !== undefined && f.permByte !== null);
-            const nameCell = el('span', '', f.isDir ? (f.name + '/') : f.name);
-            if (hl && String(f.name).replace(/^flash:\/\//i, '').replace(/^flash:/i, '') === hl) {
-              nameCell.className = 'flash-new';
-              setTimeout(() => { nameCell.classList.remove('flash-new'); }, 6000);
-            }
-            const btns = [];
-            // Download for anything that isn't a directory. Routed through
-            // runButtonAction (standard B6) so it spins until the TFTP copy +
-            // browser download resolves, then shows Done.
-            if (!f.isDir) btns.push(actBtn('Download', (e) => {
-              runButtonAction(e.currentTarget, {
-                failLabel: 'Download', spinLabel: 'Fetching\u2026',
-                run: () => download(f.name),
-                ok: (okFlag) => okFlag === true,
-                settle: () => Promise.resolve()
-              });
-            }, 'primary', 'Download this file'));
-            // Delete rules: never for directories or read-only (system) files;
-            // offered for writable or unknown-permission files.
-            let noteLabel = null;
-            if (f.isDir) { noteLabel = ' directory'; }
-            else if (permKnown && f.writable === false) { noteLabel = ' read-only'; }
-            else {
-              btns.push(actBtnConfirm('Delete', (e) => {
-                runButtonAction(e.currentTarget, {
-                  failLabel: 'Delete',
-                  run: () => doDeleteFlash(f),
-                  ok: (okFlag) => okFlag === true,
-                  settle: () => Promise.resolve()   // doDeleteFlash reloads the list itself
-                });
-              }, 'danger', 'Delete this file'));
-            }
-            // A span.tbl-acts (from actGroup) is detected by ktRenderCell as an
-            // action cell (clicks stopped); append the informational note, if any.
-            const actCell = actGroup(btns);
-            if (noteLabel) actCell.appendChild(el('span', 'card-sub', noteLabel));
-            return [
-              nameCell,
-              permKnown ? ('0x' + Number(f.permByte).toString(16).padStart(2, '0')) : '?',
-              f.isDir ? '' : (f.size !== undefined ? fmtSize(f.size) : ''),
-              [f.date, f.time].filter(Boolean).join(' '),
-              actCell
-            ];
-          });
-          listBody.appendChild(plainTable(s, cols, rows));
-        })
-        .catch((e) => { clear(listBody); listBody.appendChild(el('div', 'card-sub', 'Could not list flash: ' + e.message)); });
-    };
-
-    // Expose so the capture panel's Export can download a file and reload this
-    // list without the user switching panels.
-    s._flashDownload = download;
-    s._flashReload = load;
-    load();
+  // POST to the local server; resolves its reply, or { ok:false, error }.
+  async function sidePost(url, payload) {
+    try {
+      const { body } = await apiPost(url, payload);
+      return body || { ok: false, error: 'no reply from the local server' };
+    } catch (e) { return { ok: false, error: 'lost contact with the local server: ' + e.message }; }
   }
 
-  function paintCapturePanel(s, body) {
-    clear(body);
-    if (!s.target) {
-      body.appendChild(el('div', 'card-sub', 'Connect with SNMP to use packet capture.'));
-      return;
+  // Reconcile a b2 panel after its loader or a write, or repaint it when the
+  // pass is structural. Does nothing when the panel is closed or collapsed.
+  function sideRepaint(s, key) {
+    const p = s.panels && s.panels.find((x) => x.kind === 'builtin' && x.key === key);
+    if (!p || !p._body || p.collapsed) return;
+    if (!reconcilePanelInPlace(s, p)) repaintPanel(s, key);
+  }
+  // Load once per visit: on open, unless a load is running or ran in the last
+  // 30 s. `st` is the panel's state object, `load` its loader.
+  function sideEnsure(s, st, load) {
+    if (!s.target || !st) return;
+    if (st.loading || Date.now() - (st.fetchedAt || 0) < 30000) return;
+    load(s);
+  }
+  const fmtFlashSize = (n) => {
+    const v = Number(n); if (!Number.isFinite(v)) return String(n);
+    if (v >= 1048576) return (v / 1048576).toFixed(1) + ' MB';
+    if (v >= 1024) return (v / 1024).toFixed(1) + ' KB';
+    return v + ' B';
+  };
+  const bareFlashName = (n) => String(n || '').replace(/^flash:\/\//i, '').replace(/^flash:/i, '');
+
+  // ---- Flash files ----
+  // Lists the switch's flash; any file can be downloaded (TFTP to this app,
+  // then to the browser) and a writable one deleted (rlFileRowStatus destroy).
+  // Delete is not offered for directories or files the switch marks read-only.
+
+  // Read the listing and reconcile. highlight (a file name) flashes that row
+  // once, so a capture exported from the Packet capture panel is easy to spot.
+  function flashLoad(s, highlight) {
+    s._flash = s._flash || {};
+    const st = s._flash;
+    if (highlight) st.highlight = bareFlashName(highlight);
+    if (st.loading) return st.loading;
+    st.fetchedAt = Date.now();
+    st.loading = sidePost('/api/flash/list', { target: s.target })
+      .then((b) => { st.data = (b && !b.error) ? b : { error: (b && b.error) || 'no answer' }; })
+      .finally(() => { st.loading = null; sideRepaint(s, 'flash'); });
+    return st.loading;
+  }
+
+  // Copy a flash file to the browser. Resolves { ok, error }.
+  async function flashDownload(s, fileName) {
+    s.writeBusy = true;
+    try {
+      const b = await sidePost('/api/opc/fetch-flash', { target: s.target, flashFileName: fileName });
+      if (!(b && b.ok && b.pcapBase64)) return { ok: false, error: (b && b.error) || 'unknown error' };
+      const bytes = atob(b.pcapBase64);
+      const arr = new Uint8Array(bytes.length);
+      for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([arr], { type: 'application/octet-stream' }));
+      const a = document.createElement('a');
+      a.href = url; a.download = bareFlashName(fileName);
+      document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+      return { ok: true };
+    } finally { s.writeBusy = false; }
+  }
+
+  function paintFlashPanel(s, body, p) {
+    if (!s._ktReconcile) clear(body);
+    if (!s.target) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Connect with SNMP to browse flash.')); return; }
+    s._flash = s._flash || {};
+    if (!s._ktReconcile) sideEnsure(s, s._flash, flashLoad);
+    const d = s._flash.data;
+    // The shape: waiting, an error, no files, or the table.
+    const shape = !d ? 'wait' : (d.error ? 'error' : ((d.files || []).length ? 'files' : 'empty'));
+    if (s._ktReconcile && p._flashShape !== shape) { s._ktStructural = true; return; }
+    p._flashShape = shape;
+    if (shape === 'wait') { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Waiting for data\u2026')); return; }
+    if (shape === 'error') { if (!s._ktReconcile) body.appendChild(el('div', 'panel-err', 'Could not list flash: ' + d.error)); return; }
+
+    const files = d.files || [];
+    if (!s._ktReconcile) {
+      const st = el('div', 'section-title', 'Flash files');
+      p._flashNote = el('span', 'st-note', '');
+      st.appendChild(p._flashNote);
+      body.appendChild(st);
     }
-    // Existing captures on the switch, discovered by walking the capture table.
-    const existing = el('div', 'capture-existing'); existing.style.margin = '10px 0';
-    body.appendChild(existing);
+    p._flashNote.textContent = files.length + ' entr' + (files.length === 1 ? 'y' : 'ies') +
+      (d.flash && d.flash.free != null ? '  \u00b7  ' + fmtFlashSize(d.flash.free) + ' free of ' + fmtFlashSize(d.flash.total) : '');
+    if (shape === 'empty') { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'No files found.')); return; }
 
-    const grid = el('div', 'snmp-form-grid'); grid.style.marginTop = '10px';
+    const hl = s._flash.highlight; s._flash.highlight = null;
+    mountInto(body, s, p, 'flash:files', ['Name', 'Perm', 'Size', 'Modified', ''], files.map((f) => {
+      const permKnown = f.permByte !== undefined && f.permByte !== null;
+      const deletable = !f.isDir && !(permKnown && f.writable === false);
+      const btns = [];
+      if (!f.isDir) {
+        btns.push(actBtn('Download', (e) => runButtonAction(e.currentTarget, {
+          failLabel: 'Download', spinLabel: 'Fetching\u2026',
+          run: () => flashDownload(s, f.name),
+          ok: (r) => r && r.ok,
+          error: (r) => (r && r.error) || 'unknown error'
+        }), 'primary', 'Download this file'));
+      }
+      if (deletable) {
+        btns.push(actBtnConfirm('Delete', (e) => runButtonAction(e.currentTarget, {
+          failLabel: 'Delete',
+          run: async () => { s.writeBusy = true; try { return await sidePost('/api/flash/delete', { target: s.target, fileName: f.name }); } finally { s.writeBusy = false; } },
+          ok: (r) => r && r.ok,
+          error: (r) => (r && r.error) || 'unknown error',
+          settle: () => flashLoad(s)
+        }), 'danger', 'Delete this file'));
+      }
+      const actCell = actGroup(btns);
+      if (f.isDir) actCell.appendChild(el('span', 'card-sub', ' directory'));
+      else if (!deletable) actCell.appendChild(el('span', 'card-sub', ' read-only'));
+      return { key: 'file:' + f.name, cells: [
+        { v: f.isDir ? f.name + '/' : f.name, _flash: !!hl && bareFlashName(f.name) === hl },
+        { v: permKnown ? '0x' + Number(f.permByte).toString(16).padStart(2, '0') : '?' },
+        { v: f.isDir ? '' : (f.size !== undefined ? fmtFlashSize(f.size) : '') },
+        { v: [f.date, f.time].filter(Boolean).join(' ') },
+        { cellNode: actCell, sig: (f.isDir ? 'd' : 'f') + (deletable ? 'w' : 'r') }] };
+    }));
+  }
 
-    const nameIn = el('input'); nameIn.type = 'text'; nameIn.maxLength = 32; nameIn.value = s.captureName || 'capture1';
-    nameIn.addEventListener('input', () => { s._captureExisting = false; });
-    grid.appendChild(field('Capture name', nameIn));
+  // ---- Packet capture ----
+  // Lists the captures on the switch, each with Start/Stop, Export, Clear and
+  // Delete. + New capture, or a capture's name, opens the settings in the
+  // standard pop-out. While any capture is running the list re-reads every
+  // 15 s, so its packet counts move without a refresh.
 
-    const dirSel = el('select');
-    for (const d of ['both', 'in', 'out']) { const o = el('option', '', d); o.value = d; dirSel.appendChild(o); }
-    grid.appendChild(field('Control-plane direction', dirSel));
+  function captureLoad(s) {
+    s._capture = s._capture || {};
+    const st = s._capture;
+    if (st.loading) return st.loading;
+    st.fetchedAt = Date.now();
+    st.loading = sidePost('/api/opc/list', { target: s.target })
+      .then((b) => {
+        st.data = (b && !b.error) ? b : { error: (b && b.error) || 'no answer' };
+        st.anyActive = !st.data.error && (st.data.captures || []).some((c) => c.stateText === 'active');
+      })
+      .finally(() => { st.loading = null; sideRepaint(s, 'capture'); captureTimer(s); });
+    return st.loading;
+  }
 
-    const bufSel = el('select');
-    for (const b2 of ['linear', 'circular']) { const o = el('option', '', b2); o.value = b2; bufSel.appendChild(o); }
-    grid.appendChild(field('Buffer type', bufSel));
+  // The 15 s poll runs only while a capture is active and the panel is open,
+  // and skips a tick while a write is running. A capture's state does not
+  // change second to second, and each read walks the capture table.
+  function captureTimer(s) {
+    const st = s._capture || {};
+    const p = s.panels && s.panels.find((x) => x.kind === 'builtin' && x.key === 'capture');
+    const open = p && p._body && !p.collapsed && document.body.contains(p._body);
+    if (st.anyActive && open) {
+      if (!s._captureStatsTimer) {
+        s._captureStatsTimer = setInterval(() => {
+          if (!s.writeBusy && !(s._capture && s._capture.loading)) captureLoad(s);
+        }, 15000);
+      }
+    } else if (s._captureStatsTimer) { clearInterval(s._captureStatsTimer); s._captureStatsTimer = null; }
+  }
 
-    const sizeIn = el('input'); sizeIn.type = 'number'; sizeIn.min = '1'; sizeIn.placeholder = 'MB (optional)';
-    grid.appendChild(field('Buffer size (MB)', sizeIn));
+  // One capture action (start, stop, clear, delete, configure). Resolves
+  // { ok, error, body } for runButtonAction.
+  async function captureWrite(s, url, payload) {
+    s.writeBusy = true;
+    try {
+      const b = await sidePost(url, Object.assign({ target: s.target }, payload));
+      return { ok: !!(b && b.ok), error: (b && b.error) || 'unknown error', body: b };
+    } finally { s.writeBusy = false; }
+  }
 
-    const filterSel = el('select');
-    for (const f2 of ['any', 'acl']) { const o = el('option', '', f2 === 'any' ? 'match any' : 'match ACL'); o.value = f2; filterSel.appendChild(o); }
-    grid.appendChild(field('Filter', filterSel));
-
-    const aclIn = el('input'); aclIn.type = 'text'; aclIn.maxLength = 32; aclIn.placeholder = 'ACL name';
-    const aclField = field('ACL name', aclIn);
-    grid.appendChild(aclField);
-
-    const durIn = el('input'); durIn.type = 'number'; durIn.min = '0'; durIn.placeholder = 'seconds (0 = none)';
-    grid.appendChild(field('Limit: duration', durIn));
-
-    const pktIn = el('input'); pktIn.type = 'number'; pktIn.min = '0'; pktIn.placeholder = 'packets (0 = none)';
-    grid.appendChild(field('Limit: packets', pktIn));
-
-    body.appendChild(grid);
-    const syncFilter = () => { aclField.style.display = filterSel.value === 'acl' ? '' : 'none'; };
-    filterSel.addEventListener('change', syncFilter); syncFilter();
-
-    const msg = el('div', 'sw-msg');
-
-    // Per-capture status (state, packets, dropped, buffer) is shown inline in
-    // the captures list, so "refresh status" just reloads that list rather than
-    // maintaining a separate, redundant status block.
-    const readStatus = () => { if (s._captureListReload) s._captureListReload(); };
-
-    const cfg = () => ({
-      target: s.target, name: (nameIn.value || '').trim(), direction: dirSel.value,
-      bufferType: bufSel.value, bufferSizeMb: parseInt(sizeIn.value, 10),
-      filter: filterSel.value, aclName: (aclIn.value || '').trim(),
-      limitDurationSec: parseInt(durIn.value, 10), limitPackets: parseInt(pktIn.value, 10),
-      existing: !!s._captureExisting
-    });
-    const run = (label, url, payload, after) => {
-      clear(msg);
-      s.writeBusy = true;
-      return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
-        .then((r) => r.json().then((b) => ({ ok: r.ok, b })))
-        .then(({ ok, b }) => {
-          s.writeBusy = false;
-          // No success text — the list updates to reflect the new state. Only
-          // surface failures.
-          if (ok && b.ok) { if (after) after(b); readStatus(); if (s._captureListReload) s._captureListReload(); }
-          else { clear(msg); msg.appendChild(el('div', 'sw-err', label + ' failed: ' + (b.error || 'unknown error'))); }
-          return { ok: ok && b.ok, b };
-        })
-        .catch((e) => { s.writeBusy = false; clear(msg); msg.appendChild(el('div', 'sw-err', label + ' failed: ' + e.message)); return { ok: false }; });
-    };
-
-    const actions = el('div', 'snmp-form-actions'); actions.style.marginTop = '10px';
-    const applyBtn = el('button', 'btn btn-small btn-blue', 'Configure'); applyBtn.type = 'button';
-
-    const nameOf = () => (nameIn.value || '').trim();
-    const needName = () => { if (!nameOf()) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a capture name.')); return false; } return true; };
-
-    applyBtn.addEventListener('click', () => { if (needName()) { s.captureName = nameOf(); run('Configure', '/api/opc/configure', cfg()); } });
-    actions.appendChild(applyBtn);
-    body.appendChild(actions);
-
-    body.appendChild(msg);
-
-    // Export a stopped, non-empty capture to a flash .pcap via the rlCopyTable
-    // copy engine (sourceFileType=pcap -> capture://). This is the proven,
-    // non-crashing path. Exposed on s so the inline per-capture Export button
-    // (in the list above) can call it.
-    s._exportCapture = (captureName, btn) => {
-      clear(msg);
-      // The export button spins through the WHOLE operation - copying the capture
-      // to a flash file AND the TFTP download of that file - and only says Done
-      // once the file has actually downloaded. The copy result is carried from
-      // run() into settle() so the download targets the right flash file.
-      let copyResult = null;
-      runButtonAction(btn, {
-        failLabel: 'Export',
-        run: () => apiPost('/api/copy/capture-to-flash', { target: s.target, name: captureName, confirm: true })
-          .then((res) => { copyResult = res.body; return res; }),
-        // Success means the copy to flash genuinely finished (server waits for it).
-        ok: (res) => res && res.ok && res.body && res.body.ok && res.body.flashFileName,
-        error: (res) => {
-          const b = res && res.body;
-          if (b && b.finished === false && !b.failed) {
-            // Still being written (a very large capture beyond the server's wait):
-            // show the file in the Flash list so the user can grab it when ready.
-            if (b.flashFileName && s._flashReload) s._flashReload(b.flashFileName);
-            return 'still writing to flash - it will appear in the Flash files list shortly; download it from there once it finishes';
-          }
-          return (b && b.error) || 'unknown error';
-        },
-        // settle = the TFTP download. The button keeps spinning until it lands,
-        // and a failed download rejects so the helper reports it rather than
-        // showing a false Done.
-        settle: () => {
-          const fn = copyResult && copyResult.flashFileName;
-          if (!fn) return Promise.resolve();
-          if (s._flashReload) s._flashReload(fn);
-          if (!s._flashDownload) return Promise.resolve();
-          return Promise.resolve(s._flashDownload(fn)).then((okDl) => { if (okDl === false) throw new Error('download from flash failed'); });
+  // Export a stopped, non-empty capture: copy it to a flash .pcap through the
+  // rlCopyTable engine (sourceFileType=pcap -> capture://), the proven
+  // non-crashing path, then download that file. The button spins through both
+  // and says Done only once the file has downloaded.
+  function captureExport(s, btn, name) {
+    let copy = null;
+    return runButtonAction(btn, {
+      failLabel: 'Export',
+      run: () => apiPost('/api/copy/capture-to-flash', { target: s.target, name, confirm: true })
+        .then((res) => { copy = res.body; return res; }),
+      // Success means the copy to flash finished (the server waits for it).
+      ok: (res) => res && res.ok && res.body && res.body.ok && res.body.flashFileName,
+      error: (res) => {
+        const b = res && res.body;
+        if (b && b.finished === false && !b.failed) {
+          // Still being written (a capture larger than the server waits for):
+          // show it in Flash files so it can be fetched once it finishes.
+          if (b.flashFileName) flashLoad(s, b.flashFileName);
+          return 'still writing to flash - it will appear in the Flash files list shortly; download it from there once it finishes';
         }
-      }).catch(() => { /* toast already shown by the helper */ });
-    };
+        return (b && b.error) || 'unknown error';
+      },
+      settle: () => {
+        const fn = copy && copy.flashFileName;
+        if (!fn) return Promise.resolve();
+        flashLoad(s, fn);
+        return flashDownload(s, fn).then((r) => { if (!r.ok) throw new Error('download from flash failed: ' + r.error); });
+      }
+    }).catch(() => { /* the helper has shown the failure */ });
+  }
 
-    // Populate the config form from an existing capture object.
-    const loadIntoForm = (cap) => {
-      nameIn.value = cap.name || '';
-      s.captureName = cap.name;
-      s._captureExisting = true;
-      if (cap.bufferTypeText) bufSel.value = cap.bufferTypeText;
-      if (Number(cap.bufferSize) > 0) sizeIn.value = String(cap.bufferSize); else sizeIn.value = '';
-      if (cap.filterText === 'acl') { filterSel.value = 'acl'; aclIn.value = cap.aclName || ''; }
-      else filterSel.value = 'any';
-      syncFilter();
-      durIn.value = Number(cap.limitDuration) > 0 ? String(cap.limitDuration) : '';
-      pktIn.value = Number(cap.limitPackets) > 0 ? String(cap.limitPackets) : '';
-      readStatus();
-    };
+  function paintCapturePanel(s, body, p) {
+    if (!s._ktReconcile) clear(body);
+    if (!s.target) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Connect with SNMP to use packet capture.')); return; }
+    s._capture = s._capture || {};
+    if (!s._ktReconcile) { sideEnsure(s, s._capture, captureLoad); captureTimer(s); }
+    const d = s._capture.data;
+    const caps = (d && !d.error && d.captures) || [];
+    const shape = !d ? 'wait' : (d.error ? 'error' : (caps.length ? 'list' : 'empty'));
+    if (s._ktReconcile && p._capShape !== shape) { s._ktStructural = true; return; }
+    p._capShape = shape;
+    if (shape === 'wait') { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Waiting for data\u2026')); return; }
+    if (shape === 'error') { if (!s._ktReconcile) body.appendChild(el('div', 'panel-err', 'Could not list captures: ' + d.error)); return; }
 
-    // Discover and render existing captures.
-    const loadCaptureList = () => {
-      clear(existing);
-      existing.appendChild(el('div', 'card-sub', 'Looking for existing captures\u2026'));
-      fetch('/api/opc/list', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: s.target }) })
-        .then((r) => r.json())
-        .then((b) => {
-          const caps = (b && !b.error) ? (b.captures || []) : null;
-          if (caps) s._anyCaptureActive = caps.some((c) => c.stateText === 'active');
-          // Render with scroll preserved around the rebuild (standard B5), and
-          // through plainTable (the keyed render helper) like every other table.
-          selfManagedRender(s, () => {
-            clear(existing);
-            if (!caps) { existing.appendChild(el('div', 'card-sub', 'Could not list captures: ' + ((b && b.error) || 'error'))); return; }
-            // Nothing to show when there are no captures — the create form below
-            // is how one is made, so this section simply stays hidden.
-            if (!caps.length) return;
-            const title = el('div', 'section-title', 'Captures on the switch');
-            title.appendChild(el('span', 'st-note', caps.length + ' found'));
-            existing.appendChild(title);
-            const cols = ['Name', 'State', 'Buffer', 'Filter', 'Packets', 'Dropped', 'Used', 'Pkts/s', ''];
-            const rows = caps.map((cap) => {
-              const nm = cap.name;
-              const btns = [];
-              // Every capture action goes through runButtonAction: spinner on
-              // click, held until the switch state (and the capture list) actually
-              // reflect the change, then Done - consistent with the rest of the app.
-              const captureAction = (btn, label, url, payload) => runButtonAction(btn, {
-                failLabel: label,
-                run: () => apiPost(url, payload),
-                ok: (r) => r && r.ok && r.body && r.body.ok,
-                error: (r) => (r && r.body && r.body.error) || 'unknown error',
-                onApplied: () => { readStatus(); },
-                settle: () => selfManagedReload(s, s._captureListReload)
-              });
-              if (cap.stateText === 'active') {
-                btns.push(actBtn('Stop', (e) => captureAction(e.currentTarget, 'Stop', '/api/opc/action', { target: s.target, name: nm, action: 'stop' }), '', 'Stop capturing'));
-              } else {
-                btns.push(actBtn('Start', (e) => captureAction(e.currentTarget, 'Start', '/api/opc/action', { target: s.target, name: nm, action: 'start' }), '', 'Start capturing'));
-              }
-              btns.push(actBtn('Edit', () => loadIntoForm(cap), '', 'Load this capture into the form below to reconfigure'));
-              const exp = actBtn('Export', (e) => { if (s._exportCapture) s._exportCapture(nm, e.currentTarget); }, '', 'Export to a flash .pcap and download it');
-              const capPkts = Number(cap.packets) || 0;
-              if (cap.stateText === 'active' || capPkts <= 0) {
-                exp.disabled = true;
-                exp.title = cap.stateText === 'active' ? 'Stop the capture before exporting.' : 'Nothing to export yet — this capture has no packets.';
-              }
-              btns.push(exp);
-              // Clear empties the capture buffer so the same capture can be
-              // re-run without deleting and recreating it. Only meaningful when it
-              // is stopped and actually has captured packets.
-              const clr = actBtnConfirm('Clear', (e) => captureAction(e.currentTarget, 'Clear', '/api/opc/action', { target: s.target, name: nm, action: 'clear' }), '', 'Empty the capture buffer so you can capture again (keeps the capture configured)');
-              if (cap.stateText === 'active' || capPkts <= 0) {
-                clr.disabled = true;
-                clr.title = cap.stateText === 'active' ? 'Stop the capture before clearing.' : 'Nothing to clear \u2014 this capture has no packets.';
-              }
-              btns.push(clr);
-              btns.push(actBtnConfirm('Delete', (e) => captureAction(e.currentTarget, 'Delete', '/api/opc/delete', { target: s.target, name: nm }), 'danger', 'Delete this capture'));
-              return [
-                cap.name,
-                cap.stateText,
-                (cap.bufferTypeText || '') + (Number(cap.bufferSize) ? ' ' + cap.bufferSize + 'MB' : ''),
-                cap.filterText === 'acl' ? ('acl ' + (cap.aclName || '')) : (cap.filterText || ''),
-                cap.packets === undefined ? '' : String(cap.packets),
-                cap.dropped === undefined ? '' : String(cap.dropped),
-                cap.bufferUsed === undefined ? '' : String(cap.bufferUsed),
-                cap.pps === undefined ? '' : String(cap.pps),
-                actGroup(btns)
-              ];
-            });
-            existing.appendChild(plainTable(s, cols, rows));
-          });
-        })
-        .catch((e) => { clear(existing); existing.appendChild(el('div', 'card-sub', 'Could not list captures: ' + e.message)); });
-    };
-    // Expose so action handlers can refresh the list after changes.
-    s._captureListReload = loadCaptureList;
-    s._captureLoadIntoForm = loadIntoForm;
+    if (!s._ktReconcile) {
+      const st = el('div', 'section-title', 'Captures on the switch');
+      p._capNote = el('span', 'st-note', '');
+      st.appendChild(p._capNote);
+      body.appendChild(st);
+      body.appendChild(addControl('New capture', () => openCaptureForm(s, null)));
+    }
+    p._capNote.textContent = caps.length ? caps.length + ' found' : '';
+    if (shape === 'empty') { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'No captures on the switch.')); return; }
 
-    loadCaptureList();
+    // Every action spins until the list has been re-read (B6).
+    const act = (label, url, payload) => (e) => runButtonAction(e.currentTarget, {
+      failLabel: label,
+      run: () => captureWrite(s, url, payload),
+      ok: (r) => r && r.ok,
+      error: (r) => (r && r.error) || 'unknown error',
+      settle: () => captureLoad(s)
+    });
+    mountInto(body, s, p, 'capture:list', ['Name', 'State', 'Buffer', 'Filter', 'Packets', 'Dropped', 'Used', 'Pkts/s', ''], caps.map((cap) => {
+      const nm = cap.name;
+      const active = cap.stateText === 'active';
+      const empty = (Number(cap.packets) || 0) <= 0;
+      const btns = [active
+        ? actBtn('Stop', act('Stop', '/api/opc/action', { name: nm, action: 'stop' }), '', 'Stop capturing')
+        : actBtn('Start', act('Start', '/api/opc/action', { name: nm, action: 'start' }), '', 'Start capturing')];
+      const exp = actBtn('Export', (e) => captureExport(s, e.currentTarget, nm), '', 'Export to a flash .pcap and download it');
+      // Clear empties the buffer so the same capture can run again without
+      // being deleted and recreated; it needs a stopped capture with packets.
+      const clr = actBtnConfirm('Clear', act('Clear', '/api/opc/action', { name: nm, action: 'clear' }), '', 'Empty the capture buffer so you can capture again (keeps the capture configured)');
+      if (active || empty) {
+        exp.disabled = true; clr.disabled = true;
+        exp.title = active ? 'Stop the capture before exporting.' : 'Nothing to export yet \u2014 this capture has no packets.';
+        clr.title = active ? 'Stop the capture before clearing.' : 'Nothing to clear \u2014 this capture has no packets.';
+      }
+      btns.push(exp, clr, actBtnConfirm('Delete', act('Delete', '/api/opc/delete', { name: nm }), 'danger', 'Delete this capture'));
+      return { key: 'cap:' + nm, cells: [
+        { v: nm, click: { open: () => openCaptureForm(s, nm) } },
+        { pill: true, v: cap.stateText || '' },
+        { v: (cap.bufferTypeText || '') + (Number(cap.bufferSize) ? ' ' + cap.bufferSize + 'MB' : '') },
+        { v: cap.filterText === 'acl' ? 'acl ' + (cap.aclName || '') : (cap.filterText || '') },
+        { v: cap.packets === undefined ? '' : String(cap.packets) },
+        { v: cap.dropped === undefined ? '' : String(cap.dropped) },
+        { v: cap.bufferUsed === undefined ? '' : String(cap.bufferUsed) },
+        { v: cap.pps === undefined ? '' : String(cap.pps) },
+        { cellNode: actGroup(btns), sig: (active ? 'a' : 's') + (empty ? 'e' : 'p') }] };
+    }));
+  }
 
-    // Auto-update the capture stats every 3s while any capture is running, so
-    // packet counts update live without a refresh button. The timer is torn
-    // down when the panel is repainted (a fresh paint starts a new one) or when
-    // no capture is active, and pauses during writes.
-    if (s._captureStatsTimer) { clearInterval(s._captureStatsTimer); s._captureStatsTimer = null; }
-    // Capture status is walked from the switch each time, so poll gently - a
-    // packet capture's state does not change second-to-second, and a 3s loop was
-    // a constant SNMP drain whenever the capture panel sat open with an active
-    // capture. 15s is responsive enough for status while far lighter.
-    s._captureStatsTimer = setInterval(() => {
-      // Stop if this panel is gone from the DOM.
-      if (!document.body.contains(existing)) { clearInterval(s._captureStatsTimer); s._captureStatsTimer = null; return; }
-      if (s._anyCaptureActive && !s.writeBusy) loadCaptureList();
-    }, 15000);
-    readStatus();
+  // New or existing capture settings in the standard pop-out (A5): one tap to
+  // apply (B8), the failure as a red line under the button, Esc closes.
+  function openCaptureForm(s, name) {
+    const caps = (s._capture && s._capture.data && s._capture.data.captures) || [];
+    const cap = name ? caps.find((c) => c.name === name) : null;
+    if (name && !cap) return;
+    openTabbedPopout(s, cap ? 'Capture \u00b7 ' + cap.name : 'New packet capture', [{ label: 'Settings', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const sec = formSection('Capture');
+      sec.body.classList.add('acl-stack');
+      const nameIn = textInput(cap ? cap.name : (s.captureName || 'capture1')); nameIn.maxLength = 32;
+      if (cap) nameIn.disabled = true;
+      sec.body.appendChild(field('Capture name', nameIn));
+      const dirSel = selectInput(['both', 'in', 'out'].map((v) => ({ label: v, value: v })), 'both');
+      sec.body.appendChild(field('Control-plane direction', dirSel));
+      const bufSel = selectInput(['linear', 'circular'].map((v) => ({ label: v, value: v })), (cap && cap.bufferTypeText) || 'linear');
+      sec.body.appendChild(field('Buffer type', bufSel));
+      const num = (v, ph) => { const i = el('input'); i.type = 'number'; i.min = '0'; i.placeholder = ph; if (Number(v) > 0) i.value = String(v); return i; };
+      const sizeIn = num(cap && cap.bufferSize, 'MB (optional)');
+      sec.body.appendChild(field('Buffer size (MB)', sizeIn));
+      const filterSel = selectInput([{ label: 'match any', value: 'any' }, { label: 'match ACL', value: 'acl' }], cap && cap.filterText === 'acl' ? 'acl' : 'any');
+      sec.body.appendChild(field('Filter', filterSel));
+      const aclIn = textInput(cap && cap.filterText === 'acl' ? (cap.aclName || '') : '', 'ACL name'); aclIn.maxLength = 32;
+      const aclField = field('ACL name', aclIn);
+      sec.body.appendChild(aclField);
+      const syncFilter = () => { aclField.style.display = filterSel.value === 'acl' ? '' : 'none'; };
+      filterSel.addEventListener('change', syncFilter); syncFilter();
+      const durIn = num(cap && cap.limitDuration, 'seconds (0 = none)');
+      sec.body.appendChild(field('Limit: duration', durIn));
+      const pktIn = num(cap && cap.limitPackets, 'packets (0 = none)');
+      sec.body.appendChild(field('Limit: packets', pktIn));
+      form.appendChild(sec.sec);
+
+      const { actions, apply, msg } = applyActions(cap ? 'Save' : 'Create capture');
+      apply.addEventListener('click', (ev) => {
+        clear(msg);
+        const nm = (nameIn.value || '').trim();
+        if (!nm) { msg.appendChild(el('div', 'sw-err', 'Enter a capture name.')); return; }
+        if (!cap && caps.some((c) => c.name === nm)) { msg.appendChild(el('div', 'sw-err', 'A capture named \u201c' + nm + '\u201d already exists.')); return; }
+        if (filterSel.value === 'acl' && !(aclIn.value || '').trim()) { msg.appendChild(el('div', 'sw-err', 'Enter the ACL name to match.')); return; }
+        s.captureName = nm;
+        runButtonAction(ev.currentTarget, {
+          failLabel: cap ? 'Save capture' : 'Create capture', spinLabel: cap ? 'Saving\u2026' : 'Creating\u2026',
+          run: () => captureWrite(s, '/api/opc/configure', {
+            name: nm, direction: dirSel.value, bufferType: bufSel.value, bufferSizeMb: parseInt(sizeIn.value, 10),
+            filter: filterSel.value, aclName: (aclIn.value || '').trim(),
+            limitDurationSec: parseInt(durIn.value, 10), limitPackets: parseInt(pktIn.value, 10), existing: !!cap }),
+          ok: (r) => r && r.ok,
+          error: (r) => { const e = (r && r.error) || 'unknown error'; msg.appendChild(el('div', 'sw-err', (cap ? 'Save' : 'Create') + ' failed: ' + e)); return e; },
+          settle: () => captureLoad(s).then(() => close())
+        });
+      });
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+      if (!cap) nameIn.focus();
+    } }], []);
   }
 
   // =================================================================
@@ -11426,6 +11061,16 @@
           .concat(editable ? [r.key ? snmpDeleteCell(s, 'Delete recipient', 'recipient-delete-apply', { key: r.key }, ['recipients'], 'Delete this recipient') : { v: '' }] : []) })));
     }
 
+    // The credential this app connects with cannot be deleted (the switch
+    // refuses, and it would cut the app off), so its row shows the standard
+    // lock with the reason instead of offering Delete (B6).
+    const inUseCell = (row) => {
+      if (!row.inUse) return null;
+      const locked = el('span', 'card-sub', '\uD83D\uDD12 in use');
+      locked.title = 'This app connects to the switch with this credential, so it cannot be deleted here.';
+      return { cellNode: locked, sig: 'locked' };
+    };
+
     // ---- Communities ----
     // Traps and Status are not shown: Traps is only filled for the legacy
     // station-restricted community table (unused here), and a community is
@@ -11442,7 +11087,7 @@
           const key = 'comm:' + (c.key ? c.key.source + ':' + c.key.index : c.community);
           const first = (editable && c.key) ? { v: c.community, click: { open: () => openSnmpCommunityForm(s, key) } } : { v: c.community };
           return { key, cells: [first, { v: c.station || 'any' }, { v: c.access || '' }, { v: c.view || '\u2014' }]
-            .concat(editable ? [c.key ? snmpDeleteCell(s, 'Delete community', 'community-delete-apply', { key: c.key }, ['communities'], 'Delete this community') : { v: '' }] : []) };
+            .concat(editable ? [inUseCell(c) || (c.key ? snmpDeleteCell(s, 'Delete community', 'community-delete-apply', { key: c.key }, ['communities'], 'Delete this community') : { v: '' })] : []) };
         }));
     }
 
@@ -11473,7 +11118,7 @@
       else mountInto(body, s, p, 'snmp:usr', ['User', 'Auth', 'Privacy', 'Group', 'Status'].concat(act),
         users.map((u) => ({ key: 'usr:' + (u.key ? u.key.index : u.name), cells: [
           { v: u.name }, { v: u.auth }, { v: u.priv }, { v: u.group }, { v: u.status }]
-          .concat(editable ? [u.key ? snmpDeleteCell(s, 'Delete user', 'user-delete-apply', { key: u.key }, ['users'], 'Delete this user') : { v: '' }] : []) })));
+          .concat(editable ? [inUseCell(u) || (u.key ? snmpDeleteCell(s, 'Delete user', 'user-delete-apply', { key: u.key }, ['users'], 'Delete this user') : { v: '' })] : []) })));
     }
   }
 

@@ -32,8 +32,8 @@
     if (key === 'acl') { paintAclPanel(s, body, p); return; }
     if (key === 'routing') { paintRoutingPanel(s, body, p); return; }
     if (key === 'vlans') { paintVlanPanel(s, body, p); return; }
-    if (key === 'capture') { paintCapturePanel(s, body); return; }
-    if (key === 'flash') { paintFlashPanel(s, body); return; }
+    if (key === 'capture') { paintCapturePanel(s, body, p); return; }
+    if (key === 'flash') { paintFlashPanel(s, body, p); return; }
     const h = s.health;
     if (!h) { body.appendChild(el('div', 'card-sub', 'No SNMP data yet.')); return; }
     const sc = (k) => (h.scalars[k] ? h.scalars[k].display : null);
@@ -77,7 +77,7 @@
           const pen = el('button', 'hero-edit-btn', '\u270E');
           pen.title = 'Edit name, location and contact';
           pen.type = 'button';
-          pen.addEventListener('click', (e) => { e.stopPropagation(); editSysIdentity(s, pen); });
+          pen.addEventListener('click', (e) => { e.stopPropagation(); editSysIdentity(s); });
           nameRow.appendChild(pen);
         }
         main.appendChild(nameRow);
@@ -877,13 +877,11 @@
               { v: dv(r.port) }, { v: dv(r.mac) }]), h.dot1xLocked, (r) => String(dv(r.port)) + '|' + String(dv(r.mac))));
         }
 
-        // --- AAA servers (RADIUS + TACACS+) --- not yet keyed; skipped on
-        // reconcile (a full repaint still renders them, and a change to their
-        // tables forces a full repaint via PANEL_FULL_REPAINT_TABLES).
-        if (!s._ktReconcile) {
-          buildDot1xGlobal(s, body, h, section);
-          buildAaaServers(s, body, h, section, p);
-        }
+        // --- 802.1X global settings (an editor: built on a full paint only;
+        // a change to the scalars it shows repaints the panel) and the AAA
+        // servers (keyed tables, reconciled in place) ---
+        if (!s._ktReconcile) buildDot1xGlobal(s, body, h, section);
+        buildAaaServers(s, body, h, section, p);
 
         if (!s._ktReconcile && !body.children.length) {
           body.appendChild(el('div', 'empty-state',
@@ -1069,198 +1067,198 @@
         };
         const perInstance = mode === 'pvst' || mode === 'mstp';
         const isDisabled = (v) => !v || /^(dsbl|disabled|unknown|broken)/i.test(String(v));
-
-        // --- what mode, and the global picture ---
-        const headline = el('div', 'stp-head');
-        const facts = el('div', 'stp-facts');
-        const fact = (k, v) => {
-          if (v === undefined || v === null || v === '') return;
-          const row = el('div', 'kv-row');
-          row.appendChild(el('div', 'k', k));
-          row.appendChild(el('div', 'v', v));
-          facts.appendChild(row);
-        };
         const detect = h.stpDetect || {};
-        fact('Mode', (MODE_LABEL[mode] || mode) +
-          (detect.disagrees && detect.reportedVersion
-            ? '  \u00b7  the switch reports "' + detect.reportedVersion + '"' : ''));
-        fact('This bridge', (sc('dot1dStpPriority') ? sc('dot1dStpPriority') + '  ' : '') +
-          (sc('dot1dBaseBridgeAddress') || ''));
-        if (mode === 'mstp') {
-          fact('MST region', sc('rldot1sMstpConfigurationName'));
-          fact('Region digest', sc('rldot1sMstpConfigurationDigest'));
-          fact('Max hops', sc('rldot1sMstpDesignatedMaxHopes'));
-        }
-        if (!perInstance) {
-          fact('Root bridge', sc('dot1dStpDesignatedRoot'));
-          fact('Root port', sc('dot1dStpRootPort'));
-          fact('Cost to root', sc('dot1dStpRootCost'));
-          fact('Topology changes', sc('dot1dStpTopChanges'));
-          fact('Last change', sc('dot1dStpTimeSinceTopologyChange'));
-          fact('Timers in force', [sc('dot1dStpHelloTime') && 'hello ' + sc('dot1dStpHelloTime'),
-            sc('dot1dStpMaxAge') && 'max age ' + sc('dot1dStpMaxAge'),
-            sc('dot1dStpForwardDelay') && 'forward delay ' + sc('dot1dStpForwardDelay')]
-            .filter(Boolean).join('  \u00b7  '));
-        }
         const instances = mode === 'pvst' ? h.pvstVlans : (mode === 'mstp' ? h.mstpInstances : []);
-        if (detect.disagrees) {
-          // Worth stating plainly: the mode shown was worked out from the
-          // tables the switch populates, not from what it says it runs.
-          fact('Detected from', (detect.pvstVlanRows ? detect.pvstVlanRows + ' per-VLAN row(s)' : '') +
-            (detect.mstpInstanceRows ? (detect.pvstVlanRows ? ', ' : '') +
-              detect.mstpInstanceRows + ' MST instance row(s)' : '') +
-            ' returned by the switch');
-        }
-        if (perInstance) {
-          const rooted = instances.filter((r) => String(dv(r.isRoot)) === 'yes').length;
-          fact('Instances', instances.length + (mode === 'pvst' ? ' VLAN(s)' : ' MST instance(s)') +
-            (rooted ? '  \u00b7  root for ' + rooted : ''));
-        }
-        if (!perInstance) {
-          headline.appendChild(el('div', 'hero-badge sev-' + (h.summary.stpIsRoot ? 'info' : 'ok'),
-            h.summary.stpIsRoot ? 'This switch is root' : 'Non-root bridge'));
-        }
-        headline.appendChild(facts);
-        body.appendChild(headline);
+        const pv = mode === 'pvst';
+        const instId = (inst) => String(dv(pv ? inst.rlBrgPvstOperVlanId : inst.rldot1sMstpInstanceId, inst.index));
+        const showCommon = !(perInstance && instances.length);
 
-        // --- per VLAN / per instance, the way the CLI prints it ---
-        if (perInstance && instances.length) {
-          const portsByKey = new Map();
-          const source = mode === 'pvst' ? h.pvstPorts : h.mstpPorts;
-          const keyOf = (r) => String(dv(mode === 'pvst' ? r.vlan : r.instance));
-          for (const r of source) {
-            const k = keyOf(r);
+        // Ports per instance, and which of them are participating. A port is
+        // participating only if its *state* says so: switches report
+        // "designated" against disabled ports and even against slots that do
+        // not exist, and the CLI lists a port as active only on its Sts column.
+        // Ports that did not resolve to a real interface are slots in the
+        // switch's ifIndex space, not ports, and never belong in a table.
+        const roleOf = (r) => dv(pv ? r.rlBrgPvstOperPortRole : r.rldot1sMStpInstancePortRole);
+        const stateOf = (r) => dv(pv ? r.rlBrgPvstOperPortState : r.rldot1sMstpInstancePortState);
+        const portsByKey = new Map();
+        if (perInstance) {
+          for (const r of (pv ? h.pvstPorts : h.mstpPorts)) {
+            const k = String(dv(pv ? r.vlan : r.instance));
             if (!portsByKey.has(k)) portsByKey.set(k, []);
             portsByKey.get(k).push(r);
           }
+        }
+        const instPorts = (id) => {
+          const everything = portsByKey.get(id) || [];
+          const all = everything.filter((r) => r.realPort !== false);
+          return { all, active: all.filter((r) => !isDisabled(stateOf(r))), phantom: everything.length - all.length };
+        };
+        const commonActive = h.stpPorts.filter((r) => !isDisabled(dv(r.dot1dStpPortState)));
+        const commonHidden = showCommon && h.stpPorts.length > commonActive.length && !s._stpShowDisabled;
+        const omitted = showCommon ? (h.stpPortsOmitted || 0) : 0;
 
-          const roleOf = (r) => dv(mode === 'pvst' ? r.rlBrgPvstOperPortRole : r.rldot1sMStpInstancePortRole);
-          const stateOf = (r) => dv(mode === 'pvst' ? r.rlBrgPvstOperPortState : r.rldot1sMstpInstancePortState);
-          const costOf = (r) => dv(mode === 'pvst' ? r.rlBrgPvstOperPortPathCost : r.rldot1sMstpInstancePortPathCost);
-
-          for (const inst of instances) {
-            const id = String(dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanId : inst.rldot1sMstpInstanceId, inst.index));
-            const wrap = el('div', 'stp-instance');
-            const head = el('div', 'stp-instance-head');
-            head.appendChild(el('span', 'stp-instance-name', (mode === 'pvst' ? 'VLAN ' : 'Instance ') + id));
-            const amRoot = String(dv(inst.isRoot)) === 'yes';
-            head.appendChild(el('span', 'stp-instance-badge' + (amRoot ? ' root' : ''),
-              amRoot ? 'this switch is the root' : 'root elsewhere'));
-            wrap.appendChild(head);
-
-            const kv = el('div', 'stp-instance-facts');
-            const f2 = (k, v) => {
-              if (v === undefined || v === null || v === '') return;
-              const row = el('div', 'kv-row');
-              row.appendChild(el('div', 'k', k));
-              row.appendChild(el('div', 'v', v));
-              kv.appendChild(row);
-            };
-            f2('Root ID', dv(mode === 'pvst'
-              ? inst.rlBrgPvstOperVlanDesignatedRoot : inst.rldot1sMstpInstanceDesignatedRoot));
-            if (!amRoot) {
-              f2('Root port', dv(inst.rootPort));
-              f2('Path cost', dv(mode === 'pvst'
-                ? inst.rlBrgPvstOperVlanRootCost : inst.rldot1sMstpInstanceRootCost));
-            }
-            f2('Bridge priority', dv(mode === 'pvst'
-              ? inst.rlBrgPvstOperVlanPriority : inst.rldot1sMstpInstancePriority));
-            f2('Timers', [
-              dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanHelloTime : inst.rldot1sMstpInstanceHelloTime) &&
-                'hello ' + dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanHelloTime : inst.rldot1sMstpInstanceHelloTime),
-              dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanMaxAge : inst.rldot1sMstpInstanceMaxAge) &&
-                'max age ' + dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanMaxAge : inst.rldot1sMstpInstanceMaxAge),
-              dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanForwardDelay : inst.rldot1sMstpInstanceForwardDelay) &&
-                'forward delay ' + dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanForwardDelay : inst.rldot1sMstpInstanceForwardDelay)
-            ].filter(Boolean).join('  \u00b7  '));
-            const tc = dv(mode === 'pvst' ? inst.rlBrgPvstOperVlanTopChanges : inst.rldot1sMstpInstanceTopChanges);
-            const ts = dv(mode === 'pvst'
-              ? inst.rlBrgPvstOperVlanTimeSinceTopologyChange : inst.rldot1sMstpInstanceTimeSinceTopologyChange);
-            f2('Topology changes', tc !== '' && tc !== undefined
-              ? tc + (ts ? '  \u00b7  last ' + ts : '') : undefined);
-            wrap.appendChild(kv);
-
-            // Only ports doing something. A 24-port switch times five VLANs
-            // is 120 rows of "Dsbl" that say nothing.
-            // Ports that did not resolve to a real interface are slots in
-            // the switch's ifIndex space, not ports; they never belong in
-            // a per-VLAN table.
-            const everything = portsByKey.get(id) || [];
-            const all = everything.filter((r) => r.realPort !== false);
-            const phantom = everything.length - all.length;
-            // A port is participating only if its *state* says so. Role
-            // alone is not enough: switches report "designated" against
-            // ports that are disabled, and even against slots that do not
-            // exist, which is contradictory -- a disabled port has no
-            // role. The CLI agrees: it shows an idle port as "Dsbl Dsbl",
-            // and lists a port as active only on the Sts column.
-            const active = all.filter((r) => !isDisabled(stateOf(r)));
-            if (active.length) {
-              const t = el('table', 'data-table');
-              const hr = document.createElement('tr');
-              for (const x of ['Port', 'Role', 'State', 'Cost', 'Priority', 'Edge', 'BPDUs in', 'BPDUs out']) {
-                hr.appendChild(el('th', '', x));
-              }
-              t.appendChild(hr);
-              for (const r of active) {
-                const tr = document.createElement('tr');
-                tr.appendChild(el('td', 'col-value', dv(r.port)));
-                const rt = document.createElement('td');
-                rt.appendChild(el('span', 'pill ' + stateClass(String(roleOf(r))), roleOf(r)));
-                tr.appendChild(rt);
-                const stt = document.createElement('td');
-                stt.appendChild(el('span', 'pill ' + stateClass(String(stateOf(r))), stateOf(r)));
-                tr.appendChild(stt);
-                tr.appendChild(el('td', 'col-value', costOf(r)));
-                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst'
-                  ? r.rlBrgPvstOperPortPriority : r.rldot1sMstpInstancePortPriority)));
-                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst' ? r.rlBrgPvstOperPortEdgePort : '')));
-                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst'
-                  ? r.rlBrgPvstOperPortBpduReceived : r.rldot1sMStpInstancePortBpduReceived)));
-                tr.appendChild(el('td', 'col-value', dv(mode === 'pvst'
-                  ? r.rlBrgPvstOperPortBpduSent : r.rldot1sMStpInstancePortBpduSent)));
-                t.appendChild(tr);
-              }
-              wrap.appendChild(t);
-              if (all.length > active.length || phantom) {
-                wrap.appendChild(el('div', 'panel-note',
-                  (all.length - active.length) + ' disabled port(s) not shown' +
-                  (phantom ? ', and ' + phantom + ' entr(y/ies) for interfaces this switch does not have' : '') +
-                  '.'));
-              }
-            } else {
-              wrap.appendChild(el('div', 'panel-note',
-                'No ports are participating in this instance' +
-                (all.length ? ' (' + all.length + ' disabled' +
-                  (phantom ? ', ' + phantom + ' non-existent' : '') + ').' : '.')));
-            }
-            body.appendChild(wrap);
+        // Keyed paint (B2): the layout is built on a full paint only. Its
+        // shape - the mode, the instances, which of them have a table, and
+        // which notes exist - is the signature; when a refresh changes it the
+        // pass is structural and the panel repaints. Otherwise tables
+        // reconcile row by row and the text blocks update in their own nodes.
+        const sig = JSON.stringify([mode, perInstance, showCommon, !!s._stpShowDisabled,
+          instances.map((i) => instId(i) + ':' + (instPorts(instId(i)).active.length ? 't' : 'n')),
+          h.pvstInconsistencies.length > 0, h.stpPorts.length > 0, commonHidden, omitted > 0]);
+        if (s._ktReconcile && p._stpSig !== sig) { s._ktStructural = true; return; }
+        if (!s._ktReconcile) { p._stpSig = sig; p._stpLive = {}; }
+        // A block whose text changes with each refresh: built once, then
+        // refilled in place only when its content differs.
+        const live = (key, parent, cls, fill) => {
+          const fresh = el('div', cls);
+          fill(fresh);
+          // An empty block (a note with nothing to say this time) is hidden.
+          if (!s._ktReconcile) { fresh.hidden = !fresh.firstChild; p._stpLive[key] = fresh; parent.appendChild(fresh); return fresh; }
+          const node = p._stpLive[key];
+          if (node && node.innerHTML !== fresh.innerHTML) {
+            clear(node);
+            while (fresh.firstChild) node.appendChild(fresh.firstChild);
+            node.hidden = !node.firstChild;
           }
-        }
+          return node || fresh;
+        };
+        const kvRows = (box, pairs) => {
+          for (const [k, v] of pairs) {
+            if (v === undefined || v === null || v === '') continue;
+            const row = el('div', 'kv-row');
+            row.appendChild(el('div', 'k', k));
+            row.appendChild(el('div', 'v', v));
+            box.appendChild(row);
+          }
+        };
+        const sectionTitle = (key, title, note) => {
+          if (!s._ktReconcile) {
+            const st = el('div', 'section-title', title);
+            const n = el('span', 'st-note', note);
+            p._stpLive[key] = n;
+            st.appendChild(n);
+            body.appendChild(st);
+          } else if (p._stpLive[key] && p._stpLive[key].textContent !== note) {
+            p._stpLive[key].textContent = note;
+          }
+        };
 
-        if (perInstance && !instances.length) {
-          body.appendChild(el('div', 'panel-note',
-            'No per-VLAN or per-instance spanning-tree rows were returned, so only the common ' +
-            'instance is shown below.'));
-        }
-        if (!perInstance) {
+        // --- what mode, and the global picture ---
+        live('head', body, 'stp-head', (head) => {
+          if (!perInstance) {
+            head.appendChild(el('div', 'hero-badge sev-' + (h.summary.stpIsRoot ? 'info' : 'ok'),
+              h.summary.stpIsRoot ? 'This switch is root' : 'Non-root bridge'));
+          }
+          const facts = el('div', 'stp-facts');
+          const pairs = [
+            ['Mode', (MODE_LABEL[mode] || mode) + (detect.disagrees && detect.reportedVersion
+              ? '  ·  the switch reports "' + detect.reportedVersion + '"' : '')],
+            ['This bridge', (sc('dot1dStpPriority') ? sc('dot1dStpPriority') + '  ' : '') + (sc('dot1dBaseBridgeAddress') || '')]
+          ];
+          if (mode === 'mstp') {
+            pairs.push(['MST region', sc('rldot1sMstpConfigurationName')],
+              ['Region digest', sc('rldot1sMstpConfigurationDigest')],
+              ['Max hops', sc('rldot1sMstpDesignatedMaxHopes')]);
+          }
+          if (!perInstance) {
+            pairs.push(['Root bridge', sc('dot1dStpDesignatedRoot')], ['Root port', sc('dot1dStpRootPort')],
+              ['Cost to root', sc('dot1dStpRootCost')], ['Topology changes', sc('dot1dStpTopChanges')],
+              ['Last change', sc('dot1dStpTimeSinceTopologyChange')],
+              ['Timers in force', [sc('dot1dStpHelloTime') && 'hello ' + sc('dot1dStpHelloTime'),
+                sc('dot1dStpMaxAge') && 'max age ' + sc('dot1dStpMaxAge'),
+                sc('dot1dStpForwardDelay') && 'forward delay ' + sc('dot1dStpForwardDelay')].filter(Boolean).join('  ·  ')]);
+          }
+          if (detect.disagrees) {
+            // Worth stating plainly: the mode shown was worked out from the
+            // tables the switch populates, not from what it says it runs.
+            pairs.push(['Detected from', (detect.pvstVlanRows ? detect.pvstVlanRows + ' per-VLAN row(s)' : '') +
+              (detect.mstpInstanceRows ? (detect.pvstVlanRows ? ', ' : '') + detect.mstpInstanceRows + ' MST instance row(s)' : '') +
+              ' returned by the switch']);
+          }
+          if (perInstance) {
+            const rooted = instances.filter((r) => String(dv(r.isRoot)) === 'yes').length;
+            pairs.push(['Instances', instances.length + (pv ? ' VLAN(s)' : ' MST instance(s)') +
+              (rooted ? '  ·  root for ' + rooted : '')]);
+          }
+          kvRows(facts, pairs);
+          head.appendChild(facts);
+        });
+
+        // --- per VLAN / per instance, the way the CLI prints it ---
+        // Only ports doing something: a 24-port switch times five VLANs is
+        // 120 rows of "Dsbl" that say nothing.
+        if (perInstance) {
+          for (const inst of instances) {
+            const id = instId(inst);
+            const k = 'inst:' + id;
+            let wrap = p._stpLive[k + ':wrap'];
+            if (!s._ktReconcile) { wrap = el('div', 'stp-instance'); p._stpLive[k + ':wrap'] = wrap; body.appendChild(wrap); }
+            const amRoot = String(dv(inst.isRoot)) === 'yes';
+            live(k + ':head', wrap, 'stp-instance-head', (head) => {
+              head.appendChild(el('span', 'stp-instance-name', (pv ? 'VLAN ' : 'Instance ') + id));
+              head.appendChild(el('span', 'stp-instance-badge' + (amRoot ? ' root' : ''),
+                amRoot ? 'this switch is the root' : 'root elsewhere'));
+            });
+            const pick = (pvstCol, mstpCol) => dv(pv ? inst[pvstCol] : inst[mstpCol]);
+            const hello = pick('rlBrgPvstOperVlanHelloTime', 'rldot1sMstpInstanceHelloTime');
+            const maxAge = pick('rlBrgPvstOperVlanMaxAge', 'rldot1sMstpInstanceMaxAge');
+            const fwd = pick('rlBrgPvstOperVlanForwardDelay', 'rldot1sMstpInstanceForwardDelay');
+            const tc = pick('rlBrgPvstOperVlanTopChanges', 'rldot1sMstpInstanceTopChanges');
+            const ts = pick('rlBrgPvstOperVlanTimeSinceTopologyChange', 'rldot1sMstpInstanceTimeSinceTopologyChange');
+            live(k + ':facts', wrap, 'stp-instance-facts', (kv) => kvRows(kv, [
+              ['Root ID', pick('rlBrgPvstOperVlanDesignatedRoot', 'rldot1sMstpInstanceDesignatedRoot')],
+              ['Root port', amRoot ? '' : dv(inst.rootPort)],
+              ['Path cost', amRoot ? '' : pick('rlBrgPvstOperVlanRootCost', 'rldot1sMstpInstanceRootCost')],
+              ['Bridge priority', pick('rlBrgPvstOperVlanPriority', 'rldot1sMstpInstancePriority')],
+              ['Timers', [hello && 'hello ' + hello, maxAge && 'max age ' + maxAge, fwd && 'forward delay ' + fwd].filter(Boolean).join('  ·  ')],
+              ['Topology changes', tc !== '' && tc !== undefined ? tc + (ts ? '  ·  last ' + ts : '') : undefined]
+            ]));
+            const { all, active, phantom } = instPorts(id);
+            if (active.length) {
+              mountInto(wrap, s, p, 'stp:' + k, ['Port', 'Role', 'State', 'Cost', 'Priority', 'Edge', 'BPDUs in', 'BPDUs out'],
+                active.map((r) => ({ key: 'port:' + dv(r.port), cells: [
+                  { v: dv(r.port) },
+                  { pill: true, v: roleOf(r) },
+                  { pill: true, v: stateOf(r) },
+                  { v: dv(pv ? r.rlBrgPvstOperPortPathCost : r.rldot1sMstpInstancePortPathCost) },
+                  { v: dv(pv ? r.rlBrgPvstOperPortPriority : r.rldot1sMstpInstancePortPriority) },
+                  { v: dv(pv ? r.rlBrgPvstOperPortEdgePort : '') },
+                  { v: dv(pv ? r.rlBrgPvstOperPortBpduReceived : r.rldot1sMStpInstancePortBpduReceived) },
+                  { v: dv(pv ? r.rlBrgPvstOperPortBpduSent : r.rldot1sMStpInstancePortBpduSent) }] })));
+              live(k + ':note', wrap, 'panel-note', (n) => {
+                if (all.length > active.length || phantom) {
+                  n.textContent = (all.length - active.length) + ' disabled port(s) not shown' +
+                    (phantom ? ', and ' + phantom + ' entr(y/ies) for interfaces this switch does not have' : '') + '.';
+                }
+              });
+            } else {
+              live(k + ':note', wrap, 'panel-note', (n) => {
+                n.textContent = 'No ports are participating in this instance' +
+                  (all.length ? ' (' + all.length + ' disabled' + (phantom ? ', ' + phantom + ' non-existent' : '') + ').' : '.');
+              });
+            }
+          }
+          if (!instances.length && !s._ktReconcile) {
+            body.appendChild(el('div', 'panel-note',
+              'No per-VLAN or per-instance spanning-tree rows were returned, so only the common ' +
+              'instance is shown below.'));
+          }
+        } else {
           const probed = [];
           if (detect.pvstVlanRows !== undefined) probed.push('rlBrgPvstOperVlanTable: ' + detect.pvstVlanRows + ' rows');
           if (detect.mstpInstanceRows !== undefined) probed.push('rldot1sMstpInstanceTable: ' + detect.mstpInstanceRows + ' rows');
-          if (probed.length) {
-            body.appendChild(el('div', 'panel-note',
-              'No per-VLAN or per-instance tables are populated on this switch (' +
-              probed.join(', ') + '), so the common instance below is the whole picture.'));
-          }
+          live('probed', body, 'panel-note', (n) => {
+            if (probed.length) {
+              n.textContent = 'No per-VLAN or per-instance tables are populated on this switch (' +
+                probed.join(', ') + '), so the common instance below is the whole picture.';
+            }
+          });
         }
 
         // --- inconsistencies always matter ---
         if (h.pvstInconsistencies.length) {
-          if (!s._ktReconcile) {
-            const st = el('div', 'section-title', 'Spanning-tree inconsistencies');
-            st.appendChild(el('span', 'st-note', 'ports blocked by a protection feature'));
-            body.appendChild(st);
-          }
+          sectionTitle('incons', 'Spanning-tree inconsistencies', 'ports blocked by a protection feature');
           mountInto(body, s, p, 'pvstInconsistencies', ['Port', 'VLAN', 'State'],
             h.pvstInconsistencies.map((r, i) => ({ key: 'pvst:' + (dv(r.port) || '') + '|' + (dv(r.vlan) || '') + '|' + i, cells: [
               { v: dv(r.port) }, { v: dv(r.vlan) }, { pill: true, v: dv(r.state) }] })));
@@ -1272,17 +1270,13 @@
         // port disabled, so it is left out entirely rather than displayed
         // with a caveat -- a table of misleading values plus an
         // explanation is still a table of misleading values.
-        const showCommon = !(perInstance && instances.length);
         if (showCommon && h.stpPorts.length) {
-          const active = h.stpPorts.filter((r) => !isDisabled(dv(r.dot1dStpPortState)));
-          if (!s._ktReconcile) {
-            const st = el('div', 'section-title', 'Ports');
-            st.appendChild(el('span', 'st-note', active.length
-              ? active.length + ' active of ' + h.stpPorts.length
-              : 'all ' + h.stpPorts.length + ' ports report disabled'));
-            body.appendChild(st);
-          }
-          const krowFor = (r) => ({ key: 'stp:' + (dv(r.port) || r.index), cells: [
+          sectionTitle('ports', 'Ports', commonActive.length
+            ? commonActive.length + ' active of ' + h.stpPorts.length
+            : 'all ' + h.stpPorts.length + ' ports report disabled');
+          const showList = s._stpShowDisabled ? h.stpPorts : commonActive;
+          mountInto(body, s, p, 'stpPorts', ['Port', 'State', 'Enabled', 'Cost', 'Priority', 'Edge', 'P2P',
+            'Designated bridge', 'Transitions'], showList.map((r) => ({ key: 'stp:' + (dv(r.port) || r.index), cells: [
             { v: dv(r.port) },
             { pill: true, v: dv(r.dot1dStpPortState) },
             { v: dv(r.dot1dStpPortEnable) },
@@ -1291,22 +1285,15 @@
             { v: dv(r.edge) },
             { v: dv(r.p2p) },
             { v: dv(r.dot1dStpPortDesignatedBridge) },
-            { v: dv(r.dot1dStpPortForwardTransitions) }] });
-          const headers = ['Port', 'State', 'Enabled', 'Cost', 'Priority', 'Edge', 'P2P',
-            'Designated bridge', 'Transitions'];
-          // Active ports shown; the disabled ones (if any) reveal via the
-          // engine's own "Show all" by including them past the cap... but here
-          // the hidden set is a filter, not a cap, so a toggle flips the source.
-          const showList = s._stpShowDisabled ? h.stpPorts : (active.length ? active : []);
-          mountInto(body, s, p, 'stpPorts', headers, showList.map(krowFor));
-          if (!s._ktReconcile && h.stpPorts.length > active.length && !s._stpShowDisabled) {
-            const note = el('div', 'panel-note',
-              (h.stpPorts.length - active.length) + ' disabled port(s) hidden.  ');
-            const show = el('button', 'raw-toggle', 'Show disabled ports');
-            show.type = 'button';
-            show.addEventListener('click', () => { s._stpShowDisabled = true; repaintPanel(s, 'stp'); });
-            note.appendChild(show);
-            body.appendChild(note);
+            { v: dv(r.dot1dStpPortForwardTransitions) }] })));
+          if (commonHidden) {
+            live('hidden', body, 'panel-note', (n) => {
+              n.appendChild(document.createTextNode((h.stpPorts.length - commonActive.length) + ' disabled port(s) hidden.  '));
+              const show = el('button', 'raw-toggle', 'Show disabled ports');
+              show.type = 'button';
+              show.addEventListener('click', () => { s._stpShowDisabled = true; repaintPanel(s, 'stp'); });
+              n.appendChild(show);
+            });
           }
         } else if (showCommon && !s._ktReconcile) {
           body.appendChild(el('div', 'panel-note',
@@ -1314,12 +1301,12 @@
             'disabled, or this model does not implement dot1dStpPortTable.'));
         }
 
-        const omitted = showCommon ? (h.stpPortsOmitted || 0) : 0;
         if (omitted) {
-          body.appendChild(el('div', 'panel-note',
-            omitted.toLocaleString() + ' row(s) hidden: the switch answers for every slot in its ' +
-            'ifIndex space, including stack members that are not fitted and port-channels that do ' +
-            'not exist. Only interfaces present in rlifPresentTable are shown.'));
+          live('omitted', body, 'panel-note', (n) => {
+            n.textContent = omitted.toLocaleString() + ' row(s) hidden: the switch answers for every slot in its ' +
+              'ifIndex space, including stack members that are not fitted and port-channels that do ' +
+              'not exist. Only interfaces present in rlifPresentTable are shown.';
+          });
         }
         return;
       }
@@ -1356,67 +1343,63 @@
   const SYS_EDIT_OIDS = {
     name: '1.3.6.1.2.1.1.5.0', location: '1.3.6.1.2.1.1.6.0', contact: '1.3.6.1.2.1.1.4.0'
   };
-  function editSysIdentity(s, anchor) {
+  // Edit the system name, location and contact in the standard pop-out (A5):
+  // one tap to save (B8), the failure as the red line under the button.
+  function editSysIdentity(s) {
     if (!s.target) return;
     const h = s.health;
     const cur = (k) => {
       const v = h && h.scalars && h.scalars[k] ? h.scalars[k].display : '';
       return (v && v !== '(empty)') ? v : '';
     };
-    // Render a small inline form inside the hero's main column, below the
-    // name/details, so it sits in normal flow rather than becoming a stray
-    // flex item in the (wrapping) .hero row.
-    const heroMain = anchor && anchor.closest('.hero-main');
-    const host = heroMain || (anchor && anchor.closest('.hero'));
-    let form = document.getElementById('sysid-form');
-    if (form) form.remove();
-    form = el('div', 'snmp-form'); form.id = 'sysid-form'; form.style.marginTop = '10px';
-    form.appendChild(el('h5', '', 'Edit identity'));
-    const defs = [
-      ['name', 'System name', SYS_EDIT_OIDS.name, cur('sysName')],
-      ['location', 'Location', SYS_EDIT_OIDS.location, cur('sysLocation')],
-      ['contact', 'Contact', SYS_EDIT_OIDS.contact, cur('sysContact')]
-    ];
-    const grid = el('div', 'snmp-form-grid');
-    const inputs = {};
-    for (const [key, label, oid, value] of defs) {
-      const inp = textInput(value);
-      inputs[key] = { inp, oid, current: value, label };
-      grid.appendChild(field(label, inp));
-    }
-    form.appendChild(grid);
-    const msg = el('div'); form.appendChild(msg);
-    const actions = el('div', 'snmp-form-actions');
-    const save = el('button', 'btn btn-small', 'Save');
-    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
-    cancel.addEventListener('click', () => form.remove());
-    withConfirm(save, (ev) => {
-      const changes = Object.values(inputs).filter((f) => f.inp.value !== f.current)
-        .map((f) => ({ label: f.label, oid: f.oid, value: f.inp.value }));
-      if (!changes.length) { form.remove(); return; }
-      runButtonAction(ev.currentTarget, {
-        failLabel: 'Save identity', spinLabel: 'Saving\u2026',
-        run: async () => {
-          for (const ch of changes) {
+    openTabbedPopout(s, 'Switch identity', [{ label: 'Identity', fill: (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const sec = formSection('Identity');
+      sec.body.classList.add('acl-stack');
+      const defs = [
+        ['name', 'System name', SYS_EDIT_OIDS.name, cur('sysName')],
+        ['location', 'Location', SYS_EDIT_OIDS.location, cur('sysLocation')],
+        ['contact', 'Contact', SYS_EDIT_OIDS.contact, cur('sysContact')]
+      ];
+      const inputs = {};
+      for (const [key, label, oid, value] of defs) {
+        const inp = textInput(value);
+        inputs[key] = { inp, oid, current: value, label };
+        sec.body.appendChild(field(label, inp));
+      }
+      form.appendChild(sec.sec);
+      const { actions, apply, msg } = applyActions('Save');
+      apply.addEventListener('click', (ev) => {
+        clear(msg);
+        const changes = Object.values(inputs).filter((f) => f.inp.value !== f.current)
+          .map((f) => ({ label: f.label, oid: f.oid, value: f.inp.value }));
+        if (!changes.length) { close(); return; }
+        runButtonAction(ev.currentTarget, {
+          failLabel: 'Save identity', spinLabel: 'Saving\u2026',
+          run: async () => {
+            s.writeBusy = true;
             try {
-              const { body: j } = await apiPost('/api/snmp-config/status-set-apply', { target: s.target, cfg: { oid: ch.oid, value: ch.value } });
-              if (!j || !j.ok) return { ok: false, error: ch.label + ': ' + ((j && j.error) || 'failed') };
-              if (!j.applied.ok) { const d = (j.applied.log && j.applied.log[0] && j.applied.log[0].detail) || 'change failed'; return { ok: false, error: ch.label + ' could not be changed: ' + d }; }
-            } catch (e) { return { ok: false, error: 'Lost contact: ' + e.message }; }
+              for (const ch of changes) {
+                const { body: j } = await apiPost('/api/snmp-config/status-set-apply', { target: s.target, cfg: { oid: ch.oid, value: ch.value } });
+                if (!j || !j.ok) return { ok: false, error: ch.label + ': ' + ((j && j.error) || 'failed') };
+                if (!j.applied.ok) { const d = (j.applied.log && j.applied.log[0] && j.applied.log[0].detail) || 'change failed'; return { ok: false, error: ch.label + ' could not be changed: ' + d }; }
+              }
+              return { ok: true };
+            } catch (e) { return { ok: false, error: 'lost contact with the local server: ' + e.message }; }
+            finally { s.writeBusy = false; }
+          },
+          ok: (r) => r && r.ok,
+          error: (r) => { const e = (r && r.error) || 'failed'; msg.appendChild(el('div', 'sw-err', 'Save identity failed: ' + e)); return e; },
+          onApplied: () => markConfigDirty(s),
+          settle: () => {
+            const panel = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === 'summary');
+            return Promise.resolve(panel ? refreshPanel(s, panel) : startHealth(s)).then(() => close());
           }
-          return { ok: true };
-        },
-        ok: (r) => r && r.ok,
-        error: (r) => { msg.className = 'snmp-msg bad'; msg.textContent = (r && r.error) || 'failed'; return (r && r.error) || 'failed'; },
-        onApplied: () => markConfigDirty(s),
-        settle: () => {
-          const panel = s.panels && s.panels.find((p) => p.kind === 'builtin' && p.key === 'summary');
-          if (panel) return Promise.resolve(refreshPanel(s, panel)); else { startHealth(s); return Promise.resolve(); }
-        }
+        });
       });
-    });
-    actions.appendChild(save); actions.appendChild(cancel);
-    form.appendChild(actions);
-    if (host) host.appendChild(form); else if (anchor) anchor.parentElement.appendChild(form);
-    inputs.name.inp.focus();
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+      inputs.name.inp.focus();
+    } }], []);
   }
+

@@ -105,7 +105,7 @@
       form.appendChild(sec.sec);
       const { actions, apply } = applyActions('Add static MAC');
       const msg = el('div', 'port-detail-msg');
-      withConfirm(apply, (ev) => {
+      apply.addEventListener('click', (ev) => {
         clear(msg);
         const mac = (macIn.value || '').trim();
         if (!isValidMac(mac)) { msg.appendChild(el('div', 'sw-err', 'Enter a MAC like AA:BB:CC:DD:EE:FF.')); return; }
@@ -403,7 +403,7 @@
 
     const { actions, apply, msg } = applyActions('Apply');
     const voiceVid = () => parseInt((s.health && s.health.scalars && (s.health.scalars.vlanVoiceAdminVid || {}).value), 10);
-    withConfirm(apply, (ev) => {
+    apply.addEventListener('click', (ev) => {
       clear(msg);
       const newVoice = parseInt(voiceSel.value, 10);
       const newQos = parseInt(voiceQosSel.value, 10);

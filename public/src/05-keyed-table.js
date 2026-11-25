@@ -27,7 +27,7 @@
   //   { v, pill }                    -> coloured status pill
   //   { v, click:{open} }            -> row-opens-detail link cell
   //   { actions }                    -> port action buttons (via portActionsCell)
-  //   { vlanDelete } / { rowActions }-> module-specific action cells
+  //   { vlanDelete }                 -> VLAN delete cell
   //   { cellNode }                   -> a caller-built DOM node (buttons, etc.)
   // Value cells diff by their value; node-bearing cells (cellNode/actions/...)
   // carry an explicit `sig` string the caller sets to whatever determines their
@@ -73,12 +73,6 @@
       td.appendChild(c.cellNode);
       return td;
     }
-    if (c && c.rowActions) {
-      const td = el('td', 'port-actions');
-      td.addEventListener('click', (e) => e.stopPropagation());
-      if (s._aaaRowAction) s._aaaRowAction(td, c.rowActions);
-      return td;
-    }
     if (c && c.click) {
       const td = el('td', 'col-value');
       td.appendChild(el('span', 'port-link', c.v === undefined || c.v === null ? '' : c.v));
@@ -107,7 +101,7 @@
     if (typeof c !== 'object') return 't:' + c;
     // Cells carrying a live DOM node diff by a caller-supplied sig; without one
     // they rebuild every reconcile (safe default).
-    if (c.actions || c.cellNode || c.vlanDelete || c.rowActions || (c.node instanceof Node)) {
+    if (c.actions || c.cellNode || c.vlanDelete || (c.node instanceof Node)) {
       return 'n:' + (c.sig !== undefined ? c.sig : ('\u0000rand' + Math.random()));
     }
     const kind = c.pill ? 'p' : (c.click ? 'c' : 'v');
@@ -334,10 +328,8 @@
     return cellArrays.map((cells, i) => ({ key: String(keyFn(dataRows[i], i)), cells: cells }));
   }
 
-  // A one-shot keyed table for panels that manage their OWN container and
-  // rebuild it wholesale on their own refresh (SNMP config, ACL) - they don't
-  // participate in the panel reconcile system, so they just need the standard
-  // table markup. Rows are plain cell-arrays (cells may be values or DOM nodes,
+  // A one-shot keyed table outside the panels (the config history list): it is
+  // built once and never reconciled, so it just needs the standard markup. Rows are plain cell-arrays (cells may be values or DOM nodes,
   // the legacy snmpTable style). onRowClick(i, tr) is supported for edit rows.
   // Returns the node; keeps _tbody/_colspan/_rowByKey for editor anchoring.
   function plainTable(s, cols, rows, onRowClick) {

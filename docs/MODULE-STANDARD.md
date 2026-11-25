@@ -241,7 +241,11 @@ here), never as inline styles on a one-off node.
   meaning (A2).
 - **Form** — a modal via `openTabbedPopout(s, title, tabs, [])`; inside, group with
   `formSection(title)` (amber ruled title) and lay out fields with `field(label,
-  control)` (`.snmp-field`: stacked label + input).
+  control)` (`.snmp-field`: stacked label + input). `openTabbedPopout` is the only
+  pop-out: no inline row editors, no forms opened inside a panel, and no second
+  modal helper (`openDetailDialog` is a one-tab `openTabbedPopout`). A form has no
+  Cancel button; **Esc** closes it. Errors go on a red `.sw-err` line under the
+  button.
 - **Change flash** — `flashValue(node)` adds `.value-changed` (a 1.7s settle
   animation) so a value that just changed is felt. Used for inline edits.
 
@@ -273,15 +277,18 @@ helpers, following Part B yields correct visuals automatically.
 
 ## B1. Module families
 
-There are four, by how their data is sourced. All of them obey the same VISUAL rules
+There are three, by how their data is sourced. All of them obey the same VISUAL rules
 (Part A) and the same WRITE rules (§B6) — those are universal. They differ only in
 the data/refresh mechanism (§B4–§B5). §B2–§B3 (keyed paint + `mountKeyedTable`)
-apply fully to families (a), (b) and (b2); only the two unconverted modules in (c)
-still rebuild themselves.
+apply fully to every family: no panel rebuilds itself.
 
 **(a) Health-data panels** — render from tables in the periodic SNMP walk (summary,
 metrics, hardware, interfaces, auth, connected, stp). A `case` in `paintBuiltin`.
-Read-mostly; any writes follow §B6.
+Read-mostly; any writes follow §B6. When the layout itself depends on the data (stp:
+one block per VLAN or MST instance, each with a table or a note), the paint keeps a
+signature of that shape on the panel and sets `s._ktStructural` when a reconcile
+pass sees a different one; text that changes with each walk (facts, counts, notes)
+lives in nodes built once and refilled in place.
 
 **(b) Keyed write modules** — data from `health.js` tables (some `onDemand`), refresh
 via `refreshTables`, tables via `mountKeyedTable`, reconcile in place. Dedicated
@@ -289,7 +296,7 @@ paint fn dispatched before the switch. **routing (the IPv4 Addressing panel), vl
 acl.** This is the preferred
 pattern for any NEW interactive module, and §B2–§B6 describe it in full.
 
-**(b2) Keyed panels with their own loader** — **snmpcfg.** Rendered exactly like
+**(b2) Keyed panels with their own loader** — **snmpcfg, flash, capture.** Rendered exactly like
 family (b): a `paintXPanel(s, body, p)` that follows §B2, `mountInto` tables with
 stable keys, counts and notes in stable nodes, registered in `KEYED_PANELS`, and
 reconciled in place after a load or a write. The only difference is where the rows
@@ -297,7 +304,13 @@ come from: the module's own loader (`snmpLoad`) reads a server endpoint
 (`/api/snmp-config`) instead of `health.js` tables, keeps the replies on the session
 (`s._snmp.data`), and calls `reconcilePanelInPlace` (falling back to `repaintPanel`)
 when they land. Its `PANEL_TABLE_DEPS` entry is `[]` so no table refresh repaints it,
-and `refreshPanel` re-runs its loader for the panel's Refresh button.
+and `refreshPanel` re-runs its loader for the panel's Refresh button. Flash files
+(`flashLoad`, `/api/flash/list`) and Packet capture (`captureLoad`, `/api/opc/list`)
+follow the same pattern with one read each: the server decodes the switch's file
+table and joins the capture configuration and status tables (test 1 below), and
+both modules' actions are server operations (TFTP download, the copy engine). A
+running capture re-reads its list every 15 s while the panel is open; the timer
+stops when no capture is active.
 
 **When a module may have its own loader — the two tests.** A module gets its own
 loader only if it meets AT LEAST ONE of these, and the choice is documented:
@@ -336,23 +349,10 @@ and `PANEL_TABLES.acl` so the panel's Refresh re-reads only its own tables. Havi
 for a module of its own: routing and vlans are keyed panels with 5+ tables each. The only
 criteria are the two tests above.
 
-**(c) Self-managed modules** — **capture, flash.** These own their data pipeline
-(`/api/capture`, `/api/flash`) AND still their own rebuild: they have not been
-converted to the keyed paint yet, so they are the only modules that use the two
-legacy helpers below. A conversion moves them to (b2).
-
-- **Tables** — `plainTable(s, cols, rows)` (a thin keyed-render wrapper with
-  position keys: `rows` are arrays of cells, each a string or a DOM node such as an
-  `actGroup`), NOT a hand-built `<table>`. A handful of read-only, one-shot or
-  live-append display tables elsewhere — the tech-support parse output, the OID
-  results grid, the syslog stream, the dot1x trap matrix — deliberately stay as
-  hand-built `<table>` elements with the shared `data-table` class; nothing
-  reconciles them.
-- **Refresh** — the render runs inside `selfManagedRender(s, renderFn)`, which
-  captures scroll before `renderFn` clears+rebuilds and restores it after (standard
-  A7). The loader is awaited via `selfManagedReload(s, loaderFn)` (or by returning
-  its promise), so a write's `runButtonAction` `settle` holds the spinner until the
-  reload has actually repainted.
+A handful of read-only, one-shot or live-append display tables outside the panels —
+the tech-support parse output, the OID results grid, the syslog stream, the dot1x
+trap matrix, the config history list (`plainTable`) — deliberately stay simple;
+nothing reconciles them.
 
 Obligations for every module, whatever its family: VISUAL rules (Part A) in full;
 WRITE rules (§B6) in full (`snmpSet`/`snmpSetResult` or the module's one write
@@ -577,6 +577,9 @@ on the periodic timer is a cost decision, not just a correctness one.
       works. This was established by a delete-probe that tried each variant (rule 5:
       the negative was proven, not assumed), after reading both CISCOSB-dnscl.mib and
       rfc1612.mib. Both cases show a 🔒 with a reason instead of a Delete button.
+  (c) the SNMP community or SNMPv3 user the app is connected with: the server
+      flags it `inUse` (it knows the resolved credential, including a saved
+      switch's) and the panel shows `🔒 in use` instead of Delete.
 - **Protect connectivity-critical writes.** A write that could sever the app's own
   SNMP path to the switch is locked, not merely confirmed — the same protection the
   management SVI/VLAN already has (`isManagementIf`). This covers deleting the
@@ -633,10 +636,8 @@ on the periodic timer is a cost decision, not just a correctness one.
 | Reconcile one panel's keyed tables in place | `reconcilePanelInPlace(s, p)` |
 | Build/diff a data table | `mountKeyedTable(s, p, id, cols, rows, opts)` |
 | Place a table (multi-table panels) | `mountInto(container, s, p, id, cols, rows, opts)` |
-| Render a table in a self-managed module (capture, flash only) | `plainTable(s, cols, rows)` |
-| Preserve scroll around a self-managed rebuild | `selfManagedRender(s, renderFn)` |
-| Await a self-managed loader (settle) | `selfManagedReload(s, loaderFn)` |
-| Load / re-read one section of a module with its own loader (b2) | `snmpLoad(s)`, `snmpRefresh(s, sections)` |
+| A one-shot table outside the panels (config history) | `plainTable(s, cols, rows)` |
+| Load / re-read a module with its own loader (b2) | `snmpLoad(s)`, `snmpRefresh(s, sections)`, `flashLoad(s, highlight)`, `captureLoad(s)` |
 | A text input / a select from `[{label, value}]` | `textInput(value, placeholder)`, `selectInput(options, value)` |
 | ~~Old button lifecycle — REMOVED~~ | `beginApply` / `resetApply` deleted (no callers); `flashButtonOk` is now internal to `runButtonAction` only → always use `runButtonAction` |
 | Wrap existing cell arrays as keyed rows | `keyedRowsFrom(cells, rows, keyFn)` |
@@ -655,6 +656,7 @@ on the periodic timer is a cost decision, not just a correctness one.
 | Status pill | `el('span','pill '+variant, label)` |
 | Modal form | `openTabbedPopout(s, title, tabs, [])`, `formSection`, `field` |
 | Two-tap confirm only when the click is drastic | `withConfirm(btn, run, { when, confirmText })`: `when()` false runs on the first tap; `confirmText` may be a function naming what goes |
+| Which clicks take two taps | Every delete; a write that replaces something in place (overwrite startup, change an existing address, rebuild a channel's members, configure the switch's logging); a port setting that can drop the link (speed/duplex, switchport mode, 802.1X port control); a key sent without SNMPv3 privacy. Add, create, rename and other saves take one tap. A two-tap button arms in place (`withConfirm`); never a separate Yes/Cancel row |
 | IPv4 address of an L3 interface (VLAN SVI or routed port) | `buildSviEditor(s, iface, ifIndex, pane, done)` in `15-ipv4-addressing.js`, `iface` = `vlanIface(vlan)` or `l3Iface(s, ifIndex)`; one editor, one management lock. Every interface address is set in the IPv4 Addressing panel only (`openIpv4Editor`, `openIpv4AddForm`), never in a VLAN or port popout |
 | Remove one interface's address / DHCP client (reports failure) | `removeIfAddress(s, ifIndex, cur, dhcpOn)`; `teardownSvi(s, ifIndex)` is the best-effort teardown before a VLAN delete or a switch back to switchport |
 | The user IPv4 addresses (static/dhcp rows of rsIpAddrTable) | `ipv4Addresses(s)` |

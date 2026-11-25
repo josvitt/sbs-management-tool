@@ -142,7 +142,7 @@
       form.appendChild(sec.sec);
       const { actions, apply } = applyActions('Save name');
       const msg = el('div', 'port-detail-msg');
-      withConfirm(apply, (ev) => {
+      apply.addEventListener('click', (ev) => {
         clear(msg);
         runButtonAction(ev.currentTarget, {
           failLabel: 'Rename VLAN',
@@ -203,7 +203,7 @@
       form.appendChild(sec.sec);
       const { actions, apply } = applyActions('Create VLAN');
       const msg = el('div', 'port-detail-msg');
-      withConfirm(apply, (ev) => {
+      apply.addEventListener('click', (ev) => {
         const id = parseInt(idIn.value, 10);
         clear(msg);
         if (!Number.isFinite(id) || id < 2 || id > 4094) { msg.appendChild(el('div', 'sw-err', 'Enter a VLAN id between 2 and 4094.')); return; }
