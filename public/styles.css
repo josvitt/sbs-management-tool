@@ -1289,6 +1289,8 @@ tr.aaa-editing > td { background: var(--panel-2); vertical-align: middle; }
    Unified "+ Add ..." button — bottom-left, below the table it adds to.
    ============================================================ */
 .tbl-add { margin: 8px 0 14px; }
+/* A list-level action beside an add control (the ACL panel's Delete ACL). */
+.acl-list-acts { margin-left: 10px; }
 /* Compact inline-control row: a small amber-muted label beside a narrow input or
    select, for scalar config rows (e.g. Voice VLAN mode/VLAN/CoS). Reusable. */
 .sw-mini-label { font-size: 10px; color: var(--muted); letter-spacing: 0.04em; margin: 0 4px 0 10px; }
@@ -1456,14 +1458,8 @@ input.value-changed, select.value-changed, textarea.value-changed {
   background: rgba(232, 163, 61, 0.12); border: 1px solid rgba(232, 163, 61, 0.4); border-radius: 6px;
   font-size: 12px; color: var(--amber); }
 
-/* ---- IP access lists panel ---- */
-.acl-cfg { padding: 4px 2px; }
-.acl-cfg .intro { margin-bottom: 12px; }
-.acl-cfg .data-table { margin-bottom: 14px; }
-
 /* ---- ACL create/edit form: clean sectioned layout ---- */
 .acl-form { max-width: 560px; }
-.acl-form h5 { margin: 0 0 12px; font-size: 14px; }
 /* Each section: a labelled block with breathing room. */
 .acl-fsec { margin-bottom: 16px; }
 .acl-fsec-title {
@@ -1508,8 +1504,6 @@ input.value-changed, select.value-changed, textarea.value-changed {
 .acl-flag-opt { display: flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--muted); cursor: pointer; }
 .acl-flag-opt input { width: auto; margin: 0; }
 /* The per-ACL add button and the New ACL row. */
-.acl-new-row { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--panel-border); }
-.acl-cfg .tbl-add { margin: 6px 0 16px; }
 
 /* MAC table pagination controls. */
 .mac-paged { display: flex; flex-direction: column; }

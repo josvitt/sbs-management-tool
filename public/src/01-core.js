@@ -574,17 +574,8 @@
     return { sec, body };
   }
 
-  // Walk the candidate ACL tables and show what each returns, including the
-  // actual row contents of the QoS ACL/ACE/Ref tables (where this switch keeps
-  // its ACLs) so we can see the real structure, not just counts.
-
-  // Helper: a classification value accessor (display or value) for ACL cells.
+  // A cell's display text, falling back to its raw value (ACL and port-channel
+  // cells).
   function dvc(cell) { return cell ? (cell.display !== undefined && cell.display !== null && cell.display !== '' ? cell.display : cell.value) : ''; }
-  // A sub-heading inside the ACL panel (mirrors the SNMP sub-sections).
-  function section2(root, title, note) {
-    const h = el('div', 'aaa-sub', title);
-    if (note) h.appendChild(el('span', 'st-note', '  ' + note));
-    root.appendChild(h);
-  }
 
   const q2 = (s, sel) => s.pane.querySelector(sel);

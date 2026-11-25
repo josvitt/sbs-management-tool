@@ -29,7 +29,7 @@
     // SNMP configuration does not depend on a health collection, so it is
     // handled before the "no data yet" gate the health panels sit behind.
     if (key === 'snmpcfg') { paintSnmpPanel(s, body); return; }
-    if (key === 'acl') { paintAclPanel(s, body); return; }
+    if (key === 'acl') { paintAclPanel(s, body, p); return; }
     if (key === 'routing') { paintRoutingPanel(s, body, p); return; }
     if (key === 'vlans') { paintVlanPanel(s, body, p); return; }
     if (key === 'capture') { paintCapturePanel(s, body); return; }

@@ -7,7 +7,7 @@ designed to reinforce each other, so a correctly-built module is automatically a
 correctly-styled one and vice versa.
 
 Everything here is **derived from the code that already exists** — the working
-modules (VLANs, Connected, Hardware, Auth, Interfaces) and `public/styles.css`.
+modules (VLANs, IPv4 Addressing, IP access lists, Connected, Hardware, Auth, Interfaces) and `public/styles.css`.
 Nothing here is aspirational invention; it documents the real system and makes it
 the rule.
 
@@ -284,7 +284,8 @@ Read-mostly; any writes follow §B6.
 
 **(b) Keyed write modules** — data from `health.js` tables (some `onDemand`), refresh
 via `refreshTables`, tables via `mountKeyedTable`, reconcile in place. Dedicated
-paint fn dispatched before the switch. **routing (the IPv4 Addressing panel), vlans.** This is the preferred
+paint fn dispatched before the switch. **routing (the IPv4 Addressing panel), vlans,
+acl.** This is the preferred
 pattern for any NEW interactive module, and §B2–§B6 describe it in full.
 
 **(c) Self-managed config modules** — **snmpcfg, capture, flash.** These own their
@@ -319,9 +320,11 @@ behaviour.
 (`QOS_ACL.name/aceTidx/tuple`) are plain `getbulk` walks, its join is purely
 client-side, and its load costs ~6 PDUs (~12-packet burst — negligible). It fails
 both family-(c) tests: the data is flat-walkable and the cost is trivial. So ACL's
-tables are declared in `health.js` and the existing client-side join moves, intact,
-into its paint function (reading `h.aclNames/h.aclAces/h.aclTuples` instead of its
-own `apiPost` walks). Having multiple tables/sections in one panel is NOT a reason
+tables are declared in `health.js` (raw + onDemand, §B4), its join is one function
+(`aclModel(h)`) that the paint, the write paths and the port/VLAN binding editor all
+read, and its paint follows §B2 like VLANs: `mountInto` tables keyed by
+`ace:<acl>.<rule>`, per-list rule counts and the Delete-ACL lock refreshed in place,
+and `PANEL_TABLES.acl` so the panel's Refresh re-reads only its own tables. Having multiple tables/sections in one panel is NOT a reason
 for family (c): routing and vlans are keyed panels with 5+ tables each. The only
 family-(c) criteria are the two tests above.
 
@@ -346,8 +349,7 @@ it is not a separate world — only its data source differs:
   arrays of cells, each cell a string or a DOM node such as an `actGroup`), NOT a
   hand-built `<table>`. This gives it the same cell-diffing, styling, and action-cell
   handling as the keyed panels. The scope is tables with rows the user acts on or
-  that re-render on a refresh (ACL rules, SNMP users/communities, flash files,
-  captures). A handful of read-only, one-shot or live-append display tables
+  that re-render on a refresh (SNMP users/communities, flash files, captures). A handful of read-only, one-shot or live-append display tables
   elsewhere — the tech-support parse output, the OID results grid, the syslog stream,
   the dot1x trap matrix, the SNMP view grid — deliberately stay as hand-built
   `<table>` elements: they already carry the shared `data-table` class (so they are
@@ -493,7 +495,11 @@ value, display }`). Declare such a table with `raw: true` (and `oid`, or `oids` 
 list of subtrees to walk and concatenate); `health.js` then returns the raw walk rows
 and the panel's existing join reads them unchanged. This is how ACL became a keyed
 panel (B1b) without rewriting its join: its three tables (`aclNames/aclAces/
-aclTuples`) are `raw` + `onDemand`, synced to the panel via pointers. Use `raw` only
+aclTuples`) are `raw` + `onDemand`. A panel whose first load is still pending shows
+"Waiting for data…" (not an empty-state note) until its table key exists in
+`s.health`, and treats that first arrival as a structural change on a reconcile
+pass; `applyFullHealth` carries an on-demand table forward, empty or not, once it
+has been read. Use `raw` only
 when a panel genuinely joins subtrees itself; a single flat table uses the normal
 pivoted form.
 
@@ -607,6 +613,13 @@ on the periodic timer is a cost decision, not just a correctness one.
   routed (`buildSwitchportEditor`), each locked with the reason shown.
 - **RowStatus creates** set the mandatory columns and `createAndGo(4)` in ONE PDU (a
   bare RowStatus set returns InconsistentValue).
+- **Multi-row writes leave nothing half-made.** When one change spans several rows
+  that point at each other (an ACL rule = tuple rows + the ACE that points at them),
+  a failed later step removes the rows the earlier steps created; a delete also
+  removes the pointed-at rows that nothing else still references; and a replace
+  keeps the old pointed-at rows until the new row is in, so the old row can be put
+  back at its own index if the new one is refused (`createQosAce`, `editQosAce`,
+  `deleteQosAce` in 14-acl.js). A replace keeps the row's index when order matters.
 - **`markConfigDirty(s)`** in `onApplied` for any running-config change, so the
   unsaved badge/banner update.
 - **Index encoding** uses the shared helper matched to the MIB index type:
