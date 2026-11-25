@@ -90,8 +90,16 @@ function limitRequests(session, host, port) {
   return session;
 }
 
+// A stand-in for the net-snmp session, for recording a real switch
+// (scripts/record-switch.js wraps the real session) and for replaying one
+// offline (test/fake-agent.js answers from the recording). factory(target,
+// buildReal) returns the session to use. null restores the normal path.
+let sessionFactory = null;
+function setSessionFactory(fn) { sessionFactory = typeof fn === 'function' ? fn : null; }
+
 function buildSnmpSession(target) {
-  return limitRequests(buildRawSession(target), target.host, target.port);
+  const raw = sessionFactory ? sessionFactory(target, () => buildRawSession(target)) : buildRawSession(target);
+  return limitRequests(raw, target.host, target.port);
 }
 
 function buildRawSession(target) {
@@ -721,6 +729,7 @@ module.exports = {
   copyFinishedWaiter,
   v3SecurityOf,
   buildSnmpSession,
+  setSessionFactory,
   limitRequests,
   onSwitchWrite,
   MAX_REQUESTS_PER_SEC,
