@@ -285,7 +285,11 @@ still rebuild themselves.
 
 **(a) Health-data panels** — render from tables in the periodic SNMP walk (summary,
 metrics, hardware, interfaces, auth, connected, stp). A `case` in `paintBuiltin`.
-Read-mostly; any writes follow §B6.
+Read-mostly; any writes follow §B6. When the layout itself depends on the data (stp:
+one block per VLAN or MST instance, each with a table or a note), the paint keeps a
+signature of that shape on the panel and sets `s._ktStructural` when a reconcile
+pass sees a different one; text that changes with each walk (facts, counts, notes)
+lives in nodes built once and refilled in place.
 
 **(b) Keyed write modules** — data from `health.js` tables (some `onDemand`), refresh
 via `refreshTables`, tables via `mountKeyedTable`, reconcile in place. Dedicated
