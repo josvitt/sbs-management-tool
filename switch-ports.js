@@ -71,7 +71,11 @@ const REFLECTOR = { 1: 'span', 2: 'rspan-start', 3: 'rspan-final' };
 const SPAN_PORT_TYPE = { 1: 'monitor-only', 2: 'network' };
 const SRC_TYPE = { 1: 'port', 2: 'vlan', 3: 'flow', 4: 'remote-vlan' };
 const DIRECTION = { 1: 'rx', 2: 'tx', 3: 'both' };
-const PHY_TYPE = { 2: 'cableStatus', 3: 'cableFault', 4: 'cableLength', 13: 'pair1', 14: 'pair2', 15: 'pair3', 16: 'pair4' };
+const PHY_TYPE = { 2: 'cableStatus', 3: 'cableFault', 4: 'cableLength',
+  13: 'pair1', 14: 'pair2', 15: 'pair3', 16: 'pair4',
+  17: 'polarity1', 18: 'polarity2', 19: 'polarity3', 20: 'polarity4',
+  21: 'skew1', 22: 'skew2', 23: 'skew3', 24: 'skew4' };
+const PHY_SET = V + '.90.1.1.1.1';   // rlPhyTestSetType, index ifIndex
 const TRAFFIC = { 1: 'broadcast', 2: 'multicastRegistered', 3: 'multicastUnregistered', 4: 'multicastAll', 5: 'unknownUnicast', 6: 'all' };
 const PHY_STATUS = { 1: 'none', 2: 'success', 3: 'inProgress', 4: 'notSupported', 5: 'unableToRun', 6: 'aborted', 7: 'failed' };
 
@@ -243,6 +247,246 @@ async function readCableTests(session) {
     }));
 }
 
+// ---- writes ----------------------------------------------------------------
+// Each is encoded from the row the switch made (docs/SWITCH-NOTES.md, "Port
+// features"). Nothing here saves the configuration.
+
+function setVarbinds(session, varbinds) {
+  return new Promise((resolve, reject) => {
+    session.set(varbinds, (error, result) => {
+      if (error) return reject(error);
+      const bad = (result || []).find((vb) => snmp.isVarbindError(vb));
+      if (bad) return reject(new Error(snmp.varbindError(bad)));
+      resolve(result);
+    });
+  });
+}
+
+const I = (oid, value) => ({ oid, type: snmp.ObjectType.Integer, value });
+const TV = (on) => (on ? 1 : 2);
+const ROW = { active: 1, createAndGo: 4, createAndWait: 5, destroy: 6 };
+
+function checkIf(ifIndex) {
+  const n = Number(ifIndex);
+  if (!Number.isInteger(n) || n < 1 || n >= 1000) throw new Error('ifIndex must be a front-panel port.');
+  return n;
+}
+
+/**
+ * PoE on one port. `p` has any of admin (bool), priority ('critical',
+ * 'high', 'low') and limitMw (milliwatts, the user's power limit).
+ */
+async function setPoe(session, group, port, p) {
+  const g = Number(group) || 1, n = Number(port);
+  if (!Number.isInteger(n) || n < 1) throw new Error('port is required.');
+  const idx = g + '.' + n;
+  const vbs = [];
+  if (p.admin != null) vbs.push(I(PETH + '.3.' + idx, TV(p.admin)));
+  if (p.priority != null) {
+    const v = Number(Object.keys(POE_PRIORITY).find((k) => POE_PRIORITY[k] === p.priority));
+    if (!v) throw new Error('priority must be critical, high or low.');
+    vbs.push(I(PETH + '.7.' + idx, v));
+  }
+  if (p.limitMw != null) {
+    const mw = Number(p.limitMw);
+    if (!Number.isInteger(mw) || mw < 0 || mw > 100000) throw new Error('The power limit is in milliwatts, 0 to 100000.');
+    vbs.push(I(RL_PETH + '.6.' + idx, mw));
+  }
+  if (!vbs.length) throw new Error('Nothing to change.');
+  await setVarbinds(session, vbs);
+  return { group: g, port: n, set: p };
+}
+
+/**
+ * Port security on one port: locked (bool), mode ('disabled' classic lock,
+ * 'dynamic' learn up to maxMacs, 'secure-permanent', 'secure-delete-on-reset')
+ * and maxMacs.
+ */
+async function setPortSecurity(session, ifIndex, p) {
+  const ifx = checkIf(ifIndex);
+  const vbs = [];
+  if (p.mode != null) {
+    const v = Number(Object.keys(LOCK_MODE).find((k) => LOCK_MODE[k] === p.mode));
+    if (!v) throw new Error('mode must be disabled, dynamic, secure-permanent or secure-delete-on-reset.');
+    vbs.push(I(SWIF + '.37.' + ifx, v));
+  }
+  if (p.maxMacs != null) {
+    const m = Number(p.maxMacs);
+    if (!Number.isInteger(m) || m < 0 || m > 256) throw new Error('The address limit is 0 to 256.');
+    vbs.push(I(SWIF + '.38.' + ifx, m));
+  }
+  if (p.locked != null) vbs.push(I(SWIF + '.8.' + ifx, p.locked ? 1 : 2));
+  if (!vbs.length) throw new Error('Nothing to change.');
+  await setVarbinds(session, vbs);
+  return { ifIndex: ifx, set: p };
+}
+
+/**
+ * Storm control on one port: the rate for one kind of traffic ('broadcast',
+ * 'multicastAll' or 'unknownUnicast'); 0 turns it off. Only the rate column
+ * is written. The unit (.3) and action (.4) stay as the switch has them: on
+ * a C1300 on 4.1.9.92 every row reads rate 0, unit 1, action 1, and what
+ * unit 1 means is checked by eye in the switch test (docs/SWITCH-NOTES.md).
+ */
+async function setStorm(session, ifIndex, traffic, rate) {
+  const ifx = checkIf(ifIndex);
+  const t = Number(Object.keys(TRAFFIC).find((k) => TRAFFIC[k] === traffic));
+  if (!t || [1, 4, 5].indexOf(t) < 0) throw new Error('traffic must be broadcast, multicastAll or unknownUnicast.');
+  const n = Number(rate);
+  if (!Number.isInteger(n) || n < 0 || n > 10000000) throw new Error('The rate must be 0 to 10000000.');
+  await setVarbinds(session, [{ oid: STORM + '.2.' + ifx + '.' + t, type: snmp.ObjectType.Gauge, value: n }]);
+  return { ifIndex: ifx, traffic, rate: n };
+}
+
+async function setErrdisableInterval(session, seconds) {
+  const n = Number(seconds);
+  if (!Number.isInteger(n) || n < 30 || n > 86400) throw new Error('The recovery interval is 30 to 86400 seconds.');
+  await setVarbinds(session, [I(SCALARS.errdisInterval, n)]);
+  return { intervalSec: n };
+}
+
+async function setErrdisableCause(session, cause, on) {
+  const id = Number(Object.keys(CAUSES).find((k) => CAUSES[k] === cause || k === String(cause)));
+  if (!id) throw new Error('Unknown errdisable cause.');
+  await setVarbinds(session, [I(ERRDIS + '.2.1.2.' + id, TV(on))]);
+  return { cause: CAUSES[id], recover: !!on };
+}
+
+/** LLDP, CDP or EEE for the whole switch. */
+async function setGlobal(session, feature, on) {
+  const oid = { lldp: SCALARS.lldp, cdp: SCALARS.cdp, eee: SCALARS.eee }[feature];
+  if (!oid) throw new Error('feature must be lldp, cdp or eee.');
+  await setVarbinds(session, [I(oid, TV(on))]);
+  return { feature, on: !!on };
+}
+
+/** LLDP on one port: 'txAndRx', 'txOnly', 'rxOnly' or 'disabled'. */
+async function setLldpPort(session, ifIndex, admin) {
+  const ifx = checkIf(ifIndex);
+  const v = Number(Object.keys(LLDP_ADMIN).find((k) => LLDP_ADMIN[k] === admin));
+  if (!v) throw new Error('LLDP must be txAndRx, txOnly, rxOnly or disabled.');
+  await setVarbinds(session, [I(LLDP_PORTS + '.2.' + ifx, v)]);
+  return { ifIndex: ifx, lldp: admin };
+}
+
+async function setCdpPort(session, ifIndex, on) {
+  const ifx = checkIf(ifIndex);
+  await setVarbinds(session, [I(CDP_IF + '.2.' + ifx, TV(on))]);
+  return { ifIndex: ifx, cdp: !!on };
+}
+
+async function setEeePort(session, ifIndex, on) {
+  const ifx = checkIf(ifIndex);
+  await setVarbinds(session, [I(EEE_PORTS + '.1.' + ifx, TV(on))]);
+  return { ifIndex: ifx, eee: !!on };
+}
+
+// ---- port mirroring ----
+
+const MAX_SESSIONS = 4;
+
+/**
+ * A local mirroring session: copy `sources` ([{ ifIndex, direction: 'rx' |
+ * 'tx' | 'both' }]) to the `dest` port. The destination row is made as the
+ * switch makes it (span, monitor-only), then each source. If a source is
+ * refused, the rows made so far are removed again.
+ */
+async function addMirror(session, sessionId, dest, sources) {
+  const id = Number(sessionId);
+  if (!Number.isInteger(id) || id < 1 || id > MAX_SESSIONS) throw new Error('The session is 1 to ' + MAX_SESSIONS + '.');
+  const d = checkIf(dest);
+  if (!Array.isArray(sources) || !sources.length) throw new Error('Choose at least one port to copy.');
+  const src = sources.map((x) => {
+    const ifx = checkIf(x.ifIndex);
+    if (ifx === d) throw new Error('A port cannot be copied to itself.');
+    const dir = Number(Object.keys(DIRECTION).find((k) => DIRECTION[k] === (x.direction || 'both')));
+    if (!dir) throw new Error('direction must be rx, tx or both.');
+    return { ifx, dir };
+  });
+  const now = await readMirror(session);
+  if (now.destinations.some((x) => x.session === id)) throw new Error('Session ' + id + ' is in use.');
+  if (now.destinations.some((x) => x.ifIndex === d)) throw new Error('That port is already a mirroring destination.');
+  // The destination as the switch makes it: span(1), monitor-only(1).
+  // createAndGo with its columns first; createAndWait, columns, then active
+  // if that is refused (MODULE-STANDARD rule 6: the forms tried are kept).
+  const cols = [I(SPAN_DEST + '.2.' + id, d), I(SPAN_DEST + '.3.' + id, 1), I(SPAN_DEST + '.4.' + id, 1)];
+  const tried = [];
+  try {
+    await setVarbinds(session, [I(SPAN_DEST + '.6.' + id, ROW.createAndGo)].concat(cols));
+  } catch (e) {
+    tried.push('createAndGo: ' + e.message);
+    try {
+      await setVarbinds(session, [I(SPAN_DEST + '.6.' + id, ROW.createAndWait)]);
+      await setVarbinds(session, cols);
+      await setVarbinds(session, [I(SPAN_DEST + '.6.' + id, ROW.active)]);
+    } catch (e2) {
+      tried.push('createAndWait then active: ' + e2.message);
+      await setVarbinds(session, [I(SPAN_DEST + '.6.' + id, ROW.destroy)]).catch(() => {});
+      throw new Error('The switch refused every form of the destination (' + tried.join('; ') + ').');
+    }
+  }
+  const made = [];
+  try {
+    for (const x of src) {
+      const idx = id + '.1.' + x.ifx;
+      await setVarbinds(session, [I(SPAN_SRC + '.5.' + idx, ROW.createAndGo), I(SPAN_SRC + '.4.' + idx, x.dir)]);
+      made.push(idx);
+    }
+  } catch (e) {
+    for (const idx of made) await setVarbinds(session, [I(SPAN_SRC + '.5.' + idx, ROW.destroy)]).catch(() => {});
+    await setVarbinds(session, [I(SPAN_DEST + '.6.' + id, ROW.destroy)]).catch(() => {});
+    throw new Error('The switch refused a mirrored port, so the session was removed again (' + e.message + ').');
+  }
+  return { session: id, dest: d, sources: src.map((x) => ({ ifIndex: x.ifx, direction: DIRECTION[x.dir] })) };
+}
+
+/** Remove a mirroring session: its sources first, then its destination. */
+async function removeMirror(session, sessionId) {
+  const id = Number(sessionId);
+  const now = await readMirror(session);
+  if (!now.destinations.some((x) => x.session === id) && !now.sources.some((x) => x.session === id)) {
+    throw new Error('There is no mirroring session ' + id + '.');
+  }
+  for (const x of now.sources.filter((y) => y.session === id)) {
+    const t = Number(Object.keys(SRC_TYPE).find((k) => SRC_TYPE[k] === x.type)) || 1;
+    await setVarbinds(session, [I(SPAN_SRC + '.5.' + id + '.' + t + '.' + x.index, ROW.destroy)]);
+  }
+  if (now.destinations.some((x) => x.session === id)) await setVarbinds(session, [I(SPAN_DEST + '.6.' + id, ROW.destroy)]);
+  return { removed: id };
+}
+
+// ---- cable test ----
+
+/**
+ * Start a cable test on one port and wait for its results. 'length' (VCT
+ * length, rlPhyTestTableCableLength) runs on a port whose link is up at
+ * 1 Gb/s and keeps the link; 'full' (rlPhyTestTableCableStatus, TDR)
+ * takes the link down for a few seconds while it measures each pair.
+ */
+async function cableTest(session, ifIndex, kind, opts) {
+  const ifx = checkIf(ifIndex);
+  const type = { full: 2, length: 4 }[kind || 'full'];
+  if (!type) throw new Error('The test is full or length.');
+  const waitMs = (opts && opts.waitMs) || 20000;
+  const stepMs = (opts && opts.stepMs) || 1000;
+  // Results from an earlier test stay in the table, so a result counts only
+  // once its time stamp has changed.
+  const stamp = (rs) => rs.map((r) => r.test + '@' + r.at).join('|');
+  const before = stamp((await readCableTests(session)).filter((r) => r.ifIndex === ifx));
+  await setVarbinds(session, [I(PHY_SET + '.' + ifx, type)]);
+  const until = Date.now() + waitMs;
+  let results = [];
+  let fresh = false;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, stepMs));
+    results = (await readCableTests(session)).filter((r) => r.ifIndex === ifx);
+    fresh = results.length > 0 && stamp(results) !== before && !results.some((r) => r.status === 'inProgress');
+    if (fresh || Date.now() > until) break;
+  }
+  if (!fresh) throw new Error('The switch took the test but gave no new results within ' + Math.round(waitMs / 1000) + ' s.');
+  return { ifIndex: ifx, kind: kind || 'full', results };
+}
+
 /**
  * Everything the port popout's feature tabs and the Port mirroring panel
  * show. A part the switch does not answer is null or empty, never an error
@@ -274,7 +518,8 @@ async function readPorts(session) {
 }
 
 module.exports = {
-  readPorts, walkColumns, getRows, SCALARS, PRESENT_TYPE, TRAFFIC,
+  readPorts, setPoe, setPortSecurity, setStorm, setErrdisableInterval, setErrdisableCause, setGlobal,
+  setLldpPort, setCdpPort, setEeePort, addMirror, removeMirror, cableTest, walkColumns, getRows, SCALARS, PRESENT_TYPE, TRAFFIC,
   PETH, RL_PETH, SWIF, STORM, ERRDIS, LLDP_PORTS, CDP_IF, EEE_PORTS, SPAN_DEST, SPAN_SRC, PHY_GET,
   CAUSES, LOCK_MODE, LLDP_ADMIN, POE_PRIORITY
 };

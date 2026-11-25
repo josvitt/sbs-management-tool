@@ -90,3 +90,64 @@ test('readPorts returns empty parts when the switch has none of the tables', asy
   assert.deepEqual(r.mirror, { destinations: [], sources: [] });
   assert.equal(r.lldp.enabled, null);
 });
+
+test('setPoe, setPortSecurity and the discovery writes send the columns the switch made', async () => {
+  const s = fakeSession(sample());
+  await ports.setPoe(s, 1, 5, { admin: false, priority: 'critical', limitMw: 15400 });
+  await ports.setPortSecurity(s, 5, { mode: 'secure-permanent', maxMacs: 4, locked: true });
+  await ports.setLldpPort(s, 5, 'disabled');
+  await ports.setCdpPort(s, 5, false);
+  await ports.setEeePort(s, 5, false);
+  await ports.setGlobal(s, 'eee', false);
+  await ports.setErrdisableInterval(s, 600);
+  await ports.setErrdisableCause(s, 'stp-bpdu-guard', true);
+  assert.deepEqual(s.sets.map((vbs) => vbs.map((v) => v.oid.replace('1.3.6.1.4.1.9.6.1.101', 'V') + '=' + v.value)), [
+    ['1.3.6.1.2.1.105.1.1.1.3.1.5=2', '1.3.6.1.2.1.105.1.1.1.7.1.5=1', 'V.108.1.1.6.1.5=15400'],
+    ['V.43.1.1.37.5=3', 'V.43.1.1.38.5=4', 'V.43.1.1.8.5=1'],
+    ['1.0.8802.1.1.2.1.1.6.1.2.5=4'],
+    ['1.3.6.1.4.1.9.9.23.1.1.1.1.2.5=2'],
+    ['V.149.2.1.1.5=2'],
+    ['V.149.1.0=2'],
+    ['V.128.1.0=600'],
+    ['V.128.2.1.2.5=1']
+  ]);
+});
+
+test('the writes refuse values the switch would not take', async () => {
+  const s = fakeSession(sample());
+  await assert.rejects(ports.setPoe(s, 1, 5, {}), /Nothing to change/);
+  await assert.rejects(ports.setPoe(s, 1, 5, { priority: 'urgent' }), /critical, high or low/);
+  await assert.rejects(ports.setPortSecurity(s, 1000, { locked: true }), /front-panel/);
+  await assert.rejects(ports.setErrdisableInterval(s, 5), /30 to 86400/);
+  await assert.rejects(ports.setLldpPort(s, 5, 'on'), /txAndRx/);
+  assert.equal(s.sets.length, 0);
+});
+
+test('addMirror makes the destination as the switch does, then each source; removeMirror undoes it', async () => {
+  const v = sample();
+  const s = fakeSession(v);
+  await assert.rejects(ports.addMirror(s, 1, 12, [{ ifIndex: 3 }]), /in use/);
+  await assert.rejects(ports.addMirror(s, 2, 24, [{ ifIndex: 24 }]), /already a mirroring destination|itself/);
+  const r = await ports.addMirror(s, 2, 12, [{ ifIndex: 3, direction: 'rx' }, { ifIndex: 4 }]);
+  assert.deepEqual(r, { session: 2, dest: 12, sources: [{ ifIndex: 3, direction: 'rx' }, { ifIndex: 4, direction: 'both' }] });
+  const D = ports.SPAN_DEST, SR = ports.SPAN_SRC;
+  assert.deepEqual(s.sets.map((x) => x.map((y) => y.oid + '=' + y.value)), [
+    [D + '.6.2=4', D + '.2.2=12', D + '.3.2=1', D + '.4.2=1'],
+    [SR + '.5.2.1.3=4', SR + '.4.2.1.3=1'],
+    [SR + '.5.2.1.4=4', SR + '.4.2.1.4=3']
+  ]);
+  // The fake keeps what was set; make the rows look active, as the switch would.
+  v[D + '.6.2'] = [T.Integer, 1]; v[SR + '.5.2.1.3'] = [T.Integer, 1]; v[SR + '.5.2.1.4'] = [T.Integer, 1];
+  s.sets.length = 0;
+  await ports.removeMirror(s, 2);
+  assert.deepEqual(s.sets.map((x) => x.map((y) => y.oid + '=' + y.value)), [
+    [SR + '.5.2.1.3=6'], [SR + '.5.2.1.4=6'], [D + '.6.2=6']
+  ]);
+});
+
+test('addMirror removes what it made when the switch refuses a source', async () => {
+  const s = fakeSession(sample(), { refuse: (vbs) => (vbs[0].oid.indexOf(ports.SPAN_SRC + '.5.2.1.4') === 0 && vbs[0].value === 4 ? 'InconsistentValue' : null) });
+  await assert.rejects(ports.addMirror(s, 2, 12, [{ ifIndex: 3 }, { ifIndex: 4 }]), /removed again/);
+  const last = s.sets.slice(-2).map((x) => x.map((y) => y.oid + '=' + y.value));
+  assert.deepEqual(last, [[ports.SPAN_SRC + '.5.2.1.3=6'], [ports.SPAN_DEST + '.6.2=6']]);
+});

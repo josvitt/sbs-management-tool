@@ -70,6 +70,7 @@ require('./routes/aaa')(app);
 require('./routes/flash')(app);
 require('./routes/maint')(app);
 require('./routes/system')(app);
+require('./routes/port-features')(app);
 require('./routes/monitoring')(app);
 require('./routes/state')(app);
 require('./routes/streams')(app);
