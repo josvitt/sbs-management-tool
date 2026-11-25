@@ -335,7 +335,8 @@
       }
       host.appendChild(memWrap);
 
-      const cancel = el('button', 'btn btn-small', 'Cancel'); cancel.type = 'button';
+      // Cancel is a muted button: green means "do this" (MODULE-STANDARD A2).
+      const cancel = el('button', 'tbl-act-btn', 'Cancel'); cancel.type = 'button';
       cancel.addEventListener('click', () => { if (inPopout && popClose) popClose(); else closeChEditors(); });
       const { actions, apply: save, msg } = applyActions('Save', { extra: [cancel] });
       withConfirm(save, (ev) => {
