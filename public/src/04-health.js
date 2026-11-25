@@ -60,7 +60,9 @@
     { key: 'flash', title: 'Flash files', span: 12, h: 0, needs: () => true },
     // Reboot and firmware: the images, the next boot image, installing an
     // image and rebooting (26-maint.js). Always offered.
-    { key: 'maint', title: 'Reboot and firmware', span: 12, h: 0, needs: () => true }
+    { key: 'maint', title: 'Reboot and firmware', span: 12, h: 0, needs: () => true },
+    // System: clock, SNTP, local users and management access (27-system.js).
+    { key: 'system', title: 'System', span: 12, h: 0, needs: () => true }
   ];
 
   const builtinDef = (key) => BUILTIN.find((b) => b.key === key);
@@ -1166,7 +1168,9 @@
     capture: [],
     // Reboot and firmware has its own loader too; the saved-state scalar
     // drives its "unsaved changes" warning, so a scalar refresh reconciles it.
-    maint: ['scalars']
+    maint: ['scalars'],
+    // System has its own loader (27-system.js); no health table feeds it.
+    system: []
   };
   function panelDependsOn(key, changedTables) {
     const deps = PANEL_TABLE_DEPS[key];
@@ -1341,6 +1345,7 @@
       st.anyActive = !st.data.error && (st.data.captures || []).some((c) => c.stateText === 'active');
     });
     take('_maint', body.maint && !body.maint.error ? body.maint : (body.maint ? { error: body.maint.error } : undefined));
+    take('_system', body.system && !body.system.error ? body.system : (body.system ? { error: body.system.error } : undefined));
   }
 
   // Viewer sync: show the server's latest snapshot WITHOUT the browser walking
@@ -1461,7 +1466,7 @@
     if (p.key === 'auth') { loadSessions(s); }
     // SNMP configuration, Flash files and Packet capture re-run their own
     // loaders (server endpoints, not health tables) and reconcile in place.
-    const ownLoader = { snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad, maint: maintLoad }[p.key];
+    const ownLoader = { snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad, maint: maintLoad, system: systemLoad }[p.key];
     if (ownLoader) {
       if (btn) { btn.disabled = true; btn.classList.add('spin'); }
       ownLoader(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });

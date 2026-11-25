@@ -18,6 +18,7 @@ const snmpConfig = require('./snmp-config');
 const { listFlash } = require('./routes/flash');
 const { listCaptures } = require('./routes/opc');
 const { readMaint } = require('./switch-maint');
+const { readSystem } = require('./switch-system');
 
 const READERS = {
   snmpConfig: (session, target) => snmpConfig.readAll(snmpConfigBundle(session), {
@@ -25,7 +26,8 @@ const READERS = {
   }),
   flash: (session) => listFlash(session),
   captures: (session) => listCaptures(session),
-  maint: (session) => readMaint(session)
+  maint: (session) => readMaint(session),
+  system: (session) => readSystem(session)
 };
 
 const MODULE_KEYS = Object.keys(READERS);

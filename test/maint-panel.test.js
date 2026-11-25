@@ -81,7 +81,7 @@ test('the panel is registered: built in, keyed, painted, refreshed by its loader
   const health = read('04-health.js');
   assert.match(health, /\{ key: 'maint', title: 'Reboot and firmware'/);
   assert.match(health, /maint: \['scalars'\]/);
-  assert.match(health, /maint: maintLoad \}\[p\.key\]/);
+  assert.match(health, /maint: maintLoad[,\s}]/);
   assert.match(health, /take\('_maint', body\.maint/);
   assert.match(read('06-panels.js'), /KEYED_PANELS = new Set\(\[[^\]]*'maint'/);
   assert.match(read('11-panel-bodies.js'), /key === 'maint'\) \{ paintMaintPanel\(s, body, p\)/);

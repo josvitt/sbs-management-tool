@@ -98,6 +98,53 @@ Proven on a C1300 (25 Nov 2026, firmware 4.1.9.92, `scripts/switch-test-maint.js
   Twice the upload sat at uploadInProgress until the app gave up; a later
   read worked.
 
+## System settings (`switch-system.js`, `27-system.js`)
+
+Read from a C1300 (25 Nov 2026, firmware 4.1.9.92):
+
+- **Never read the local user table in bulk.** `rlAAALocalUserTable`
+  (101.79.17.1) keeps the password hash in column 2 and its salt in column
+  10, right after the name. A GETBULK on the name column runs on into them.
+  The app walks the privilege column (3) one GETNEXT at a time, which stops
+  on the row status column (4), and reads name, lock state and failed
+  logins with a GET per user. The index is the name, length first.
+- **SNTP servers are indexed by address type, length and address**
+  (`rlSntpConfigServerInetTable`, 101.92.2.2.17.1). Host names are type
+  dns(16), so the switch's defaults read as `16.12.pool.ntp.org` and so on.
+  Status (column 6) can say down(4) for every server while the clock says
+  synchronizedBySntp: `rlSntpTimeSinceLastSync` tells how stale it is.
+- **The time zone reads as `00:00`, without a sign,** in `rlTimeZone`.
+  The clock (`rndTimeSyncManagedDateTime`) reads as ddmmyyhhmmss.
+- **Written and read back over SNMP (25 Nov 2026, `scripts/switch-test-system.js`):**
+  the time zone (`rlTimeZone` "+01:30" reads back "01:30", with
+  `rlTimeZoneCode`), the clock (`rndTimeSyncManagedDateTime`, then
+  `rlClockStatus` reads manuallySet), SNTP on and off
+  (`rlSntpUnicastAdminState`), Telnet on and off, and a user's privilege
+  (column 3) and deletion (column 4 destroy).
+- **No form of adding an SNTP server was taken.** In
+  `rlSntpConfigServerInetTable` a new row is refused with InconsistentValue
+  as createAndGo with or without `polled`, and as createAndWait; so is a
+  createAndGo in the older IPv4 table (101.92.2.2.12). It is not a limit:
+  with one of the five servers removed, adding is still refused, and so is
+  adding the removed server back. Destroying a row works. Not yet tried:
+  createAndGo with `polled` and `rlSntpServerInetKeyIdentifier` (0) together.
+  The app keeps the server list read-only, since a removal could not be
+  undone.
+- **No form of creating a user or setting a password was taken.** Privilege
+  and createAndGo without a password: InconsistentValue. With the password
+  in the same PDU as plain text (with or without hash method SHA-512):
+  WrongValue on the password. With "$" and the clear text (the MIB's
+  form a): CommitFailed, and the row is created anyway, without a usable
+  password, so it must be removed. Changing a password on an existing row
+  the same ways: CommitFailed. Not yet tried: the "#" encrypted form and
+  `rlAAALocalUserPasswordVerificationAndSettingTable` (101.79.68).
+  The app does not add users or set passwords.
+- **Summer time start and end are 14-byte strings** whose layout the parsed
+  MIB description does not give in full, so the app shows summer time but
+  does not set it yet.
+- **The SSH server's switches are enable(1)/disable(2), not TruthValue;**
+  Telnet, HTTP and HTTPS are TruthValue.
+
 ## Spanning tree (`health.js`)
 
 - **`dot1dStpVersion` can't be trusted on its own.** Firmware reports `rstp`
