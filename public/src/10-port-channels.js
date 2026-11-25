@@ -294,12 +294,17 @@
       const host = pane || el('div', 'ch-editor aaa-form');
       if (!inPopout) host.appendChild(el('h5', '', 'Edit port channel ' + (nameByIdx.get(aggIdx) || aggIdx)));
       const grid = el('div', 'snmp-form-grid');
-      // Mode: off / static / LACP.
+      // Mode: static or LACP - the only two modes a port channel has here
+      // (CLI "channel-group N mode on|auto"). There is no "off": a channel with
+      // no members is simply empty, and the members' actor state is written as
+      // either LACP (a2) or static (00).
       const modeSel = el('select');
-      for (const m of [['off', 'off'], ['static', 'static'], ['lacp', 'LACP']]) { const o = el('option', '', m[1]); o.value = m[0]; modeSel.appendChild(o); }
+      for (const m of [['static', 'static'], ['lacp', 'LACP']]) { const o = el('option', '', m[1]); o.value = m[0]; modeSel.appendChild(o); }
       // Current mode from members' actor state (not the unreliable creation flags).
+      // An empty channel starts on static, which is what the old "off" choice
+      // wrote when members were added under it.
       const curStates = currentMembers.map((p) => String(portState.get(String(p)) || '').replace(/0x|\s|\(hex\)|"/gi, ''));
-      modeSel.value = !currentMembers.length ? 'off' : (curStates.some((st) => st && !/^0*$/.test(st)) ? 'lacp' : 'static');
+      modeSel.value = curStates.some((st) => st && !/^0*$/.test(st)) ? 'lacp' : 'static';
       { const f = el('div', 'snmp-field'); f.appendChild(el('label', '', 'Mode')); f.appendChild(modeSel); grid.appendChild(f); }
       host.appendChild(grid);
 
