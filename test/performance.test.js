@@ -93,7 +93,9 @@ test('requests to one switch are spaced to the budget, across sessions', async (
   const s2 = core.limitRequests(fake(), '192.0.2.50', 161);
   await Promise.all([0, 1, 2, 3, 4, 5].map((i) => new Promise((res) => (i % 2 ? s1 : s2).get(['1.3'], res))));
   const gap = 1000 / core.MAX_REQUESTS_PER_SEC;
-  for (let i = 1; i < sent.length; i++) assert.ok(sent[i] - sent[i - 1] >= gap - 2, 'spacing ' + (sent[i] - sent[i - 1]));
+  // Timers may run late under load, never meaningfully early, so the span of
+  // the six sends is at least five gaps (1 ms slack for timer rounding).
+  assert.ok(sent[sent.length - 1] - sent[0] >= 5 * gap - 1, 'span ' + (sent[sent.length - 1] - sent[0]));
 });
 
 test('a successful write tells the write listeners which switch changed', async () => {
@@ -239,4 +241,58 @@ test('the snapshot route answers "unchanged" when the page already has it', asyn
     const other = await call({ host: '192.0.2.62', have: 'older' });
     assert.equal(other.data.collectedAt, '2026-11-25T18:00:00.000Z');
   } finally { collector.stop(); }
+});
+
+// ---- server-side panels in the collection (v1.6.0) -----------------------
+
+test('SNMP configuration is read in one pass: each table walked once, same lists', async () => {
+  const sc = require('../snmp-config');
+  const T2 = snmp.ObjectType;
+  // A plausible VACM picture: one community in group 'g' with a write view.
+  const enc = (str) => [str.length, ...Buffer.from(str, 'latin1')].join('.');
+  const rows = {
+    '1.3.6.1.6.3.18.1.1.1': [['2.' + enc('c1'), Buffer.from('public')], ['3.' + enc('c1'), Buffer.from('SNR-public')]],
+    '1.3.6.1.6.3.16.1.2.1': [['3.2.' + enc('SNR-public'), Buffer.from('g')]],
+    '1.3.6.1.6.3.16.1.4.1': [['6.' + enc('g') + '.0.2.1', Buffer.from('DefaultSuper')]]
+  };
+  let walks = 0;
+  const S = {
+    get: async (oids) => oids.map((oid) => ({ oid, value: null, error: 'noSuchInstance' })),
+    walk: async (base) => { walks++; return (rows[base] || []).map(([idx, v]) => ({ oid: base + '.' + idx, value: v, type: T2.OctetString })); },
+    set: async () => null
+  };
+  const meta = { version: '2c', community: 'public' };
+  const all = await sc.readAll(S, meta);
+  assert.ok(walks <= 9, 'walks ' + walks);
+  const one = { ok: true, ...(await sc.listGroups(S)) };
+  assert.deepEqual(JSON.parse(JSON.stringify(all.groups)), JSON.parse(JSON.stringify(one)));
+  assert.ok(all.access.ok);
+});
+
+test('the collector reads the capture list every cycle and the settings-like panels on change', async () => {
+  const reads = [];
+  collector.start({
+    probe: async () => ({ reachable: true, uptime: 100 }),
+    collect: async () => ({ collectedAt: String(Date.now()), alerts: [], summary: {} }),
+    collectModules: async (target, keys) => { reads.push(keys.slice().sort().join(',')); const o = {}; for (const k of keys) o[k] = { ok: true, n: reads.length }; return o; },
+    modules: { everyCycle: ['captures'], onSettings: ['snmpConfig', 'flash'] },
+    loadSwitches: () => [],
+    settingsTables: ['inventory'],
+    events: { record: () => {} },
+    history: { append: () => {} }
+  }, { schedule: false });
+  const realNow = Date.now;
+  let skew = 0;
+  Date.now = () => realNow() + skew;
+  try {
+    const entry = { target: { host: '192.0.2.70', port: 161 } };
+    const poll = collector._internals.pollOnce;
+    const a = await poll(entry, {});
+    skew += 10 * 60 * 1000; const b = await poll(entry, {});
+    collector.flagSettingsChange('192.0.2.70');
+    skew += 10 * 60 * 1000; await poll(entry, {});
+    assert.deepEqual(reads, ['captures,flash,snmpConfig', 'captures', 'captures,flash,snmpConfig']);
+    assert.equal(b.data.snmpConfig.n, a.data.snmpConfig.n, 'carried, not re-read');
+    assert.notEqual(b.data.captures.n, a.data.captures.n, 'the capture list is fresh');
+  } finally { Date.now = realNow; collector.stop(); }
 });

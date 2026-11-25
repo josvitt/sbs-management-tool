@@ -172,6 +172,32 @@ async function maybeConfigDiff(host, target, st, rebooted) {
   st.configHash = hash;
 }
 
+// The server-side modules (deps.modules: { everyCycle, onSettings } key lists,
+// read by deps.collectModules): read with this collection when due, otherwise
+// carried from the previous one, so the snapshot always holds every panel.
+// onSettings modules follow the settings tables' rule (read when those are
+// re-read); everyCycle modules are read on every full collection.
+async function addModules(target, data, previous, settingsRead) {
+  const m = deps && deps.modules;
+  if (!m || !deps.collectModules) return;
+  const read = (m.everyCycle || []).concat(settingsRead ? (m.onSettings || []) : []);
+  const carry = settingsRead ? [] : (m.onSettings || []);
+  let got = {};
+  try { got = await deps.collectModules(target, read); }
+  catch (e) { deps.log && deps.log.warn('collector', 'Module read failed', { host: target.host, message: e.message }); }
+  for (const k of read) {
+    if (got[k] !== undefined) data[k] = got[k];
+    else if (previous && previous[k] !== undefined) data[k] = previous[k];
+  }
+  for (const k of carry) {
+    if (previous && previous[k] !== undefined) data[k] = previous[k];
+    else {
+      // Never read yet (an older snapshot): read it now.
+      try { const one = await deps.collectModules(target, [k]); if (one[k] !== undefined) data[k] = one[k]; } catch (e) { /* next cycle */ }
+    }
+  }
+}
+
 // The settings tables of a full collection, to carry into the next one.
 function settingsFrom(data) {
   const keys = (deps && deps.settingsTables) || [];
@@ -258,6 +284,7 @@ async function pollOnce(entry, opts) {
     try { data = await deps.collect(target, reuse ? { reuse } : {}); }
     catch (e) { deps.log && deps.log.warn('collector', 'Collection failed after reachable probe', { host, message: e.message }); }
     if (data) {
+      await addModules(target, data, st.lastData, settingsDue);
       st.lastData = data;
       st.lastFullAt = now;
       if (!reuse) { st.settingsReadGen = gen; st.lastSettingsAt = now; }

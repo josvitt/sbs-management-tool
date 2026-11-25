@@ -296,7 +296,13 @@ paint fn dispatched before the switch. **routing (the IPv4 Addressing panel), vl
 acl.** This is the preferred
 pattern for any NEW interactive module, and §B2–§B6 describe it in full.
 
-**(b2) Keyed panels with their own loader** — **snmpcfg, flash, capture.** Rendered exactly like
+**(b2) Keyed panels with a server-side reader** — **snmpcfg, flash, capture.** Since
+v1.6.0 their data rides the server collection like every other panel's
+(SERVER-STANDARD §3c: `module-collection.js`, carried on the snapshot as
+`snmpConfig` / `flash` / `captures`, handed to the panel by
+`adoptCollectedModules`), so they open from the snapshot with no load on open. What
+follows describes their loader, which remains for a panel Refresh and a write's
+targeted re-read. Rendered exactly like
 family (b): a `paintXPanel(s, body, p)` that follows §B2, `mountInto` tables with
 stable keys, counts and notes in stable nodes, registered in `KEYED_PANELS`, and
 reconciled in place after a load or a write. The only difference is where the rows
@@ -320,15 +326,12 @@ loader only if it meets AT LEAST ONE of these, and the choice is documented:
    community table + VACM security-to-group + access + view tree; plus an
    access-level probe and a target-integrity check — imperative diagnostics, not
    reads). A client-side join of flat walks does NOT qualify — see the ACL note.
-2. **Periodic cost too high for the health timer.** Loading the module's data costs
-   enough SNMP PDUs that putting it on the periodic walk would breach the pps budget
-   (see §B5a). snmpcfg's load is ~35 walks over large VACM/per-port tables ≈ a ~100
-   pps *burst* — on its own at the whole budget, and it would recur every cycle
-   whether or not the panel is open. So snmpcfg MUST stay lazy; "load like the other
-   modules on the periodic walk" is not an option for it, by the pps rule, not by
-   preference.
+2. ~~Periodic cost too high for the health timer.~~ **Retired in v1.6.0.** The
+   per-switch gate (§B5a) caps every burst at the budget, and measured loads are
+   small (snmpcfg ≈ 20 requests in one pass), so cost decides a module's cadence
+   (every cycle, or the `settings` rule), never that it loads on open.
 
-Such a module still loads like an on-demand keyed panel (§B4): once per visit, with
+Its loader (used for a panel Refresh, or against an older snapshot without the module's data) still behaves like an on-demand load (§B4): once per visit, with
 an in-flight guard and a 30-second timestamp, "Waiting for data…" until the first
 reply (the first data arriving is structural), and the server reads run one after
 another, not in parallel. **A write re-reads only the sections it changed** and then
@@ -522,23 +525,24 @@ on the periodic timer is a cost decision, not just a correctness one.
   anything is cheap. The constraint is the **burst**: a load fires all its PDUs in a
   ~1–2s window, and that spike is what approaches the budget. Estimate a load as
   `walks × PDUs-per-walk × 2 (req+resp)` landing in ~2s. A flat table of a few rows is
-  ~1 PDU; a getbulk over a 400-port table is several. ACL ≈ 6 PDUs ≈ a 12-packet
-  burst (noise); snmpcfg ≈ 35 walks over large tables ≈ a ~100 pps burst (the whole
-  budget, by itself).
-- **This decides family placement (§B1).** If a module's data is cheap to walk, it
-  belongs on the periodic cycle (family a/b). If its load is a large burst, it stays
-  lazy with its own loader (family b2, test 2) — loaded once per visit, re-read on
-  its Refresh and after its own writes, and never added to the always-on walk. Do not "make it load like the other
-  modules" if that puts a heavy burst on every refresh for data the user may not be
-  viewing.
+  ~1 PDU; a getbulk over a 400-port table is several. Measured (v1.6.0): ACL ≈ 6,
+  route table ≈ 3, capture list ≈ 2–5, MAC table ≈ 10–55 (300–2,000 entries),
+  Flash files ≈ 5, SNMP configuration ≈ 20 in one pass (it was 19 walks / ~35 when
+  each list read its own tables) — against ~140 for a whole full collection. The
+  old "snmpcfg ≈ a ~100 pps burst" estimate predates the gate and is withdrawn.
+- **Every panel rides the collection; cadence is the cost lever (§B1).** Since the
+  gate caps every burst, a panel's cost decides only HOW OFTEN its data is read, not
+  whether it is on the snapshot: cheap or fast-changing data every full collection;
+  configuration-like data under the `settings` rule (re-read after a change, a
+  reboot, a Refresh, or hourly). A panel never loads on open.
 - **Per-port tables are `perPort`, settings are `settings`** (SERVER-STANDARD
   §1a). A table with one row per port is marked `perPort` so it is fetched for
   the interfaces that exist, not walked across the whole ifIndex space; a table
   of configuration is marked `settings` so the collector carries it between
   reads. Named columns are always walked together.
-- **Large tables are `onDemand`.** A big table (the full route table, a per-port walk
-  a panel rarely needs) is marked `onDemand` in `health.js` and loaded once per visit
-  (§B4), not on every periodic walk — the same budget discipline inside a keyed panel.
+- **`onDemand` is a last resort.** No table uses it since v1.6.0. A table only
+  belongs there if even the `settings` cadence would be too costly, and that is a
+  measured, documented decision.
 - **Writes re-read the minimum.** A write settles by refreshing only the affected
   table(s)/section (§B5, §B6), never the whole panel or a full re-walk — both for
   snappy UX and to keep write-time PDU bursts small.
@@ -625,7 +629,8 @@ on the periodic timer is a cost decision, not just a correctness one.
 
 ## B7. Registration checklist for a new module
 
-1. `health.js`: add table walk(s); mark large ones `onDemand`; include any companion
+1. `health.js`: add table walk(s); mark per-port ones `perPort` and configuration
+   `settings` (SERVER-STANDARD §1a); include any companion
    table needed to classify rows (e.g. an Owner table that says static vs dynamic).
 2. `BUILTIN` panel list (`public/src/04-health.js`): `{ key, title, span, h, needs }`.
 3. `paintBuiltin`: `if (key === 'x') { paintXPanel(s, body, p); return; }`.

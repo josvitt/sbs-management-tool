@@ -190,11 +190,23 @@ Each switch still sees only its own full walk once per interval, and every
 request to it — walks, GETs, SETs, the probe, from any session — passes one
 per-switch spacing gate in `buildSnmpSession` (`SNMP_MAX_RPS`, default 100
 requests a second), so no mix of loads can exceed the ~100 pps budget. The pacing gap paces the **server's fan-out** across switches, not
-any one switch's load. `onDemand` modules (snmpcfg / flash / capture) are
-**never** collected by the loop — they stay lazy and browser-only, by the same
-rule. The collector reproduces exactly the scope of the old periodic walk
-(families a/b), which is also exactly the scope `buildAlerts` reads, so
-unattended alerting needs nothing the loop doesn't already gather.
+any one switch's load. Since v1.6.0 the loop collects **every** panel's data
+(§3c); nothing is left for a panel to load when it opens.
+
+### 3c. Server-side panels in the collection (`module-collection.js`)
+
+SNMP configuration, Flash files and Packet capture are server-side views, not
+health tables. `collectModulesFor(target, keys)` reads them over one session,
+one after another, with the same functions their routes use
+(`snmpConfig.readAll`, `listFlash`, `listCaptures`), and the collector attaches
+them to the full collection as `snmpConfig`, `flash` and `captures`
+(`deps.modules`): `captures` on every full collection, `snmpConfig` and `flash`
+under the settings rule (§3), otherwise carried from the previous collection.
+`snmpConfig.readAll` walks each of its nine tables once and builds all six lists
+from them. The browser hands them to the panels (`adoptCollectedModules`); a live
+read a panel made after that collection (a write's re-read, the 15 s capture
+counter while a capture runs) is kept. A full collection is marked
+`complete: true`, which tells the panels nothing is left to load on open.
 
 ## 4. The event log — `events.js`
 

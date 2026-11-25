@@ -69,10 +69,7 @@
     hardware: ['psus', 'fans', 'sensors', 'stack', 'inventory'],
     interfaces: ['interfaces', 'poe', 'poePorts', 'vlans', 'vlansCurrent', 'portModes', 'portL2L3', 'dot1xPortCfg', 'dot1xHostMode', 'dot1xPortMethod',
       'lagCreation', 'lagAgg', 'lagMembers', 'lagPortKey'],
-    // macTable is NOT listed here: it is large and fetched on demand (once per
-    // visit, time-guarded) by the connected panel's own render, so a panel
-    // refresh must not walk it again.
-    connected: ['cdp', 'lldp', 'bridgePorts'],
+    connected: ['cdp', 'lldp', 'bridgePorts', 'macTable'],
     auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked',
       'radiusServers', 'radiusStats', 'tacacsServers',
       'dot1xHostStats', 'dot1xHostDiag', 'dot1xHostSession', 'vlans'],
@@ -1291,12 +1288,14 @@
     // needs it would re-fetch on every update ("ACL/MAC reloads on every open").
     // An empty list that was actually read is carried too (a switch with no
     // ACLs), so the panel does not fall back to "Waiting for data".
-    if (s.health) {
+    // A complete collection (v1.6.0+) holds these tables itself, empty or not.
+    if (s.health && !body.complete) {
       for (const k of ['macTable', 'aclNames', 'aclAces', 'aclTuples']) {
         if ((!body[k] || !body[k].length) && Array.isArray(s.health[k]) && (s.health[k].length || !Array.isArray(body[k]))) body[k] = s.health[k];
       }
     }
     s.health = body;
+    adoptCollectedModules(s, body);
     // The server-detected product line (C1200 / C1300 / C1300X) drives the MIB
     // Explorer default and feature gating. Keep a prior value if a refresh
     // comes back without one.
@@ -1309,6 +1308,32 @@
     renderSwitch(s);
     reconcileViews(s, null);   // a full collection refreshed everything
     loadSessions(s);
+  }
+
+  // The server-side panels (SNMP configuration, Flash files, Packet capture)
+  // arrive with a full collection (SERVER-STANDARD §3c). Hand each to its
+  // panel's state so it renders from the snapshot like every other panel and
+  // does not load on open (`collected`). A live read the panel made after this
+  // collection (a write's re-read) is newer and is kept.
+  function adoptCollectedModules(s, body) {
+    const at = Date.parse(body.collectedAt) || Date.now();
+    const take = (key, data, after) => {
+      if (data === undefined || data === null) return;
+      const st = s[key] = s[key] || {};
+      if (st.loading || (st.liveAt || 0) > at) return;
+      st.data = data;
+      st.collected = true;
+      st.fetchedAt = Date.now();
+      if (after) after(st);
+    };
+    take('_snmp', body.snmpConfig, (st) => {
+      const a = st.data.access || {};
+      st.editable = !!(a.ok && a.level === 'full');
+    });
+    take('_flash', body.flash && !body.flash.error ? body.flash : (body.flash ? { error: body.flash.error } : undefined));
+    take('_capture', body.captures && !body.captures.error ? body.captures : (body.captures ? { error: body.captures.error } : undefined), (st) => {
+      st.anyActive = !st.data.error && (st.data.captures || []).some((c) => c.stateText === 'active');
+    });
   }
 
   // Viewer sync: show the server's latest snapshot WITHOUT the browser walking

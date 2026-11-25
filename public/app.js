@@ -1373,10 +1373,7 @@
     hardware: ['psus', 'fans', 'sensors', 'stack', 'inventory'],
     interfaces: ['interfaces', 'poe', 'poePorts', 'vlans', 'vlansCurrent', 'portModes', 'portL2L3', 'dot1xPortCfg', 'dot1xHostMode', 'dot1xPortMethod',
       'lagCreation', 'lagAgg', 'lagMembers', 'lagPortKey'],
-    // macTable is NOT listed here: it is large and fetched on demand (once per
-    // visit, time-guarded) by the connected panel's own render, so a panel
-    // refresh must not walk it again.
-    connected: ['cdp', 'lldp', 'bridgePorts'],
+    connected: ['cdp', 'lldp', 'bridgePorts', 'macTable'],
     auth: ['mgmtSessions', 'sshSessions', 'telnetSessions', 'dot1xHosts', 'dot1xLocked',
       'radiusServers', 'radiusStats', 'tacacsServers',
       'dot1xHostStats', 'dot1xHostDiag', 'dot1xHostSession', 'vlans'],
@@ -2595,12 +2592,14 @@
     // needs it would re-fetch on every update ("ACL/MAC reloads on every open").
     // An empty list that was actually read is carried too (a switch with no
     // ACLs), so the panel does not fall back to "Waiting for data".
-    if (s.health) {
+    // A complete collection (v1.6.0+) holds these tables itself, empty or not.
+    if (s.health && !body.complete) {
       for (const k of ['macTable', 'aclNames', 'aclAces', 'aclTuples']) {
         if ((!body[k] || !body[k].length) && Array.isArray(s.health[k]) && (s.health[k].length || !Array.isArray(body[k]))) body[k] = s.health[k];
       }
     }
     s.health = body;
+    adoptCollectedModules(s, body);
     // The server-detected product line (C1200 / C1300 / C1300X) drives the MIB
     // Explorer default and feature gating. Keep a prior value if a refresh
     // comes back without one.
@@ -2613,6 +2612,32 @@
     renderSwitch(s);
     reconcileViews(s, null);   // a full collection refreshed everything
     loadSessions(s);
+  }
+
+  // The server-side panels (SNMP configuration, Flash files, Packet capture)
+  // arrive with a full collection (SERVER-STANDARD §3c). Hand each to its
+  // panel's state so it renders from the snapshot like every other panel and
+  // does not load on open (`collected`). A live read the panel made after this
+  // collection (a write's re-read) is newer and is kept.
+  function adoptCollectedModules(s, body) {
+    const at = Date.parse(body.collectedAt) || Date.now();
+    const take = (key, data, after) => {
+      if (data === undefined || data === null) return;
+      const st = s[key] = s[key] || {};
+      if (st.loading || (st.liveAt || 0) > at) return;
+      st.data = data;
+      st.collected = true;
+      st.fetchedAt = Date.now();
+      if (after) after(st);
+    };
+    take('_snmp', body.snmpConfig, (st) => {
+      const a = st.data.access || {};
+      st.editable = !!(a.ok && a.level === 'full');
+    });
+    take('_flash', body.flash && !body.flash.error ? body.flash : (body.flash ? { error: body.flash.error } : undefined));
+    take('_capture', body.captures && !body.captures.error ? body.captures : (body.captures ? { error: body.captures.error } : undefined), (st) => {
+      st.anyActive = !st.data.error && (st.data.captures || []).some((c) => c.stateText === 'active');
+    });
   }
 
   // Viewer sync: show the server's latest snapshot WITHOUT the browser walking
@@ -7179,7 +7204,9 @@
         // returns an empty (or merely small) MAC result would leave
         // s.health.macTable falsy and the panel would re-fetch on every repaint,
         // thrashing the switch. The timestamp makes this fire once per visit.
-        if (!s._macFetching && (Date.now() - (s._macFetchedAt || 0) > 30000)) {
+        // Since v1.6.0 a full collection carries the MAC table (h.complete), so
+        // this fetch only runs against an older snapshot that lacks it.
+        if (!(s.health && s.health.complete) && !s._macFetching && (Date.now() - (s._macFetchedAt || 0) > 30000)) {
           s._macFetching = true;
           fetch('/api/health', { method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ target: s.target, only: ['macTable'] }) })
@@ -8909,6 +8936,7 @@
   }
   function ensureAclLoaded(s) {
     if (s._aclFetching || !s.target) return;
+    if (s.health && s.health.complete) return;      // the full collection carries the ACL tables
     if (Date.now() - (s._aclFetchedAt || 0) < 30000) return;
     s._aclFetching = true;
     aclRefresh(s).then(() => { s._aclFetching = false; }, () => { s._aclFetching = false; });
@@ -10350,6 +10378,7 @@
   // flag and a 30s timestamp so an empty result does not re-fetch every repaint.
   function ensureRoutingLoaded(s) {
     if (s._routingFetching || !s.target) return;
+    if (s.health && s.health.complete) return;      // the full collection carries the route table
     if (Date.now() - (s._routingFetchedAt || 0) < 30000) return;
     s._routingFetching = true;
     routingRefresh(s).then(() => { s._routingFetching = false; },
@@ -10576,6 +10605,7 @@
   // 30 s. `st` is the panel's state object, `load` its loader.
   function sideEnsure(s, st, load) {
     if (!s.target || !st) return;
+    if (st.data && st.collected) return;            // the snapshot carries it (adoptCollectedModules)
     if (st.loading || Date.now() - (st.fetchedAt || 0) < 30000) return;
     load(s);
   }
@@ -10600,6 +10630,7 @@
     if (highlight) st.highlight = bareFlashName(highlight);
     if (st.loading) return st.loading;
     st.fetchedAt = Date.now();
+    st.liveAt = Date.now();
     st.loading = sidePost('/api/flash/list', { target: s.target })
       .then((b) => { st.data = (b && !b.error) ? b : { error: (b && b.error) || 'no answer' }; })
       .finally(() => { st.loading = null; sideRepaint(s, 'flash'); });
@@ -10692,6 +10723,7 @@
     const st = s._capture;
     if (st.loading) return st.loading;
     st.fetchedAt = Date.now();
+    st.liveAt = Date.now();
     st.loading = sidePost('/api/opc/list', { target: s.target })
       .then((b) => {
         st.data = (b && !b.error) ? b : { error: (b && b.error) || 'no answer' };
@@ -10913,6 +10945,7 @@
     const st = s._snmp;
     if (st.loading) return st.loading;
     st.fetchedAt = Date.now();
+    st.liveAt = Date.now();
     st.loading = (async () => {
       const d = {};
       try { d.access = await snmpCfgPost(s, 'access'); }
@@ -10930,6 +10963,7 @@
   function ensureSnmpLoaded(s) {
     if (!s.target) return;
     const st = s._snmp || {};
+    if (st.data && st.collected) return;            // the snapshot carries it (adoptCollectedModules)
     if (st.loading || Date.now() - (st.fetchedAt || 0) < 30000) return;
     snmpLoad(s);
   }
@@ -10939,6 +10973,7 @@
   async function snmpRefresh(s, names) {
     const st = s._snmp;
     if (!st || !st.data || st.data.error) return snmpLoad(s);
+    st.liveAt = Date.now();      // newer than any snapshot taken before this write
     const want = names.slice();
     if (want.some((n) => n === 'recipients' || n === 'communities')) want.push('target-check');
     for (const [action, k] of SNMP_LISTS) {

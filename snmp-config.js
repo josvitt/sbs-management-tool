@@ -1164,3 +1164,48 @@ async function planDeleteUser(snmp, key) {
   return { title: `user '${name.toString('latin1')}'`, steps, warnings: [] };
 }
 module.exports.planDeleteUser = planDeleteUser;
+
+// Flag the community or SNMPv3 user this app is connected with, so the panel
+// can leave out its Delete: the switch refuses to delete the credential in use.
+function markInUse(result, listKey, field, current) {
+  if (current && result && Array.isArray(result[listKey])) {
+    for (const row of result[listKey]) if (row && row[field] === current) row.inUse = true;
+  }
+  return result;
+}
+module.exports.markInUse = markInUse;
+
+/**
+ * Everything the SNMP configuration panel shows, in one pass: the access check
+ * and the six lists, in the shape the panel keeps (`{ access, recips, comms,
+ * groups, users, tcheck, views }`, each `{ ok, ... }` as its route answers).
+ * The lists share tables (the community table is read by four of them, the
+ * VACM tables by three), so each table is walked ONCE and the walk reused:
+ * 9 walks instead of 19. Read by the server collector on a settings change
+ * (SERVER-STANDARD §3); the per-list routes stay for a write's targeted re-read.
+ * `meta` is { version, community, user } of the credential in use.
+ */
+async function readAll(snmp, meta) {
+  const walks = new Map();
+  const S = Object.assign({}, snmp, {
+    walk: (base) => {
+      if (!walks.has(base)) walks.set(base, Promise.resolve(snmp.walk(base)));
+      return walks.get(base).then((rows) => (Array.isArray(rows) ? rows.slice() : rows));
+    }
+  });
+  const run = async (fn) => {
+    try { return { ok: true, ...(await fn()) }; } catch (e) { return { ok: false, error: e.message }; }
+  };
+  const v3 = meta && meta.version === '3';
+  const d = { access: await run(() => accessCheck(S, meta)) };
+  // A credential that cannot read the config tables gets only the banner.
+  if (d.access.ok && d.access.level === 'limited') return d;
+  d.recips = await run(() => listRecipients(S, {}));
+  d.comms = await run(async () => markInUse(await listCommunities(S), 'communities', 'community', !v3 && meta && meta.community));
+  d.groups = await run(() => listGroups(S));
+  d.users = await run(async () => markInUse(await listUsers(S), 'users', 'name', v3 && meta && meta.user));
+  d.tcheck = await run(() => checkTargetRows(S));
+  d.views = await run(() => listViewNames(S));
+  return d;
+}
+module.exports.readAll = readAll;

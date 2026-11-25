@@ -46,6 +46,7 @@ const collector = require('./collector');
 const guard = require('./request-guard');
 const { buildSnmpSession, onSwitchWrite } = require('./snmp-core');
 const { SETTINGS_TABLES } = require('./health');
+const { collectModulesFor } = require('./module-collection');
 const { probeSwitch, collectHealthFor } = require('./collection');
 
 // Catch anything that would otherwise silently kill the process.
@@ -117,6 +118,11 @@ function startCollector() {
     },
     // Tables the collector carries between full reads (health.js `settings`).
     settingsTables: SETTINGS_TABLES,
+    // The server-side panels (module-collection.js): the capture list is read
+    // with every full collection; SNMP configuration and Flash files follow the
+    // settings rule (after a change, a reboot, a Refresh, or hourly).
+    modules: { everyCycle: ['captures'], onSettings: ['snmpConfig', 'flash'] },
+    collectModules: (target, keys) => collectModulesFor(target, keys),
     history, events, log, configHistory
   });
   // Any successful SNMP write from the app marks that switch's settings for a

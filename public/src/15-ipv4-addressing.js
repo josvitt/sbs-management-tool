@@ -664,6 +664,7 @@
   // flag and a 30s timestamp so an empty result does not re-fetch every repaint.
   function ensureRoutingLoaded(s) {
     if (s._routingFetching || !s.target) return;
+    if (s.health && s.health.complete) return;      // the full collection carries the route table
     if (Date.now() - (s._routingFetchedAt || 0) < 30000) return;
     s._routingFetching = true;
     routingRefresh(s).then(() => { s._routingFetching = false; },
