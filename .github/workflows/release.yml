@@ -1,0 +1,51 @@
+# Publishes a GitHub release for every merge to main.
+#
+# The version is package.json's "version" when no release has that tag yet.
+# A merge that did not bump it (a Dependabot update, say) still gets a
+# release: the next patch number after the newest release tag.
+# The notes are release-notes/v<version>.md when the merge added one;
+# otherwise GitHub writes them from the merged pull requests' titles.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version=$(jq -r .version package.json)
+          tag="v$version"
+          if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+            latest=$(gh release list --repo "$REPO" --limit 100 --json tagName --jq '.[].tagName' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            tag="v$major.$minor.$((patch + 1))"
+            echo "::notice::package.json still says $version; releasing as $tag"
+          fi
+          notes="release-notes/$tag.md"
+          if [ -f "$notes" ]; then
+            gh release create "$tag" --repo "$REPO" --target "$SHA" --title "$tag" --notes-file "$notes"
+          else
+            gh release create "$tag" --repo "$REPO" --target "$SHA" --title "$tag" --generate-notes
+          fi
+          echo "Published $tag"

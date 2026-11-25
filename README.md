@@ -28,6 +28,13 @@ shows fails a test. GitHub runs them too, on Node 22 and 24, with an
 (`.github/workflows/ci.yml`); Dependabot proposes dependency and Action
 updates weekly.
 
+Every merge to `main` is published as a GitHub release
+(`.github/workflows/release.yml`). In a pull request, bump `version` in
+`package.json` and add the change notes as `release-notes/v<version>.md`:
+what changed, anything that behaves differently, and how to upgrade. A
+merge without them still gets a release, numbered as the next patch, with
+notes GitHub writes from the pull request titles.
+
 ### Run it unattended (as a service)
 
 `start.bat` is the interactive way to run it. To have it collect from your
