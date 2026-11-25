@@ -77,3 +77,23 @@ test('the writes refuse values the switch would not take', async () => {
   await assert.rejects(stp.setPortIn(s, {}, 5, { cost: 1 }), /Name a vlan/);
   assert.equal(s.sets.length, 0);
 });
+
+test('a VLAN priority makes the PVST row when the switch has none, and reset removes it', async () => {
+  const V = '1.3.6.1.4.1.9.6.1.101';
+  const s = fakeSession(sample(), { refuse: (vbs) => (vbs.length === 1 && vbs[0].oid === stp.PVST_VLAN + '.5.20' ? 'NoCreation' : null) });
+  const r = await stp.setBridgePriority(s, 8192, { vlan: 20 });
+  assert.equal(r.via, 'createAndGo with the columns');
+  await stp.resetVlan(s, 20);
+  await stp.resetPortInVlan(s, 20, 5);
+  assert.deepEqual(s.sets.map((vbs) => vbs.map((v) => v.oid.replace(V, 'V') + '=' + v.value)), [
+    ['V.57.9.1.1.5.20=8192'],
+    ['V.57.9.1.1.6.20=4', 'V.57.9.1.1.5.20=8192'],
+    ['V.57.9.1.1.6.20=6'],
+    ['V.57.9.3.1.5.20.5=6']
+  ]);
+});
+
+test('every refused form is named in the error', async () => {
+  const s = fakeSession(sample(), { refuse: () => 'InconsistentValue' });
+  await assert.rejects(stp.setPortIn(s, { vlan: 20 }, 5, { cost: 10 }), /every form \(the columns.*createAndGo.*createAndWait/);
+});

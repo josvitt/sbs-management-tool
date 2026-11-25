@@ -30,7 +30,7 @@
  */
 
 const snmp = require('net-snmp');
-const { walkColumns } = require('./switch-ports');
+const { walkColumns, getRows } = require('./switch-ports');
 
 const V = '1.3.6.1.4.1.9.6.1.101';
 const DOT1D = '1.3.6.1.2.1.17.2';
@@ -93,9 +93,13 @@ async function readStp(session) {
   const s = await getScalars(session);
   const ifOf = byKey(await walkColumns(session, BASE_PORT, [2]));
   const std = await walkColumns(session, STP_PORT, [2, 4, 5]);
-  const ext = byKey(await walkColumns(session, STP_EXT, [2, 3, 4, 6]));
-  const rl = byKey(await walkColumns(session, RL_PORT, [4, 7, 9, 10, 12, 13]));
-  const guard = byKey(await walkColumns(session, BPDU_GUARD, [1]));
+  // The extended, vendor and BPDU guard tables carry a row for every
+  // possible port (424 on a 24-port C1300); only the bridge's own ports are
+  // read, with a GET each.
+  const keys = std.map((r) => r.key);
+  const ext = byKey(await getRows(session, STP_EXT, [2, 3, 4, 6], keys));
+  const rl = byKey(await getRows(session, RL_PORT, [4, 7, 9, 10, 12, 13], keys));
+  const guard = byKey(await getRows(session, BPDU_GUARD, [1], keys));
   const ports = std.map((r) => {
     const x = ext.get(r.key) || {}, y = rl.get(r.key) || {}, g = guard.get(r.key) || {};
     const ifx = (ifOf.get(r.key) || {})[2];
@@ -164,6 +168,7 @@ function setVarbinds(session, varbinds) {
 
 const I = (oid, value) => ({ oid, type: snmp.ObjectType.Integer, value });
 const TV = (on) => (on ? 1 : 2);
+const ROW = { active: 1, createAndGo: 4, createAndWait: 5, destroy: 6 };
 
 function checkPort(port) {
   const n = Number(port);
@@ -211,18 +216,65 @@ async function setMode(session, mode) {
 async function setBridgePriority(session, priority, where) {
   const n = checkBridgePriority(priority);
   const w = where || {};
-  let oid;
   if (w.vlan != null) {
-    const vlan = Number(w.vlan);
-    if (!Number.isInteger(vlan) || vlan < 1 || vlan > 4094) throw new Error('vlan is 1 to 4094.');
-    oid = PVST_VLAN + '.5.' + vlan;
-  } else if (w.instance != null) {
+    const vlan = checkVlan(w.vlan);
+    const via = await setRowForms(session, PVST_VLAN, 6, String(vlan), [I(PVST_VLAN + '.5.' + vlan, n)]);
+    return { priority: n, vlan, via };
+  }
+  let oid;
+  if (w.instance != null) {
     const inst = Number(w.instance);
     if (!Number.isInteger(inst) || inst < 0 || inst > 4094) throw new Error('instance is 0 to 4094.');
     oid = MSTP_INST + '.12.' + inst;
   } else oid = SCALARS.priority;
   await setVarbinds(session, [I(oid, n)]);
   return Object.assign({ priority: n }, w);
+}
+
+function checkVlan(v) {
+  const vlan = Number(v);
+  if (!Number.isInteger(vlan) || vlan < 1 || vlan > 4094) throw new Error('vlan is 1 to 4094.');
+  return vlan;
+}
+
+/**
+ * Columns of a PVST row (rlBrgPvstVlanTable, rlBrgPvstPortTable). A C1300
+ * keeps a row only for a VLAN or port given its own settings, so the row
+ * may need making. The forms are tried in turn and every one tried is kept
+ * in the error (MODULE-STANDARD rule 6). Resolves the form that worked.
+ */
+async function setRowForms(session, table, statusCol, idx, cols) {
+  const st = (v) => I(table + '.' + statusCol + '.' + idx, v);
+  const forms = [
+    ['the columns, on the row as it is', [cols]],
+    ['createAndGo with the columns', [[st(ROW.createAndGo)].concat(cols)]],
+    ['createAndWait, the columns, then active', [[st(ROW.createAndWait)], cols, [st(ROW.active)]]]
+  ];
+  const tried = [];
+  for (const [name, steps] of forms) {
+    try {
+      for (const vbs of steps) await setVarbinds(session, vbs);
+      return name;
+    } catch (e) {
+      tried.push(name + ': ' + e.message);
+      if (name.indexOf('createAndWait') === 0) { try { await setVarbinds(session, [st(ROW.destroy)]); } catch (x) { /* nothing made */ } }
+    }
+  }
+  throw new Error('The switch refused every form (' + tried.join('; ') + ').');
+}
+
+/** Remove a VLAN's own spanning tree settings (its PVST row), back to the defaults. */
+async function resetVlan(session, vlan) {
+  const v = checkVlan(vlan);
+  await setVarbinds(session, [I(PVST_VLAN + '.6.' + v, ROW.destroy)]);
+  return { vlan: v, reset: true };
+}
+
+/** Remove a port's own settings in one VLAN (its PVST port row). */
+async function resetPortInVlan(session, vlan, port) {
+  const v = checkVlan(vlan), n = checkPort(port);
+  await setVarbinds(session, [I(PVST_PORT + '.5.' + v + '.' + n, ROW.destroy)]);
+  return { vlan: v, port: n, reset: true };
 }
 
 /**
@@ -254,9 +306,12 @@ async function setPortIn(session, where, port, p) {
   const w = where || {};
   const vbs = [];
   if (w.vlan != null) {
-    const idx = Number(w.vlan) + '.' + n;
+    const idx = checkVlan(w.vlan) + '.' + n;
     if (p.cost != null) vbs.push(I(PVST_PORT + '.3.' + idx, checkCost(p.cost)));
     if (p.priority != null) vbs.push(I(PVST_PORT + '.4.' + idx, checkPortPriority(p.priority)));
+    if (!vbs.length) throw new Error('Nothing to change.');
+    const via = await setRowForms(session, PVST_PORT, 5, idx, vbs);
+    return Object.assign({ port: n, set: p, via }, w);
   } else if (w.instance != null) {
     const idx = Number(w.instance) + '.' + n;
     if (p.priority != null) vbs.push(I(MSTP_PORT + '.3.' + idx, checkPortPriority(p.priority)));
@@ -268,6 +323,6 @@ async function setPortIn(session, where, port, p) {
 }
 
 module.exports = {
-  readStp, setEnabled, setMode, setBridgePriority, setPort, setPortIn, SCALARS, MODE, DOT1D, STP_PORT, STP_EXT, BASE_PORT, RL_STP, RL_PORT, BPDU_GUARD,
+  readStp, setEnabled, setMode, setBridgePriority, setPort, setPortIn, resetVlan, resetPortInVlan, SCALARS, MODE, DOT1D, STP_PORT, STP_EXT, BASE_PORT, RL_STP, RL_PORT, BPDU_GUARD,
   PVST_VLAN, PVST_PORT, MSTP_INST, MSTP_PORT
 };

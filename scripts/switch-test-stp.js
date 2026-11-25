@@ -141,10 +141,16 @@ async function main() {
     const W = {}; W[where.key] = where.id;
     let r = await post('/api/stp/priority', Object.assign({ priority: 61440 }, W));
     let x = list(await status()).find((y) => y.id === where.id);
-    check(where.key + ' ' + where.id + ' bridge priority 61440', r.httpOk && x && x.priority === 61440, r.error || JSON.stringify(x && { priority: x.priority }));
-    r = await post('/api/stp/priority', Object.assign({ priority: before.priority == null ? 32768 : before.priority }, W));
-    x = list(await status()).find((y) => y.id === where.id);
-    check(where.key + ' ' + where.id + ' bridge priority back to ' + before.priority, r.httpOk && x && x.priority === before.priority, r.error || JSON.stringify(x && { priority: x.priority }));
+    check(where.key + ' ' + where.id + ' bridge priority 61440', r.httpOk && x && x.priority === 61440, r.error || ('via ' + r.via + '; ' + JSON.stringify(x || null)));
+    if (perVlan && !where.row) {
+      r = await post('/api/stp/vlan/reset', W);
+      x = list(await status()).find((y) => y.id === where.id);
+      check('vlan ' + where.id + ' back to the defaults (its row removed)', r.httpOk && !x, r.error || JSON.stringify(x || null));
+    } else {
+      r = await post('/api/stp/priority', Object.assign({ priority: before.priority == null ? 32768 : before.priority }, W));
+      x = list(await status()).find((y) => y.id === where.id);
+      check(where.key + ' ' + where.id + ' bridge priority back to ' + before.priority, r.httpOk && x && x.priority === before.priority, r.error || JSON.stringify(x && { priority: x.priority }));
+    }
 
     const row0 = (before.ports || []).find((y) => y.port === bp);
     say('  port ' + ifx + ' in ' + where.key + ' ' + where.id + ': ' + JSON.stringify(row0 || null));
@@ -154,10 +160,17 @@ async function main() {
     r = await post('/api/stp/port-in', Object.assign({ port: bp, priority: pri, cost: 200000 }, W));
     let row = ((list(await status()).find((y) => y.id === where.id) || {}).ports || []).find((y) => y.port === bp);
     check('port ' + ifx + ' in ' + where.key + ' ' + where.id + ': priority ' + pri + ', cost 200000',
-      r.httpOk && row && row.priority === pri && (row.cost === 200000 || row.adminCost === 200000), r.error || JSON.stringify(row || null));
-    r = await post('/api/stp/port-in', Object.assign({ port: bp, priority: pri0, cost: cost0 }, W));
-    row = ((list(await status()).find((y) => y.id === where.id) || {}).ports || []).find((y) => y.port === bp);
-    check('port ' + ifx + ' in ' + where.key + ' ' + where.id + ' back', r.httpOk && (!row0 ? true : (row && row.priority === pri0)), r.error || JSON.stringify(row || null));
+      r.httpOk && row && row.priority === pri && (row.cost === 200000 || row.adminCost === 200000), r.error || ('via ' + r.via + '; ' + JSON.stringify(row || null)));
+    if (perVlan && !row0) {
+      r = await post('/api/stp/vlan/reset', Object.assign({ port: bp }, W));
+      row = ((list(await status()).find((y) => y.id === where.id) || {}).ports || []).find((y) => y.port === bp);
+      check('port ' + ifx + ' in vlan ' + where.id + ' back to the defaults (its row removed)', r.httpOk && !row, r.error || JSON.stringify(row || null));
+      if (!where.row) await post('/api/stp/vlan/reset', W);
+    } else {
+      r = await post('/api/stp/port-in', Object.assign({ port: bp, priority: pri0, cost: cost0 }, W));
+      row = ((list(await status()).find((y) => y.id === where.id) || {}).ports || []).find((y) => y.port === bp);
+      check('port ' + ifx + ' in ' + where.key + ' ' + where.id + ' back', r.httpOk && row && row.priority === pri0, r.error || JSON.stringify(row || null));
+    }
   } else say('SKIP per VLAN or instance: mode ' + d0.mode + ' has none to try');
 
   // ---- 5. the mode (only with --mode) ------------------------------------------------
@@ -178,6 +191,7 @@ async function main() {
     const d = await status();
     const p = d.ports.find((x) => x.port === bp);
     check('port ' + ifx + ' is as it was', portView(p) === portView(p0), portView(p) + ' vs ' + portView(p0));
+    check('the VLAN rows are as they were', JSON.stringify(d.vlans) === JSON.stringify(d0.vlans), d.vlans.length + ' rows now, ' + d0.vlans.length + ' before');
     check('the switch is as it was', d.priority === d0.priority && d.mode === d0.mode && d.enabled === d0.enabled,
       'priority ' + d.priority + ', mode ' + d.mode + ', on ' + d.enabled);
   }

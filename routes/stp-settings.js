@@ -64,4 +64,7 @@ module.exports = function register(app) {
   // { port, vlan? | instance?, priority?, cost? }
   writeRoute(app, '/api/stp/port-in', 'Spanning tree port settings changed for a VLAN or instance', (s, b) =>
     stp.setPortIn(s, b.vlan != null ? { vlan: b.vlan } : (b.instance != null ? { instance: b.instance } : {}), b.port, { priority: b.priority, cost: b.cost }));
+  // { vlan, port? }: back to the defaults (removes the PVST row the settings made)
+  writeRoute(app, '/api/stp/vlan/reset', 'Spanning tree VLAN settings reset', (s, b) =>
+    (b.port != null ? stp.resetPortInVlan(s, b.vlan, b.port) : stp.resetVlan(s, b.vlan)));
 };
