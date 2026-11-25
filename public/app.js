@@ -253,6 +253,21 @@
     f.appendChild(control);
     return f;
   }
+  // A text input, optionally pre-filled, with a placeholder.
+  function textInput(value, placeholder) {
+    const i = el('input'); i.type = 'text'; if (value != null) i.value = value; if (placeholder) i.placeholder = placeholder;
+    return i;
+  }
+  // A <select> from [{ label, value }], with `value` selected.
+  function selectInput(options, value) {
+    const sel = el('select');
+    for (const o of options) {
+      const opt = el('option', '', o.label); opt.value = o.value;
+      if (o.value === value) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    return sel;
+  }
 
   // One place that knows how to POST JSON to the local API and parse the reply.
   // Returns { ok, body } (never throws on HTTP status); throws only on a network
@@ -2445,7 +2460,10 @@
     connected: ['macTable', 'interfaces', 'bridgePorts', 'dot1xHosts'],
     stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts'],
     routing: ['sviAddrs', 'interfaces', 'vlans', 'portL2L3', 'routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],
-    acl: ['aclNames', 'aclAces', 'aclTuples']
+    acl: ['aclNames', 'aclAces', 'aclTuples'],
+    // SNMP configuration has its own loader (17-snmp-config.js); no health
+    // table feeds it, so a table refresh never repaints it.
+    snmpcfg: []
   };
   function panelDependsOn(key, changedTables) {
     const deps = PANEL_TABLE_DEPS[key];
@@ -2483,7 +2501,7 @@
 
   // ---- Self-managed module refresh (standard B1 family (c), B5) ----
   // The keyed-panel modules refresh through refreshTables, which preserves scroll
-  // for them. The self-managed config modules (acl, snmpcfg, capture, flash) own
+  // for them. The self-managed config modules (capture, flash) own
   // their own fetch + DOM rebuild, so each one used to hand-roll the same
   // "capture scroll, clear, rebuild, restore scroll" dance - and each was a place
   // the scroll-preservation fix had to be applied separately. These two helpers
@@ -2729,6 +2747,13 @@
     // Interactive, write-driven panels don't come from the health poll; a
     // refresh just re-paints them rather than walking the whole switch.
     if (p.key === 'capture' || p.key === 'flash') { if (p._body) paintPanelBody(s, p); return; }
+    // SNMP configuration re-runs its own loader (a server-computed view, not
+    // health tables) and reconciles in place.
+    if (p.key === 'snmpcfg') {
+      if (btn) { btn.disabled = true; btn.classList.add('spin'); }
+      snmpLoad(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });
+      return;
+    }
 
     const tables = PANEL_TABLES[p.key];
     if (!tables) { loadHealth(s); return; }   // whole-switch panel
@@ -3146,7 +3171,7 @@
   // has no mounted keyed tables yet (caller should fall back to a full repaint).
   // panelIsConverted lists the keys that use keyed tables for every table they
   // render; a converted panel is safe to reconcile without a full repaint.
-  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl']);   // filled in as each is converted
+  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg']);   // filled in as each is converted
   // A converted panel may still have unkeyed sections (auth's AAA servers). When
   // a refresh changes a table those read, full-repaint instead of reconciling.
   const PANEL_FULL_REPAINT_TABLES = {
@@ -5381,6 +5406,24 @@
   // 09-aaa.js: 802.1X global settings and AAA (RADIUS/TACACS+) servers.
   // =================================================================
 
+  // Open an inline editor directly under a table row (the AAA server edit).
+  // Returns the host <div> inside a full-width cell. Any existing inline editor
+  // is closed first.
+  function openRowEditor(tr, colspan) {
+    closeRowEditors(tr.closest('table'));
+    const editTr = el('tr', 'snmp-edit-row');
+    const td = el('td'); td.colSpan = colspan;
+    const host = el('div', 'snmp-edit-host');
+    td.appendChild(host); editTr.appendChild(td);
+    tr.insertAdjacentElement('afterend', editTr);
+    host.scrollIntoView({ block: 'nearest' });
+    return host;
+  }
+  function closeRowEditors(scope) {
+    const root = scope || document;
+    root.querySelectorAll('.snmp-edit-row').forEach((r) => r.remove());
+  }
+
   // AAA server inventory (RADIUS + TACACS+) for the Authentication panel. Each
   // server is one summary row with an expander revealing the deep detail:
   // timeouts/retries/deadtime, shared-key status, and (RADIUS) the full RFC
@@ -6514,7 +6557,7 @@
   function paintBuiltin(s, key, body, p) {
     // SNMP configuration does not depend on a health collection, so it is
     // handled before the "no data yet" gate the health panels sit behind.
-    if (key === 'snmpcfg') { paintSnmpPanel(s, body); return; }
+    if (key === 'snmpcfg') { paintSnmpPanel(s, body, p); return; }
     if (key === 'acl') { paintAclPanel(s, body, p); return; }
     if (key === 'routing') { paintRoutingPanel(s, body, p); return; }
     if (key === 'vlans') { paintVlanPanel(s, body, p); return; }
@@ -7868,7 +7911,7 @@
     for (const [key, label, oid, value] of defs) {
       const inp = textInput(value);
       inputs[key] = { inp, oid, current: value, label };
-      grid.appendChild(snmpField(label, inp));
+      grid.appendChild(field(label, inp));
     }
     form.appendChild(grid);
     const msg = el('div'); form.appendChild(msg);
@@ -11188,674 +11231,442 @@
   }
 
   // =================================================================
-  // 17-snmp-config.js: SNMP configuration module (the write side): communities, groups, users, recipients; first-run SNMP setup.
+  // 17-snmp-config.js: SNMP configuration (communities, groups, users,
+  // notification recipients); first-run SNMP setup.
   // =================================================================
 
-  // ===================================================================
-  // SNMP configuration module (the write side).
-  // ===================================================================
+  // SNMP configuration is a keyed panel (standard B1b) whose rows come from its
+  // own loader instead of health.js. Its data is a computed view on the server
+  // (/api/snmp-config joins the community, VACM and target tables and probes
+  // what this credential may do), and a load is ~35 walks, about the whole pps
+  // budget (B5a), so it is read on demand once per visit, never on the health
+  // cycle. Everything else is the keyed-panel pattern: a B2 skeleton, mountInto
+  // tables with stable keys, counts refreshed in place, and a write that
+  // re-reads only its own section and reconciles.
   //
-  // A self-contained interactive panel: it loads on expand and on its own
-  // refresh, never on the health poll. The first thing it does is ask the
-  // switch whether this credential is an SNMP Admin (DefaultSuper); if it
-  // is not, a banner says so and the add/edit/delete controls are disabled,
-  // because the switch would refuse them anyway.
+  // s._snmp = { data, fetchedAt, loading, editable }. data holds one reply per
+  // action below; data.error is set when the local server could not be reached.
+  // editable (a full SNMP Admin credential) is also read by the AAA panel.
 
-  function snmpCfgPost(s, action, extra) {
-    return fetch('/api/snmp-config/' + action, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(Object.assign({ target: s.target }, extra || {}))
-    }).then((r) => r.json());
+  // The section reads, in load order, and where each lands in s._snmp.data.
+  const SNMP_LISTS = [['recipients', 'recips'], ['communities', 'comms'], ['groups', 'groups'],
+    ['users', 'users'], ['target-check', 'tcheck'], ['views', 'views']];
+
+  async function snmpCfgPost(s, action, extra) {
+    const { body } = await apiPost('/api/snmp-config/' + action, Object.assign({ target: s.target }, extra || {}));
+    return body || { ok: false, error: 'no reply from the local server' };
   }
 
-  function paintSnmpPanel(s, body) {
-    if (!s.target) {
-      body.appendChild(el('div', 'card-sub', 'Add SNMP credentials for this switch first.'));
-      return;
-    }
+  // Load everything. The reads go ONE AT A TIME, not in parallel: each opens
+  // its own SNMP session on the server and walks several tables, and a C1300's
+  // agent handles concurrent sessions badly, especially right after a VACM or
+  // community change. Returns the in-flight promise if a load is running.
+  function snmpLoad(s) {
     s._snmp = s._snmp || {};
-    const root = el('div', 'snmp-cfg');
-    body.appendChild(root);
-
-    const banner = el('div', 'snmp-access-banner'); banner.style.display = 'none';
-    root.appendChild(banner);
-    const sections = el('div', 'snmp-sections');
-    root.appendChild(sections);
-
-    // Fresh DOM nodes each paint, but the fetched DATA is cached: the section
-    // node handles are tied to this root, so drop the stale handles.
-    s._snmp.root = root; s._snmp.banner = banner; s._snmp.sections = sections;
-    s._snmp.secNodes = {};
-    // Behave like a keyed panel on open: if we have ANY cached data, render it
-    // immediately (no blocking "Reading…" reload), regardless of age - a keyed
-    // panel always shows its last-known state instantly. Then, if the cache is
-    // stale (>30s) or absent, refresh in the BACKGROUND so the panel never
-    // blocks on open. Only a true cold start (never loaded) shows the loading
-    // state, exactly as a keyed panel shows "waiting for data" before its first
-    // walk. The 30s guard prevents re-fetching on rapid open/close.
-    if (s._snmp.lastData) {
-      paintSnmpBanner(s);
-      if (s._snmp.access && s._snmp.access.ok && s._snmp.access.level === 'limited') { clear(sections); }
-      else renderSnmpSections(s);
-      if (Date.now() - (s._snmp.fetchedAt || 0) >= 30000 && !s._snmp.loading) {
-        s._snmp.loading = true;
-        loadSnmpPanel(s, root, false).then(() => { s._snmp.loading = false; }, () => { s._snmp.loading = false; });
+    const st = s._snmp;
+    if (st.loading) return st.loading;
+    st.fetchedAt = Date.now();
+    st.loading = (async () => {
+      const d = {};
+      try { d.access = await snmpCfgPost(s, 'access'); }
+      catch (e) { st.data = { error: 'Lost contact with the local server: ' + e.message }; st.editable = false; return; }
+      st.editable = !!(d.access.ok && d.access.level === 'full');
+      // A credential that cannot read the config tables gets only the banner.
+      if (!(d.access.ok && d.access.level === 'limited')) {
+        for (const [action, k] of SNMP_LISTS) d[k] = await snmpCfgPost(s, action).catch(() => null);
       }
-    } else if (!s._snmp.loading) {
-      s._snmp.loading = true;
-      loadSnmpPanel(s, root, false).then(() => { s._snmp.loading = false; }, () => { s._snmp.loading = false; });
+      st.data = d;
+    })().finally(() => { st.loading = null; snmpRepaint(s); });
+    return st.loading;
+  }
+  // Once per visit: on open, unless a load is running or ran in the last 30 s.
+  function ensureSnmpLoaded(s) {
+    if (!s.target) return;
+    const st = s._snmp || {};
+    if (st.loading || Date.now() - (st.fetchedAt || 0) < 30000) return;
+    snmpLoad(s);
+  }
+  // After a write: re-read only the sections it touched (plus the target
+  // integrity check when recipients or communities changed, since those own
+  // target rows), then reconcile. Returns a promise for a write's settle.
+  async function snmpRefresh(s, names) {
+    const st = s._snmp;
+    if (!st || !st.data || st.data.error) return snmpLoad(s);
+    const want = names.slice();
+    if (want.some((n) => n === 'recipients' || n === 'communities')) want.push('target-check');
+    for (const [action, k] of SNMP_LISTS) {
+      if (want.indexOf(action) !== -1) st.data[k] = await snmpCfgPost(s, action).catch(() => null);
     }
+    snmpRepaint(s);
+  }
+  function snmpRepaint(s) {
+    const p = s.panels && s.panels.find((x) => x.kind === 'builtin' && x.key === 'snmpcfg');
+    if (!p || !p._body || p.collapsed) return;
+    if (!reconcilePanelInPlace(s, p)) repaintPanel(s, 'snmpcfg');
   }
 
-  // Paint the access banner from the cached access result (shared by the fresh
-  // re-open path and loadSnmpPanel).
-  function paintSnmpBanner(s) {
-    const access = s._snmp.access, banner = s._snmp.banner;
-    if (access && access.ok && access.level !== 'full') {
-      banner.style.display = '';
-      banner.className = 'snmp-access-banner ' + (access.level === 'limited' ? 'warn' : 'info');
-      clear(banner);
-      banner.appendChild(el('span', 'snmp-access-icon', access.level === 'limited' ? '\u26A0' : '\u2139'));
-      banner.appendChild(el('span', '', access.summary));
-    } else {
-      banner.style.display = 'none';
-    }
-  }
-
-  async function loadSnmpPanel(s, root, force) {
-    const sections = s._snmp.sections;
-    // Only show the blocking "Reading…" placeholder on a cold start (no cached
-    // data yet). A background refresh over already-rendered sections must NOT
-    // clear them - that would be the "reloads on every open" flash. The fetched
-    // data lands via renderSnmpSections at the end, updating in place.
-    if (!s._snmp.lastData) {
-      clear(sections);
-      sections.appendChild(el('div', 'card-sub', 'Reading SNMP configuration\u2026'));
-    }
-    let access;
-    try { access = await snmpCfgPost(s, 'access'); }
-    catch (e) { clear(sections); sections.appendChild(el('div', 'panel-err', 'Lost contact with the local server: ' + e.message)); return; }
-    s._snmp.access = access;
-
-    // Access banner. editable is true only for a full DefaultSuper credential.
-    const editable = access.ok && access.level === 'full';
-    s._snmp.editable = editable;
-    paintSnmpBanner(s);
-
-    // If the credential can't even read the config tables, there is nothing
-    // to list — show only the banner and stop.
-    if (access.ok && access.level === 'limited') {
-      clear(sections);
-      return;
-    }
-
-    // Load the four lists ONE AT A TIME, not in parallel. Each request opens
-    // its own SNMP session on the server and walks several tables; firing all
-    // four at once meant four concurrent sessions doing ~15 table walks
-    // simultaneously, which a C1300's SNMP agent handles badly — especially
-    // right after a VACM/community change or alongside a config save. Serial
-    // keeps the switch under the load of a single session at a time.
-    // System identity (name/location/contact) lives in the Details panel.
-    const recips = await snmpCfgPost(s, 'recipients').catch(() => null);
-    const comms = await snmpCfgPost(s, 'communities').catch(() => null);
-    const groups = await snmpCfgPost(s, 'groups').catch(() => null);
-    const users = await snmpCfgPost(s, 'users').catch(() => null);
-    // Integrity check: malformed snmpTargetAddrTable rows cause the switch's
-    // %SNMP-F-BADTDOMAIN fault and can crash config processing. If any are
-    // found, show them first with one-click removal — this is the usual debris
-    // of a write interrupted by an earlier crash.
-    const tcheck = await snmpCfgPost(s, 'target-check').catch(() => null);
-    // Preserve scroll across the rebuild (standard A7). A self-managed module's
-    // reload clears and repopulates its sections, which would otherwise jump the
-    // page after an edit.
-    // Render with scroll preserved around the rebuild (standard B5). Each section
-    // lives in its own stable wrapper node kept on s._snmp.secNodes, so a single
-    // create/delete can refresh just that section's data and re-render only its
-    // wrapper (reloadSnmpSection) instead of reloading the whole module.
-    s._snmp.lastData = { recips: recips, comms: comms, groups: groups, users: users, tcheck: tcheck };
-    s._snmp.editable = editable;
-    s._snmp.fetchedAt = Date.now();   // for the on-open freshness check (§B4)
-    renderSnmpSections(s);
-  }
-
-  // Render all SNMP sections from cached data (s._snmp.lastData) into the stable
-  // wrapper nodes. Called by loadSnmpPanel after a fetch, and by paintSnmpPanel
-  // on a re-open when the cache is still fresh (no re-fetch). Each section lives
-  // in its own wrapper on s._snmp.secNodes, so reloadSnmpSection can refresh one.
-  function renderSnmpSections(s) {
-    const sections = s._snmp.sections;
-    const d = s._snmp.lastData || {};
-    const editable = s._snmp.editable;
-    s._snmp.secNodes = s._snmp.secNodes || {};
-    const mount = (name, node) => {
-      const wrap = s._snmp.secNodes[name] || el('div', 'snmp-sec-wrap');
-      s._snmp.secNodes[name] = wrap;
-      clear(wrap);
-      // An empty placeholder (no real section content) collapses the wrapper so
-      // the flex gap doesn't leave a phantom blank where e.g. bad-rows would be.
-      if (node && node.childNodes.length) { wrap.appendChild(node); wrap.style.display = ''; }
-      else { wrap.style.display = 'none'; }
-      return wrap;
-    };
-    selfManagedRender(s, () => {
-      clear(sections);
-      sections.appendChild(mount('badRows',
-        (d.tcheck && d.tcheck.ok && d.tcheck.bad && d.tcheck.bad.length) ? snmpBadRowsSection(s, d.tcheck.bad, editable) : el('div')));
-      sections.appendChild(mount('recipients', snmpRecipientsSection(s, d.recips, editable)));
-      sections.appendChild(mount('communities', snmpCommunitiesSection(s, d.comms, editable)));
-      sections.appendChild(mount('groups', snmpGroupsSection(s, d.groups, editable)));
-      sections.appendChild(mount('users', snmpUsersSection(s, d.users, editable)));
-    });
-  }
-
-  // Refresh ONE SNMP-config section in place: re-fetch only that section's data
-  // and re-render only its wrapper node, instead of reloading the whole module
-  // (6 serial fetches). `which` is one or more of recipients/communities/groups/
-  // users; 'target-check' is refreshed alongside recipient/community changes
-  // because those affect target bindings and the bad-rows banner. Returns a
-  // promise so a write's runButtonAction settle can hold the spinner until the
-  // section updates (standard B5). Falls back to a full reload if the panel
-  // hasn't been rendered yet (no stable wrappers).
-  async function reloadSnmpSection(s, which) {
-    const names = Array.isArray(which) ? which : [which];
-    if (!s._snmp || !s._snmp.secNodes || !s._snmp.editable) { return loadSnmpPanel(s, s._snmp && s._snmp.root, true); }
-    const editable = s._snmp.editable;
-    const touchesTargets = names.some((n) => n === 'recipients' || n === 'communities');
-    const render = (name, node) => {
-      const wrap = s._snmp.secNodes[name];
-      if (!wrap) return;
-      selfManagedRender(s, () => {
-        clear(wrap);
-        if (node && node.childNodes.length) { wrap.appendChild(node); wrap.style.display = ''; }
-        else { wrap.style.display = 'none'; }
-      });
-    };
-    for (const name of names) {
-      if (name === 'recipients') { const d = await snmpCfgPost(s, 'recipients').catch(() => null); s._snmp.lastData.recips = d; render('recipients', snmpRecipientsSection(s, d, editable)); }
-      else if (name === 'communities') { const d = await snmpCfgPost(s, 'communities').catch(() => null); s._snmp.lastData.comms = d; render('communities', snmpCommunitiesSection(s, d, editable)); }
-      else if (name === 'groups') { const d = await snmpCfgPost(s, 'groups').catch(() => null); s._snmp.lastData.groups = d; render('groups', snmpGroupsSection(s, d, editable)); }
-      else if (name === 'users') { const d = await snmpCfgPost(s, 'users').catch(() => null); s._snmp.lastData.users = d; render('users', snmpUsersSection(s, d, editable)); }
-    }
-    if (touchesTargets) {
-      const tcheck = await snmpCfgPost(s, 'target-check').catch(() => null);
-      s._snmp.lastData.tcheck = tcheck;
-      render('badRows', (tcheck && tcheck.ok && tcheck.bad && tcheck.bad.length) ? snmpBadRowsSection(s, tcheck.bad, editable) : el('div'));
-    }
-  }
-
-  function snmpSection(title, actionBtn) {
-    const sec = el('div', 'snmp-section');
-    const head = el('div', 'snmp-section-head');
-    head.appendChild(el('h4', 'snmp-section-title', title));
-    if (actionBtn) head.appendChild(actionBtn);
-    sec.appendChild(head);
-    return sec;
-  }
-
-  // Build a table. If rowKey(rowData,i) is given, each <tr> is tagged so an
-  // inline editor row can be opened directly beneath it with openRowEditor().
-
-  // Open an inline editor directly under a table row. Returns the host <div>
-  // inside a full-width cell. Any existing inline editor is closed first.
-  function openRowEditor(tr, colspan) {
-    closeRowEditors(tr.closest('table'));
-    const editTr = el('tr', 'snmp-edit-row');
-    const td = el('td'); td.colSpan = colspan;
-    const host = el('div', 'snmp-edit-host');
-    td.appendChild(host); editTr.appendChild(td);
-    tr.insertAdjacentElement('afterend', editTr);
-    host.scrollIntoView({ block: 'nearest' });
-    return host;
-  }
-  function closeRowEditors(scope) {
-    const root = scope || document;
-    root.querySelectorAll('.snmp-edit-row').forEach((r) => r.remove());
-  }
-
-  // ---- Malformed target rows (BADTDOMAIN debris) ----
-  function snmpBadRowsSection(s, bad, editable) {
-    const sec = snmpSection('Malformed target rows');
-    const warn = el('div', 'snmp-access-banner warn');
-    warn.appendChild(el('span', 'snmp-access-icon', '\u26A0'));
-    warn.appendChild(el('span', '', 'These snmpTargetAddrTable rows have a transport domain the switch cannot turn into a UDP address. ' +
-      'They trigger the switch\u2019s %SNMP-F-BADTDOMAIN fault and can crash configuration saves. ' +
-      'They are usually left behind by a write that was interrupted. Removing them is safe.'));
-    sec.appendChild(warn);
-    const cols = ['Row', 'Transport domain', 'TAddress bytes', 'Problem'].concat(editable ? [''] : []);
-    const rows = bad.map((b) => {
-      const base = [b.name, b.domain || '(none)', String(b.taddrLen), b.reason];
-      if (editable) base.push(actGroup([
-        actBtnConfirm('Remove', (e) => delBadTargetRow(s, b), 'danger', 'Remove this malformed row')
-      ]));
-      return base;
-    });
-    sec.appendChild(plainTable(s, cols, rows));
-    return sec;
-  }
-  function delBadTargetRow(s, b) {
-    snmpDeleteDirect(s, 'target-row-delete-apply', { key: { destroyOid: b.destroyOid } }, 'malformed row ' + b.name);
-  }
-
-  // ---- Recipients ----
-  function snmpRecipientsSection(s, data, editable) {
-    const sec = snmpSection('Notification recipients');
-    const addHost = editable ? addControl('Add recipient', () => openEditPopout(s, 'Add recipient', (pane, close) => addSnmpRecipient(s, pane, close))) : null;
-    if (addHost) sec._addHost = addHost;
-    if (!data || !data.ok) { sec.appendChild(el('div', 'card-sub', 'Recipients unavailable.')); return sec; }
-    const recips = data.recipients || [];
-    if (data.auth_failure_traps && data.auth_failure_traps !== 'unknown') {
-      sec.appendChild(el('div', 'snmp-subnote', 'Authentication-failure traps: ' + data.auth_failure_traps));
-    }
-    if (!recips.length) { sec.appendChild(el('div', 'card-sub', 'No notification recipients configured.')); if (addHost) sec.appendChild(addHost); return sec; }
-    const cols = ['Address', 'Port', 'Type', 'Version', 'Community / user', 'Status'].concat(editable ? [''] : []);
-    const rows = recips.map((r) => {
-      const base = [r.address, r.port, r.type, r.version, r.security_name, r.status];
-      if (editable) base.push(r.key ? actGroup([
-        actBtnConfirm('Delete', (e) => delSnmpRecipient(s, r), 'danger', 'Delete this recipient')
-      ]) : '');
-      return base;
-    });
-    sec.appendChild(plainTable(s, cols, rows));
-    if (addHost) sec.appendChild(addHost);
-    return sec;
-  }
-
-  function delSnmpRecipient(s, r) {
-    snmpDeleteDirect(s, 'recipient-delete-apply', { key: r.key }, 'recipient ' + r.address);
-  }
-
-  function snmpCommunitiesSection(s, data, editable) {
-    const sec = snmpSection('SNMP communities');
-    const addHost = editable ? addControl('Add community', () => openEditPopout(s, 'Add community', (pane, close) => addSnmpCommunity(s, pane, close))) : null;
-    if (!data || !data.ok) { sec.appendChild(el('div', 'card-sub', 'Communities unavailable.')); return sec; }
-    const comms = data.communities || [];
-    s._snmp.communities = comms;
-    if (!comms.length) { sec.appendChild(el('div', 'card-sub', 'No communities found.')); if (addHost) sec.appendChild(addHost); return sec; }
-    // Traps and Status are not shown: Traps is only populated for the legacy
-    // Cisco station-restricted community table (unused here, always blank), and
-    // Status cannot be changed through the tool (a community is present or
-    // deleted), so it is an assumed constant.
-    const cols = ['Community', 'Station', 'Access', 'View'].concat(editable ? [''] : []);
-    const rows = comms.map((c, i) => {
-      const base = [c.community, c.station || 'any', c.access || '', c.view || '\u2014'];
-      if (editable) base.push(c.key ? actGroup([
-        actBtnConfirm('Delete', (e) => runButtonAction(e.currentTarget, {
-          failLabel: 'Delete community',
-          run: () => snmpDeleteDirect(s, 'community-delete-apply', { key: c.key }, 'community \u201C' + c.community + '\u201D'),
-          ok: (r) => r && r.ok,
-          error: (r) => (r && r.error) || 'the switch rejected it',
-          settle: () => reloadSnmpSection(s, 'communities')
-        }), 'danger', 'Delete this community')
-      ]) : '');
-      return base;
-    });
-    // Row-click opens the standard tabbed popout hosting the editor.
-    sec.appendChild(plainTable(s, cols, rows, editable ? (i) => {
-      const c = comms[i];
-      if (c && c.key) openEditPopout(s, 'Community \u00b7 ' + c.community,
-        (pane, close) => editSnmpCommunity(s, c, pane, close));
-    } : null));
-    if (addHost) sec.appendChild(addHost);
-    return sec;
-  }
-
-  function snmpGroupsSection(s, data, editable) {
-    const sec = snmpSection('SNMPv3 groups');
-    const addHost = editable ? addControl('Add group', () => openEditPopout(s, 'Add group', (pane, close) => addSnmpGroup(s, pane, close))) : null;
-    if (!data || !data.ok) { sec.appendChild(el('div', 'card-sub', 'Groups unavailable.')); return sec; }
-    const groups = data.groups || [];
-    s._snmp.groups = groups;
-    if (!groups.length) { sec.appendChild(el('div', 'card-sub', 'No SNMPv3 groups found.')); if (addHost) sec.appendChild(addHost); return sec; }
-    const vcell = (views, lvl) => { const v = (views || {})[lvl]; if (!v) return '\u2014'; return [v.read, v.write, v.notify].map((x) => x || '\u2014').join(' / '); };
-    // Group editing is now via row-click (its only action was Edit), so no
-    // action column is needed.
-    const cols = ['Group', 'No Auth (R/W/N)', 'Auth (R/W/N)', 'Privacy (R/W/N)', 'Members'];
-    const rows = groups.map((g) => [g.group, vcell(g.views, 'noAuthNoPriv'), vcell(g.views, 'authNoPriv'), vcell(g.views, 'authPriv'), g.members]);
-    sec.appendChild(plainTable(s, cols, rows, editable ? (i) => {
-      const g = groups[i];
-      openEditPopout(s, 'Group \u00b7 ' + g.group, (pane, close) => editSnmpGroup(s, g, pane, close));
-    } : null));
-    if (addHost) sec.appendChild(addHost);
-    return sec;
-  }
-
-  function snmpUsersSection(s, data, editable) {
-    const sec = snmpSection('SNMPv3 users');
-    if (!data || !data.ok) { sec.appendChild(el('div', 'card-sub', 'Users unavailable.')); return sec; }
-    const users = data.users || [];
-    sec.appendChild(el('div', 'snmp-subnote', 'Users are created in the switch web GUI; this lists them, their group mapping, and can delete them.'));
-    if (!users.length) { sec.appendChild(el('div', 'card-sub', 'No SNMPv3 users found.')); return sec; }
-    const cols = ['User', 'Auth', 'Privacy', 'Group', 'Status'].concat(editable ? [''] : []);
-    const rows = users.map((u) => {
-      const base = [u.name, u.auth, u.priv, u.group, u.status];
-      if (editable) base.push(u.key ? actGroup([
-        actBtnConfirm('Delete', (e) => runButtonAction(e.currentTarget, {
-          failLabel: 'Delete user',
-          run: () => snmpDeleteDirect(s, 'user-delete-apply', { key: u.key }, 'SNMPv3 user \u201C' + u.name + '\u201D'),
-          ok: (r) => r && r.ok,
-          error: (r) => (r && r.error) || 'the switch rejected it',
-          settle: () => reloadSnmpSection(s, 'users')
-        }), 'danger', 'Delete this user')
-      ]) : '');
-      return base;
-    });
-    sec.appendChild(plainTable(s, cols, rows));
-    return sec;
-  }
-
-  // Delete an SNMP object (the two-tap button already confirmed). Returns a
-  // normalized result for runButtonAction; the caller owns the button lifecycle
-  // and the per-section refresh in settle. The two-tap confirm already happened.
-  async function snmpDeleteDirect(s, applyAction, payload, label) {
+  // One write: POST the apply action and normalise the reply for
+  // runButtonAction. s.writeBusy holds health refreshes off the switch while
+  // the write runs.
+  async function snmpWrite(s, action, payload) {
     s.writeBusy = true;
     try {
-      const j = await snmpCfgPost(s, applyAction, payload);
-      s.writeBusy = false;
-      if (!j.ok || (j.applied && !j.applied.ok)) {
-        const detail = (j.applied && (j.applied.log || []).find((x) => !x.ok)) || null;
-        return { ok: false, error: j.error || (detail && detail.detail) || 'the switch rejected it' };
+      const j = await snmpCfgPost(s, action, payload);
+      if (!j.ok) return { ok: false, error: j.error || 'the switch rejected it' };
+      const r = j.applied;
+      if (r && !r.ok) {
+        const bad = (r.log || []).find((x) => !x.ok);
+        return { ok: false, error: (bad && bad.detail) || 'the switch rejected it' };
       }
-      markConfigDirty(s);
       return { ok: true };
-    } catch (e) { s.writeBusy = false; return { ok: false, error: e.message }; }
+    } catch (e) {
+      return { ok: false, error: 'lost contact with the local server: ' + e.message };
+    } finally { s.writeBusy = false; }
   }
 
-  // ---- inline form infrastructure ----
-  // Forms render inline: add forms into a host at the foot of their section,
-  // and row actions (edit group, delete) into an editor row directly beneath
-  // the item. This keeps every edit as close to its target as possible. The
-  // original tool's inline add/edit UX: fill fields, Preview to see the exact
-  // SETs, then Apply. No browser prompt dialogs.
-
-  // Dismiss a form/preview: if it sits in an inline row-editor, remove that
-  // whole row; otherwise just empty the host it rendered into.
-  function dismissHost(host) {
-    if (!host) return;
-    const editRow = host.closest ? host.closest('.snmp-edit-row') : null;
-    if (editRow) editRow.remove(); else clear(host);
+  // A two-tap Delete for a table row (B6): spins until the section is re-read.
+  function snmpDeleteCell(s, label, action, payload, sections, title) {
+    return { cellNode: actGroup([actBtnConfirm(label === 'Remove row' ? 'Remove' : 'Delete', (e) => {
+      runButtonAction(e.currentTarget, {
+        failLabel: label,
+        run: () => snmpWrite(s, action, payload),
+        ok: (r) => r && r.ok,
+        error: (r) => (r && r.error) || 'the switch rejected it',
+        onApplied: () => markConfigDirty(s),
+        settle: () => snmpRefresh(s, sections)
+      });
+    }, 'danger', title)]), sig: 'del' };
   }
 
-  function snmpField(label, control) {
-    const f = el('div', 'snmp-field');
-    f.appendChild(el('label', '', label));
-    f.appendChild(control);
-    return f;
-  }
-  function textInput(value, placeholder) {
-    const i = el('input'); i.type = 'text'; if (value != null) i.value = value; if (placeholder) i.placeholder = placeholder;
-    return i;
-  }
-  function selectInput(options, value) {
-    const sel = el('select');
-    for (const o of options) {
-      const opt = el('option', '', o.label); opt.value = o.value;
-      if (o.value === value) opt.selected = true;
-      sel.appendChild(opt);
+  // The panel (standard B2): scaffolding on a full paint only; keyed tables
+  // through mountInto on every pass; counts and notes in stable nodes.
+  function paintSnmpPanel(s, body, p) {
+    if (!s._ktReconcile) clear(body);
+    if (!s.target) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Add SNMP credentials for this switch first.')); return; }
+    if (!s._ktReconcile) ensureSnmpLoaded(s);
+    const d = s._snmp && s._snmp.data;
+    if (!d) {
+      if (!s._ktReconcile) { body.appendChild(el('div', 'card-sub', 'Waiting for data\u2026')); p._snmpWaiting = true; }
+      return;
     }
-    return sel;
+    // What this credential may do decides the whole layout, so a change of it
+    // (or the first data arriving) is structural.
+    const access = d.access || {};
+    const mode = d.error ? 'error' : (access.ok ? access.level : 'unknown');
+    if (s._ktReconcile && (p._snmpWaiting || p._snmpMode !== mode)) { s._ktStructural = true; return; }
+    p._snmpWaiting = false;
+    p._snmpMode = mode;
+    if (!s._ktReconcile) { p._snmpNotes = {}; p._snmpSubs = {}; }
+
+    if (mode === 'error') { if (!s._ktReconcile) body.appendChild(el('div', 'panel-err', d.error)); return; }
+    // Access banner: shown unless the credential is a full SNMP Admin.
+    if (!s._ktReconcile) {
+      if (mode === 'unknown') {
+        body.appendChild(el('div', 'sw-err', 'Could not check what this credential may change: ' + (access.error || 'no answer') + '.'));
+      } else if (mode !== 'full') {
+        const banner = el('div', 'snmp-access-banner ' + (mode === 'limited' ? 'warn' : 'info'));
+        banner.appendChild(el('span', 'snmp-access-icon', mode === 'limited' ? '\u26a0' : '\u2139'));
+        p._snmpBanner = el('span', '', '');
+        banner.appendChild(p._snmpBanner);
+        body.appendChild(banner);
+      }
+    }
+    if (p._snmpBanner) p._snmpBanner.textContent = access.summary || '';
+    if (mode === 'limited') return;
+    const editable = mode === 'full';
+
+    const section = (name, title, addLabel, onAdd) => {
+      if (s._ktReconcile) return;
+      const st = el('div', 'section-title', title);
+      p._snmpNotes[name] = el('span', 'st-note', '');
+      st.appendChild(p._snmpNotes[name]);
+      body.appendChild(st);
+      if (addLabel && editable) body.appendChild(addControl(addLabel, onAdd));
+    };
+    const note = (name, text) => { const n = p._snmpNotes[name]; if (n) n.textContent = text; };
+    // A muted line under a heading, kept in a stable node.
+    const sub = (name, text) => {
+      if (!s._ktReconcile) { p._snmpSubs[name] = el('div', 'card-sub', ''); body.appendChild(p._snmpSubs[name]); }
+      const n = p._snmpSubs[name]; if (n) { n.textContent = text || ''; n.style.display = text ? '' : 'none'; }
+    };
+    const emptyNote = (msg) => { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', msg)); };
+    const count = (n, one, many) => n + ' ' + (n === 1 ? one : many);
+    const act = editable ? [''] : [];
+
+    // ---- Malformed target rows (only when there are any) ----
+    const bad = (d.tcheck && d.tcheck.ok && d.tcheck.bad) || [];
+    if (bad.length) {
+      section('bad', 'Malformed target rows');
+      note('bad', count(bad.length, 'row', 'rows'));
+      if (!s._ktReconcile) {
+        const warn = el('div', 'snmp-access-banner warn');
+        warn.appendChild(el('span', 'snmp-access-icon', '\u26a0'));
+        warn.appendChild(el('span', '', 'These notification target rows have an address the switch cannot read. ' +
+          'They cause the switch\u2019s %SNMP-F-BADTDOMAIN fault and can crash configuration saves. ' +
+          'They are usually left behind by an interrupted write, and removing them is safe.'));
+        body.appendChild(warn);
+      }
+      mountInto(body, s, p, 'snmp:bad', ['Row', 'Transport domain', 'Address bytes', 'Problem'].concat(act),
+        bad.map((b) => ({ key: 'bad:' + b.index, cells: [{ v: b.name }, { v: b.domain || '(none)' }, { v: String(b.taddrLen) }, { v: b.reason }]
+          .concat(editable ? [snmpDeleteCell(s, 'Remove row', 'target-row-delete-apply', { key: { destroyOid: b.destroyOid } }, ['target-check'], 'Remove this malformed row')] : []) })));
+    }
+
+    // ---- Notification recipients ----
+    const rd = d.recips;
+    section('rcp', 'Notification recipients', 'Add recipient', () => openSnmpRecipientForm(s));
+    if (!rd || !rd.ok) { note('rcp', ''); emptyNote('Recipients unavailable.'); }
+    else {
+      const recips = rd.recipients || [];
+      note('rcp', count(recips.length, 'recipient', 'recipients'));
+      sub('rcp', rd.auth_failure_traps && rd.auth_failure_traps !== 'unknown' ? 'Authentication-failure traps: ' + rd.auth_failure_traps : '');
+      if (!recips.length) emptyNote('No notification recipients configured.');
+      else mountInto(body, s, p, 'snmp:rcp', ['Address', 'Port', 'Type', 'Version', 'Community / user', 'Status'].concat(act),
+        recips.map((r) => ({ key: 'rcp:' + (r.key ? r.key.source + ':' + r.key.index : r.name), cells: [
+          { v: r.address }, { v: r.port }, { v: r.type }, { v: r.version }, { v: r.security_name }, { v: r.status }]
+          .concat(editable ? [r.key ? snmpDeleteCell(s, 'Delete recipient', 'recipient-delete-apply', { key: r.key }, ['recipients'], 'Delete this recipient') : { v: '' }] : []) })));
+    }
+
+    // ---- Communities ----
+    // Traps and Status are not shown: Traps is only filled for the legacy
+    // station-restricted community table (unused here), and a community is
+    // either present or deleted.
+    const cd = d.comms;
+    section('comm', 'SNMP communities', 'Add community', () => openSnmpCommunityForm(s, null));
+    if (!cd || !cd.ok) { note('comm', ''); emptyNote('Communities unavailable.'); }
+    else {
+      const comms = cd.communities || [];
+      note('comm', count(comms.length, 'community', 'communities'));
+      if (!comms.length) emptyNote('No communities found.');
+      else mountInto(body, s, p, 'snmp:comm', ['Community', 'Station', 'Access', 'View'].concat(act),
+        comms.map((c) => {
+          const key = 'comm:' + (c.key ? c.key.source + ':' + c.key.index : c.community);
+          const first = (editable && c.key) ? { v: c.community, click: { open: () => openSnmpCommunityForm(s, key) } } : { v: c.community };
+          return { key, cells: [first, { v: c.station || 'any' }, { v: c.access || '' }, { v: c.view || '\u2014' }]
+            .concat(editable ? [c.key ? snmpDeleteCell(s, 'Delete community', 'community-delete-apply', { key: c.key }, ['communities'], 'Delete this community') : { v: '' }] : []) };
+        }));
+    }
+
+    // ---- SNMPv3 groups ----
+    const gd = d.groups;
+    section('grp', 'SNMPv3 groups', 'Add group', () => openSnmpGroupForm(s, null));
+    if (!gd || !gd.ok) { note('grp', ''); emptyNote('Groups unavailable.'); }
+    else {
+      const groups = gd.groups || [];
+      note('grp', count(groups.length, 'group', 'groups'));
+      const vcell = (views, lvl) => { const v = (views || {})[lvl]; if (!v) return '\u2014'; return [v.read, v.write, v.notify].map((x) => x || '\u2014').join(' / '); };
+      if (!groups.length) emptyNote('No SNMPv3 groups found.');
+      else mountInto(body, s, p, 'snmp:grp', ['Group', 'No Auth (R/W/N)', 'Auth (R/W/N)', 'Privacy (R/W/N)', 'Members'],
+        groups.map((g) => ({ key: 'grp:' + g.group, cells: [
+          editable ? { v: g.group, click: { open: () => openSnmpGroupForm(s, g.group) } } : { v: g.group },
+          { v: vcell(g.views, 'noAuthNoPriv') }, { v: vcell(g.views, 'authNoPriv') }, { v: vcell(g.views, 'authPriv') }, { v: g.members }] })));
+    }
+
+    // ---- SNMPv3 users ----
+    const ud = d.users;
+    section('usr', 'SNMPv3 users');
+    if (!ud || !ud.ok) { note('usr', ''); emptyNote('Users unavailable.'); }
+    else {
+      const users = ud.users || [];
+      note('usr', count(users.length, 'user', 'users'));
+      sub('usr', 'Users are created in the switch\u2019s web interface. This panel lists them and can delete them.');
+      if (!users.length) emptyNote('No SNMPv3 users found.');
+      else mountInto(body, s, p, 'snmp:usr', ['User', 'Auth', 'Privacy', 'Group', 'Status'].concat(act),
+        users.map((u) => ({ key: 'usr:' + (u.key ? u.key.index : u.name), cells: [
+          { v: u.name }, { v: u.auth }, { v: u.priv }, { v: u.group }, { v: u.status }]
+          .concat(editable ? [u.key ? snmpDeleteCell(s, 'Delete user', 'user-delete-apply', { key: u.key }, ['users'], 'Delete this user') : { v: '' }] : []) })));
+    }
   }
 
-  // Render a plan preview with an Apply button; on apply, run the action and
-  // reload. cfgProvider returns the config/key object to send (captured now).
-  function snmpFormMsg(host, kind, text) {
-    let m = host.querySelector('.snmp-msg');
-    if (!m) { m = el('div', 'snmp-msg'); host.appendChild(m); }
-    m.className = 'snmp-msg ' + kind; m.textContent = text;
+  // ---- Forms (standard A5/B6/B8) ----
+  // Each opens in the tabbed pop-out (Esc closes), lays its fields out with
+  // formSection + field, applies on one tap through runButtonAction, shows a
+  // failure as the red line under the button, and closes once the section has
+  // been re-read. Lists they offer (communities, views) come from the load.
+  function snmpForm(s, title, tab, build) {
+    openTabbedPopout(s, title, [{ label: tab, fill: (pane, close) => build(pane, close) }], []);
   }
-
-  // Preview helper: POST the preview action, then show the plan.
-  // Apply an SNMP add/modify directly. The old two-step preview (show the VACM
-  // plan, then Apply) was a debugging aid; an end user just wants the change
-  // made. The calling button already carries two-tap confirmation, so this
-  // commits straight away and reloads the panel.
-  // Apply an SNMP-config create/modify. Button lifecycle via runButtonAction
-  // (standard B6); on success the form's popout closes and ONLY the affected
-  // section is refreshed in place (standard B5), not the whole module. `section`
-  // is which section to reload (communities/recipients/groups). Detailed errors
-  // go to the form's own message line, which is better UX than a toast here.
-  function snmpPreview(s, host, previewAction, applyAction, payload, title, applyBtn, section) {
-    runButtonAction(applyBtn, {
-      failLabel: title || 'Apply',
-      run: async () => {
-        s.writeBusy = true;
-        try {
-          const j = await snmpCfgPost(s, applyAction, payload);
-          s.writeBusy = false;
-          if (!j.ok) return { ok: false, error: j.error };
-          const r = j.applied;
-          if (r && !r.ok) { const bad = (r.log || []).find((x) => !x.ok); return { ok: false, error: 'Did not complete: ' + (bad ? bad.detail : 'unknown error') }; }
-          return { ok: true };
-        } catch (e) { s.writeBusy = false; return { ok: false, error: 'Lost contact with the local server: ' + e.message }; }
-      },
+  function snmpSubmit(s, ev, msg, failLabel, spinLabel, action, payload, sections, close) {
+    runButtonAction(ev.currentTarget, {
+      failLabel, spinLabel,
+      run: () => snmpWrite(s, action, payload),
       ok: (r) => r && r.ok,
-      error: (r) => { snmpFormMsg(host, 'bad', (r && r.error) || 'the switch rejected it'); return (r && r.error) || 'the switch rejected it'; },
-      onApplied: () => {
-        const pop = host.closest && host.closest('.port-detail-back');
-        if (pop) pop.remove();
-        markConfigDirty(s);
-      },
-      settle: () => reloadSnmpSection(s, section || ['recipients', 'communities', 'groups', 'users'])
+      error: (r) => { const e = (r && r.error) || 'the switch rejected it'; clear(msg); msg.appendChild(el('div', 'sw-err', failLabel + ' failed: ' + e)); return e; },
+      onApplied: () => markConfigDirty(s),
+      settle: () => snmpRefresh(s, sections).then(() => close())
+    });
+  }
+  const snmpView = (s) => ((s._snmp && s._snmp.data && s._snmp.data.views && s._snmp.data.views.views) || []);
+  const SNMP_ACCESS = [{ label: 'Read Only', value: 'read-only' }, { label: 'Read Write', value: 'read-write' }, { label: 'SNMP Admin', value: 'snmp-admin' }];
+
+  // ---- Add recipient ----
+  function openSnmpRecipientForm(s) {
+    snmpForm(s, 'Add notification recipient', 'Recipient', (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const comms = ((s._snmp.data.comms && s._snmp.data.comms.communities) || []).map((c) => c.community).filter(Boolean);
+      const ip = textInput('', '192.168.1.50');
+      const port = textInput('162');
+      const ntype = selectInput([{ label: 'Trap', value: 'trap' }, { label: 'Inform (acknowledged)', value: 'inform' }], 'trap');
+      const version = selectInput([{ label: 'SNMPv2c', value: '2c' }, { label: 'SNMPv1', value: '1' }, { label: 'SNMPv3', value: '3' }], '2c');
+      const community = selectInput(comms.length ? comms.map((c) => ({ label: c, value: c })) : [{ label: '(no communities found)', value: '' }], comms[0] || '');
+      const user = textInput('', 'existing SNMPv3 user');
+      const level = selectInput([{ label: 'authPriv', value: 'authPriv' }, { label: 'authNoPriv', value: 'authNoPriv' }, { label: 'noAuthNoPriv', value: 'noAuthNoPriv' }], 'authPriv');
+      const timeout = textInput('15'); const retries = textInput('3');
+
+      const where = formSection('Recipient');
+      where.body.appendChild(field('IPv4 address', ip));
+      where.body.appendChild(field('UDP port', port));
+      where.body.appendChild(field('Notification type', ntype));
+      where.body.appendChild(field('Version', version));
+      const sec = formSection('Security');
+      const commField = field('Community sent in notifications', community);
+      const userField = field('SNMPv3 user (must exist on the switch)', user);
+      const levelField = field('Security level', level);
+      sec.body.appendChild(commField); sec.body.appendChild(userField); sec.body.appendChild(levelField);
+      const inform = formSection('Inform');
+      inform.body.appendChild(field('Timeout (s)', timeout));
+      inform.body.appendChild(field('Retries', retries));
+      form.appendChild(where.sec); form.appendChild(sec.sec); form.appendChild(inform.sec);
+      const sync = () => {
+        const v3 = version.value === '3';
+        commField.style.display = v3 ? 'none' : '';
+        userField.style.display = v3 ? '' : 'none';
+        levelField.style.display = v3 ? '' : 'none';
+        inform.sec.style.display = ntype.value === 'inform' ? '' : 'none';
+      };
+      version.addEventListener('change', sync); ntype.addEventListener('change', sync); sync();
+
+      const { actions, apply, msg } = applyActions('Add recipient');
+      apply.addEventListener('click', (ev) => {
+        clear(msg);
+        const cfg = { ip: ip.value.trim(), port: port.value.trim(), ntype: ntype.value, version: version.value };
+        if (!ipv4ToHex(cfg.ip)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
+        if (version.value === '3') {
+          cfg.user = user.value.trim(); cfg.level = level.value;
+          if (!cfg.user) { msg.appendChild(el('div', 'sw-err', 'Enter the SNMPv3 user.')); return; }
+        } else {
+          cfg.community = community.value;
+          if (!cfg.community) { msg.appendChild(el('div', 'sw-err', 'Add a community first.')); return; }
+        }
+        if (ntype.value === 'inform') { cfg.timeout = timeout.value; cfg.retries = retries.value; }
+        snmpSubmit(s, ev, msg, 'Add recipient', 'Adding\u2026', 'recipient-add-apply', { cfg }, ['recipients'], close);
+      });
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+      ip.focus();
     });
   }
 
-  // ---- Add recipient (inline form) ----
-  async function addSnmpRecipient(s, host, onCancel) {
-    clear(host);
-    const form = el('div', 'snmp-form');
-    form.appendChild(el('h5', '', 'Add notification recipient'));
-    form.appendChild(el('p', 'intro', 'Creates the snmpTargetAddr / Params / Notify rows the switch uses for an snmp-server host, plus the community mapping row for v1/v2c.'));
+  // ---- Add / edit community ----
+  // Editing changes only the access mode and view: the community string and
+  // station are part of the row's identity, so they are shown but fixed.
+  function openSnmpCommunityForm(s, rowKey) {
+    const comms = (s._snmp.data.comms && s._snmp.data.comms.communities) || [];
+    const c = rowKey ? comms.find((x) => 'comm:' + (x.key ? x.key.source + ':' + x.key.index : x.community) === rowKey) : null;
+    if (rowKey && !c) return;
+    snmpForm(s, c ? 'Community \u00b7 ' + c.community : 'Add SNMP community', 'Community', (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      const views = snmpView(s);
+      const sec = formSection('Community');
+      const name = textInput(c ? c.community : '', 'community string');
+      sec.body.appendChild(field('Community string', name));
+      if (c) {
+        name.disabled = true;
+        const station = textInput(c.station || 'any'); station.disabled = true;
+        sec.body.appendChild(field('Station', station));
+      }
+      const cur = c ? (/admin/i.test(c.access || '') ? 'snmp-admin' : (/write/i.test(c.access || '') ? 'read-write' : 'read-only')) : 'read-only';
+      const access = selectInput(SNMP_ACCESS, cur);
+      const curView = c && c.view && c.view !== '\u2014' ? c.view : '';
+      const viewOpts = [{ label: '(default for the mode)', value: '' }].concat(views.map((v) => ({ label: v, value: v })));
+      if (curView && views.indexOf(curView) === -1) viewOpts.push({ label: curView + ' (current)', value: curView });
+      const view = selectInput(viewOpts, curView);
+      sec.body.appendChild(field('Access mode', access));
+      sec.body.appendChild(field('View', view));
+      if (c) sec.body.appendChild(el('div', 'card-sub', 'To change the community string or station, delete the community and add it again.'));
+      form.appendChild(sec.sec);
 
-    const ip = textInput('', '192.168.1.50');
-    const port = textInput('162');
-    const ntype = selectInput([{ label: 'Trap', value: 'trap' }, { label: 'Inform (acknowledged)', value: 'inform' }], 'trap');
-    const version = selectInput([{ label: 'SNMPv2c', value: '2c' }, { label: 'SNMPv1', value: '1' }, { label: 'SNMPv3', value: '3' }], '2c');
-    // Community is a dropdown of the communities that exist on the switch.
-    let commNames = [];
-    try { const cj = await snmpCfgPost(s, 'communities'); if (cj.ok) commNames = (cj.communities || []).map((c) => c.community).filter(Boolean); } catch (e) {}
-    const community = selectInput(commNames.length
-      ? commNames.map((c) => ({ label: c, value: c }))
-      : [{ label: '(no communities found)', value: '' }], commNames[0] || '');
-    const user = textInput('', 'existing SNMPv3 user');
-    const level = selectInput([{ label: 'authPriv', value: 'authPriv' }, { label: 'authNoPriv', value: 'authNoPriv' }, { label: 'noAuthNoPriv', value: 'noAuthNoPriv' }], 'authPriv');
-    const timeout = textInput('15'); const retries = textInput('3');
-
-    const grid = el('div', 'snmp-form-grid');
-    grid.appendChild(snmpField('Recipient IPv4 address', ip));
-    grid.appendChild(snmpField('UDP port', port));
-    grid.appendChild(snmpField('Notification type', ntype));
-    grid.appendChild(snmpField('Version', version));
-    const commField = snmpField('Community sent in notifications', community);
-    const userField = snmpField('SNMPv3 user (must exist on switch)', user);
-    const levelField = snmpField('Security level', level);
-    const toField = snmpField('Inform timeout (s)', timeout);
-    const rtField = snmpField('Inform retries', retries);
-    grid.appendChild(commField); grid.appendChild(userField); grid.appendChild(levelField);
-    grid.appendChild(toField); grid.appendChild(rtField);
-    form.appendChild(grid);
-
-    function sync() {
-      const v3 = version.value === '3';
-      const inform = ntype.value === 'inform';
-      commField.style.display = v3 ? 'none' : '';
-      userField.style.display = v3 ? '' : 'none';
-      levelField.style.display = v3 ? '' : 'none';
-      toField.style.display = inform ? '' : 'none';
-      rtField.style.display = inform ? '' : 'none';
-    }
-    version.addEventListener('change', sync); ntype.addEventListener('change', sync); sync();
-
-    const actions = el('div', 'snmp-form-actions');
-    const preview = el('button', 'btn btn-small btn-blue', 'Apply');
-    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
-      cancel.addEventListener('click', () => { if (onCancel) onCancel(); else dismissHost(host); });
-    withConfirm(preview, () => {
-      const cfg = { ip: ip.value.trim(), port: port.value.trim(), ntype: ntype.value, version: version.value };
-      if (version.value === '3') { cfg.user = user.value.trim(); cfg.level = level.value; }
-      else cfg.community = community.value;
-      if (ntype.value === 'inform') { cfg.timeout = timeout.value; cfg.retries = retries.value; }
-      snmpPreview(s, host, 'recipient-add-preview', 'recipient-add-apply', { cfg }, 'Add recipient ' + cfg.ip, preview, 'recipients');
+      const { actions, apply, msg } = applyActions(c ? 'Save' : 'Add community');
+      apply.addEventListener('click', (ev) => {
+        clear(msg);
+        const community = c ? c.community : name.value.trim();
+        if (!community) { msg.appendChild(el('div', 'sw-err', 'Enter a community string.')); return; }
+        if (!c && comms.some((x) => x.community === community)) { msg.appendChild(el('div', 'sw-err', 'A community named \u201c' + community + '\u201d already exists.')); return; }
+        const cfg = { community, access: access.value, view: view.value };
+        if (c) snmpSubmit(s, ev, msg, 'Save community', 'Saving\u2026', 'community-modify-apply', { cfg }, ['communities'], close);
+        else snmpSubmit(s, ev, msg, 'Add community', 'Adding\u2026', 'community-add-apply', { cfg }, ['communities'], close);
+      });
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+      if (!c) name.focus();
     });
-    actions.appendChild(preview); actions.appendChild(cancel);
-    form.appendChild(actions);
-    host.appendChild(form); host.scrollIntoView({ block: 'nearest' });
-    ip.focus();
   }
 
-  // ---- Add community (inline form) ----
-  // Edit a community: all fields shown, but only access mode and view are
-  // editable — the others are greyed out (read-only) because only the VACM
-  // access row can be meaningfully changed over SNMP.
-  async function editSnmpCommunity(s, c, host, onCancel) {
-    const form = el('div', 'snmp-form');
-    form.appendChild(el('h5', '', 'Edit community ' + c.community));
-    form.appendChild(el('p', 'intro', 'Only the access mode and view can be changed. The community string and allowed stations are fixed — to change those, delete and re-add the community.'));
-    // Community string — shown, disabled.
-    const nameRO = textInput(c.community); nameRO.disabled = true;
-    const station = textInput(c.station || 'any'); station.disabled = true;
-    const access = selectInput([{ label: 'Read Only', value: 'read-only' }, { label: 'Read Write', value: 'read-write' }, { label: 'SNMP Admin', value: 'snmp-admin' }],
-      /write/i.test(c.access || '') ? (/admin/i.test(c.access || '') ? 'snmp-admin' : 'read-write') : 'read-only');
-    const views = await viewOptions(s);
-    const view = selectInput([{ label: '(default for the mode)', value: '' }].concat(views.map((v) => ({ label: v, value: v }))),
-      (c.view && c.view !== '\u2014') ? c.view : '');
-    const grid = el('div', 'snmp-form-grid');
-    grid.appendChild(snmpField('Community string', nameRO));
-    grid.appendChild(snmpField('Station', station));
-    grid.appendChild(snmpField('Access mode', access));
-    grid.appendChild(snmpField('View', view));
-    form.appendChild(grid);
-    const actions = el('div', 'snmp-form-actions');
-    const preview = el('button', 'btn btn-small btn-blue', 'Apply');
-    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
-    cancel.addEventListener('click', () => { if (onCancel) onCancel(); });
-    withConfirm(preview, () => {
-      snmpPreview(s, host, 'community-modify-preview', 'community-modify-apply',
-        { cfg: { community: c.community, access: access.value, view: view.value } },
-        'Modify community \u201C' + c.community + '\u201D', preview, 'communities');
-    });
-    actions.appendChild(preview); actions.appendChild(cancel);
-    form.appendChild(actions);
-    host.appendChild(form);
-  }
-
-  async function addSnmpCommunity(s, host, onCancel) {
-    clear(host);
-    const form = el('div', 'snmp-form');
-    form.appendChild(el('h5', '', 'Add SNMP community'));
-    form.appendChild(el('p', 'intro', "Adds a community with its VACM group rows and the matched IPv4 + IPv6 manager-binding rows, exactly the way the switch's own Community page does. Pick an access mode and, optionally, a specific view (loaded from the switch; leave as the mode default)."));
-    const name = textInput('', 'community string');
-    const access = selectInput([{ label: 'Read Only', value: 'read-only' }, { label: 'Read Write', value: 'read-write' }, { label: 'SNMP Admin', value: 'snmp-admin' }], 'read-only');
-    const views = await viewOptions(s);
-    const view = selectInput([{ label: '(default for the mode)', value: '' }].concat(views.map((v) => ({ label: v, value: v }))), '');
-    const grid = el('div', 'snmp-form-grid');
-    grid.appendChild(snmpField('Community string', name));
-    grid.appendChild(snmpField('Access mode', access));
-    grid.appendChild(snmpField('View', view));
-    form.appendChild(grid);
-    const actions = el('div', 'snmp-form-actions');
-    const preview = el('button', 'btn btn-small btn-blue', 'Apply');
-    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
-      cancel.addEventListener('click', () => { if (onCancel) onCancel(); else dismissHost(host); });
-    withConfirm(preview, () => {
-      if (!name.value.trim()) { snmpFormMsg(host, 'bad', 'Enter a community string.'); return; }
-      snmpPreview(s, host, 'community-add-preview', 'community-add-apply',
-        { cfg: { community: name.value.trim(), access: access.value, view: view.value } },
-        'Add community \u201C' + name.value.trim() + '\u201D', preview, 'communities');
-    });
-    actions.appendChild(preview); actions.appendChild(cancel);
-    form.appendChild(actions);
-    host.appendChild(form); host.scrollIntoView({ block: 'nearest' }); name.focus();
-  }
-
-  // ---- group view grid (shared by add + edit) ----
-  async function viewOptions(s) {
-    let views = [];
-    try { const j = await snmpCfgPost(s, 'views'); if (j.ok) views = j.views || []; } catch (e) {}
-    return views;
-  }
-  function viewSelect(views, current) {
+  // ---- Add / edit group ----
+  // A group sets the Read / Write / Notify view for each security level: one
+  // row of three view pickers per level.
+  function snmpViewSelect(views, current) {
     const opts = [{ label: '(none)', value: '' }].concat(views.map((v) => ({ label: v, value: v })));
-    if (current && !views.includes(current)) opts.push({ label: current + ' (current)', value: current });
+    if (current && views.indexOf(current) === -1) opts.push({ label: current + ' (current)', value: current });
     return selectInput(opts, current || '');
   }
-  function groupLevelGrid(views, existing) {
-    // returns { table, read(level), write(level), notify(level) accessors }
-    const table = el('table', 'snmp-view-table');
-    const thead = el('thead'); const htr = el('tr');
-    ['Security level', 'Read view', 'Write view', 'Notify view'].forEach((h) => htr.appendChild(el('th', '', h)));
-    thead.appendChild(htr); table.appendChild(thead);
-    const tb = el('tbody');
+  function snmpLevelGrid(views, existing) {
+    const wrap = el('div', 'snmp-levels');
     const cells = {};
-    const levels = [['noAuthNoPriv', 'No Authentication'], ['authNoPriv', 'Authentication'], ['authPriv', 'Privacy']];
-    for (const [key, label] of levels) {
+    for (const [key, label] of [['noAuthNoPriv', 'No authentication'], ['authNoPriv', 'Authentication'], ['authPriv', 'Authentication and privacy']]) {
       const lv = (existing || {})[key] || {};
-      const tr = el('tr');
-      const lc = el('td');
-      lc.appendChild(el('div', 'snmp-lvl-label', label));
-      lc.appendChild(el('div', 'snmp-lvl-sub', key));
-      tr.appendChild(lc);
-      const rSel = viewSelect(views, lv.read), wSel = viewSelect(views, lv.write), nSel = viewSelect(views, lv.notify);
-      [rSel, wSel, nSel].forEach((sel) => { const td = el('td'); td.appendChild(sel); tr.appendChild(td); });
-      cells[key] = { read: rSel, write: wSel, notify: nSel };
-      tb.appendChild(tr);
+      wrap.appendChild(el('div', 'snmp-lvl-label', label));
+      const row = el('div', 'snmp-lvl-row');
+      const sels = { read: snmpViewSelect(views, lv.read), write: snmpViewSelect(views, lv.write), notify: snmpViewSelect(views, lv.notify) };
+      row.appendChild(field('Read', sels.read));
+      row.appendChild(field('Write', sels.write));
+      row.appendChild(field('Notify', sels.notify));
+      wrap.appendChild(row);
+      cells[key] = sels;
     }
-    table.appendChild(tb);
-    return { table, cells };
+    const levels = () => {
+      const out = {};
+      for (const k of Object.keys(cells)) out[k] = { read: cells[k].read.value, write: cells[k].write.value, notify: cells[k].notify.value };
+      return out;
+    };
+    return { node: wrap, levels };
   }
-  function collectLevels(cells) {
-    const levels = {};
-    for (const key of Object.keys(cells)) {
-      levels[key] = { read: cells[key].read.value, write: cells[key].write.value, notify: cells[key].notify.value };
-    }
-    return levels;
-  }
+  function openSnmpGroupForm(s, groupName) {
+    const groups = (s._snmp.data.groups && s._snmp.data.groups.groups) || [];
+    const g = groupName ? groups.find((x) => x.group === groupName) : null;
+    if (groupName && !g) return;
+    snmpForm(s, g ? 'Group \u00b7 ' + g.group : 'Add SNMPv3 group', 'Group', (pane, close) => {
+      const form = el('div', 'snmp-form acl-form');
+      let name = null;
+      if (!g) {
+        const id = formSection('Group');
+        name = textInput('', 'group name');
+        id.body.appendChild(field('Group name', name));
+        form.appendChild(id.sec);
+      }
+      const vs = formSection('Views by security level');
+      vs.body.classList.add('acl-stack');
+      vs.body.appendChild(el('div', 'card-sub', g
+        ? 'Setting all three views of a level to (none) removes that level from the group.'
+        : 'Leave a level\u2019s views as (none) to leave that level out of the group.'));
+      const grid = snmpLevelGrid(snmpView(s), g ? (g.views || {}) : { authPriv: { read: 'DefaultSuper', notify: 'DefaultSuper' } });
+      vs.body.appendChild(grid.node);
+      form.appendChild(vs.sec);
 
-  // ---- Add group (inline form with view grid) ----
-  async function addSnmpGroup(s, host, onCancel) {
-    clear(host);
-    const form = el('div', 'snmp-form');
-    form.appendChild(el('h5', '', 'Add SNMPv3 group'));
-    form.appendChild(el('p', 'intro', "A group sets Read / Write / Notify views per security level, like the switch's Groups page. Leave a level's views as (none) to not configure it. Views load from the switch."));
-    const name = textInput('', 'group name');
-    const grid = el('div', 'snmp-form-grid'); grid.appendChild(snmpField('Group name', name));
-    form.appendChild(grid);
-    const views = await viewOptions(s);
-    const { table, cells } = groupLevelGrid(views, { authPriv: { read: 'DefaultSuper', notify: 'DefaultSuper' } });
-    const tw = el('div', 'tablewrap'); tw.appendChild(table); form.appendChild(tw);
-    const actions = el('div', 'snmp-form-actions');
-    const preview = el('button', 'btn btn-small btn-blue', 'Apply');
-    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
-      cancel.addEventListener('click', () => { if (onCancel) onCancel(); else dismissHost(host); });
-    withConfirm(preview, () => {
-      if (!name.value.trim()) { snmpFormMsg(host, 'bad', 'Enter a group name.'); return; }
-      snmpPreview(s, host, 'group-add-preview', 'group-add-apply',
-        { cfg: { group: name.value.trim(), levels: collectLevels(cells) } }, 'Add group \u201C' + name.value.trim() + '\u201D', preview, 'groups');
+      const { actions, apply, msg } = applyActions(g ? 'Save' : 'Add group');
+      apply.addEventListener('click', (ev) => {
+        clear(msg);
+        const group = g ? (g.key && g.key.display) || g.group : name.value.trim();
+        if (!group) { msg.appendChild(el('div', 'sw-err', 'Enter a group name.')); return; }
+        if (!g && groups.some((x) => x.group === group)) { msg.appendChild(el('div', 'sw-err', 'A group named \u201c' + group + '\u201d already exists.')); return; }
+        const cfg = { group, levels: grid.levels() };
+        if (g) snmpSubmit(s, ev, msg, 'Save group', 'Saving\u2026', 'group-modify-apply', { cfg }, ['groups'], close);
+        else snmpSubmit(s, ev, msg, 'Add group', 'Adding\u2026', 'group-add-apply', { cfg }, ['groups'], close);
+      });
+      form.appendChild(actions); form.appendChild(msg);
+      pane.appendChild(form);
+      if (name) name.focus();
     });
-    actions.appendChild(preview); actions.appendChild(cancel);
-    form.appendChild(actions);
-    host.appendChild(form); host.scrollIntoView({ block: 'nearest' }); name.focus();
   }
-
-  // ---- Edit group views (inline form with view grid, prefilled) ----
-  async function editSnmpGroup(s, g, host, onCancel) {
-    const form = el('div', 'snmp-form');
-    form.appendChild(el('h5', '', 'Edit views for group ' + g.group));
-    form.appendChild(el('p', 'intro', "Change the Read / Write / Notify view for each security level. Clearing all three of a level removes that level's access row. Levels you don't change are left as-is."));
-    const views = await viewOptions(s);
-    const { table, cells } = groupLevelGrid(views, g.views || {});
-    const tw = el('div', 'tablewrap'); tw.appendChild(table); form.appendChild(tw);
-    const actions = el('div', 'snmp-form-actions');
-    const preview = el('button', 'btn btn-small btn-blue', 'Apply');
-    const cancel = el('button', 'btn btn-small secondary', 'Cancel');
-    cancel.addEventListener('click', () => { if (onCancel) onCancel(); });
-    withConfirm(preview, () => {
-      snmpPreview(s, host, 'group-modify-preview', 'group-modify-apply',
-        { cfg: { group: g.key.display || g.group, levels: collectLevels(cells) } }, 'Modify group \u201C' + g.group + '\u201D', preview, 'groups');
-    });
-    actions.appendChild(preview); actions.appendChild(cancel);
-    form.appendChild(actions);
-    host.appendChild(form);
-  }
-
 
   function offerSetup(s) {
     s.setupIntro.textContent = 'Connected to ' + (s.host || 'the switch') +

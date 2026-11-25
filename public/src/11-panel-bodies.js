@@ -28,7 +28,7 @@
   function paintBuiltin(s, key, body, p) {
     // SNMP configuration does not depend on a health collection, so it is
     // handled before the "no data yet" gate the health panels sit behind.
-    if (key === 'snmpcfg') { paintSnmpPanel(s, body); return; }
+    if (key === 'snmpcfg') { paintSnmpPanel(s, body, p); return; }
     if (key === 'acl') { paintAclPanel(s, body, p); return; }
     if (key === 'routing') { paintRoutingPanel(s, body, p); return; }
     if (key === 'vlans') { paintVlanPanel(s, body, p); return; }
@@ -1382,7 +1382,7 @@
     for (const [key, label, oid, value] of defs) {
       const inp = textInput(value);
       inputs[key] = { inp, oid, current: value, label };
-      grid.appendChild(snmpField(label, inp));
+      grid.appendChild(field(label, inp));
     }
     form.appendChild(grid);
     const msg = el('div'); form.appendChild(msg);

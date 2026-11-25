@@ -8,7 +8,7 @@
   // has no mounted keyed tables yet (caller should fall back to a full repaint).
   // panelIsConverted lists the keys that use keyed tables for every table they
   // render; a converted panel is safe to reconcile without a full repaint.
-  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl']);   // filled in as each is converted
+  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg']);   // filled in as each is converted
   // A converted panel may still have unkeyed sections (auth's AAA servers). When
   // a refresh changes a table those read, full-repaint instead of reconciling.
   const PANEL_FULL_REPAINT_TABLES = {

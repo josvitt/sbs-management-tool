@@ -273,10 +273,11 @@ helpers, following Part B yields correct visuals automatically.
 
 ## B1. Module families
 
-There are three, by how their data is sourced. All three obey the same VISUAL rules
+There are four, by how their data is sourced. All of them obey the same VISUAL rules
 (Part A) and the same WRITE rules (§B6) — those are universal. They differ only in
-the data/refresh mechanism (§B4–§B5), and §B2–§B3 (keyed paint + `mountKeyedTable`)
-apply fully only to families (a) and (b).
+the data/refresh mechanism (§B4–§B5). §B2–§B3 (keyed paint + `mountKeyedTable`)
+apply fully to families (a), (b) and (b2); only the two unconverted modules in (c)
+still rebuild themselves.
 
 **(a) Health-data panels** — render from tables in the periodic SNMP walk (summary,
 metrics, hardware, interfaces, auth, connected, stp). A `case` in `paintBuiltin`.
@@ -288,14 +289,18 @@ paint fn dispatched before the switch. **routing (the IPv4 Addressing panel), vl
 acl.** This is the preferred
 pattern for any NEW interactive module, and §B2–§B6 describe it in full.
 
-**(c) Self-managed config modules** — **snmpcfg, capture, flash.** These own their
-data pipeline: a dedicated server endpoint (`/api/snmp-config`, `/api/flash`,
-`/api/capture`), their own loader (`loadSnmpPanel`, …) and their own repaint, loaded
-lazily (on first open, then refreshed on the normal cycle and in place on write) —
-NOT through `health.js`/`refreshTables`/`mountKeyedTable`.
+**(b2) Keyed panels with their own loader** — **snmpcfg.** Rendered exactly like
+family (b): a `paintXPanel(s, body, p)` that follows §B2, `mountInto` tables with
+stable keys, counts and notes in stable nodes, registered in `KEYED_PANELS`, and
+reconciled in place after a load or a write. The only difference is where the rows
+come from: the module's own loader (`snmpLoad`) reads a server endpoint
+(`/api/snmp-config`) instead of `health.js` tables, keeps the replies on the session
+(`s._snmp.data`), and calls `reconcilePanelInPlace` (falling back to `repaintPanel`)
+when they land. Its `PANEL_TABLE_DEPS` entry is `[]` so no table refresh repaints it,
+and `refreshPanel` re-runs its loader for the panel's Refresh button.
 
-**When family (c) is justified — the two tests.** A module earns family (c) only if
-it meets AT LEAST ONE of these, and the choice is documented:
+**When a module may have its own loader — the two tests.** A module gets its own
+loader only if it meets AT LEAST ONE of these, and the choice is documented:
 1. **Computed/server-side data.** The data is not a flat SNMP table the client can
    walk — it is a computed view that joins many tables or runs a probe/check on the
    server (snmpcfg's VACM model: a "community" row is synthesized from the Cisco
@@ -310,77 +315,49 @@ it meets AT LEAST ONE of these, and the choice is documented:
    modules on the periodic walk" is not an option for it, by the pps rule, not by
    preference.
 
-A NEW module prefers family (b). It uses family (c) only when it passes a test above,
-and then it still behaves identically to a keyed panel (loads lazily but refreshes on
-the cycle, writes refresh in place — never a whole-module reload). Being "self-managed"
-describes only WHERE the fetch lives; it is never visible to the user as different
-behaviour.
+Such a module still loads like an on-demand keyed panel (§B4): once per visit, with
+an in-flight guard and a 30-second timestamp, "Waiting for data…" until the first
+reply (the first data arriving is structural), and the server reads run one after
+another, not in parallel. **A write re-reads only the sections it changed** and then
+reconciles (`snmpRefresh(s, ['communities'])`), never the whole module: a whole-module
+reload on a single create/delete was the old failure mode (6 serial fetches for one
+community change). A change in what the credential may do (full / read-only /
+limited) changes the panel's layout, so it is structural too.
 
-**ACL is NOT family (c) — it is a keyed panel (b).** Its three tables
+**ACL is NOT a module with its own loader — it is a keyed panel (b).** Its three tables
 (`QOS_ACL.name/aceTidx/tuple`) are plain `getbulk` walks, its join is purely
 client-side, and its load costs ~6 PDUs (~12-packet burst — negligible). It fails
-both family-(c) tests: the data is flat-walkable and the cost is trivial. So ACL's
+both tests: the data is flat-walkable and the cost is trivial. So ACL's
 tables are declared in `health.js` (raw + onDemand, §B4), its join is one function
 (`aclModel(h)`) that the paint, the write paths and the port/VLAN binding editor all
 read, and its paint follows §B2 like VLANs: `mountInto` tables keyed by
 `ace:<acl>.<rule>`, per-list rule counts and the Delete-ACL lock refreshed in place,
 and `PANEL_TABLES.acl` so the panel's Refresh re-reads only its own tables. Having multiple tables/sections in one panel is NOT a reason
-for family (c): routing and vlans are keyed panels with 5+ tables each. The only
-family-(c) criteria are the two tests above.
+for a module of its own: routing and vlans are keyed panels with 5+ tables each. The only
+criteria are the two tests above.
 
-**Why the self-managed PATTERN lives in helpers, not in `health.js`.** It is
-tempting to teach `health.js` to produce computed/joined views so family (c)'s data
-could run through it too. Do NOT: the defining trait of `health.js` is "runs
-periodically for everyone", and the defining constraint of a genuine family-(c)
-module (snmpcfg) is "must NOT run periodically" (test 2) — those are incompatible,
-and snmpcfg's probe/check logic is imperative, not a declarative view producer. The
-reuse benefit — a standard way to do "fetch several things, compute, render several
-sections, refresh one in place on write" — is delivered through the family-(c)
-helpers (`selfManagedRender`, `selfManagedReload`, per-section reload like
-`reloadSnmpSection`, `plainTable`), which a future computed-view module composes.
-Reuse comes from the helpers; it does not come from moving server-computed logic
-onto the periodic timer.
+**(c) Self-managed modules** — **capture, flash.** These own their data pipeline
+(`/api/capture`, `/api/flash`) AND still their own rebuild: they have not been
+converted to the keyed paint yet, so they are the only modules that use the two
+legacy helpers below. A conversion moves them to (b2).
 
-Even so, family (c) shares the RENDER and REFRESH machinery through two helpers, so
-it is not a separate world — only its data source differs:
+- **Tables** — `plainTable(s, cols, rows)` (a thin keyed-render wrapper with
+  position keys: `rows` are arrays of cells, each a string or a DOM node such as an
+  `actGroup`), NOT a hand-built `<table>`. A handful of read-only, one-shot or
+  live-append display tables elsewhere — the tech-support parse output, the OID
+  results grid, the syslog stream, the dot1x trap matrix — deliberately stay as
+  hand-built `<table>` elements with the shared `data-table` class; nothing
+  reconciles them.
+- **Refresh** — the render runs inside `selfManagedRender(s, renderFn)`, which
+  captures scroll before `renderFn` clears+rebuilds and restores it after (standard
+  A7). The loader is awaited via `selfManagedReload(s, loaderFn)` (or by returning
+  its promise), so a write's `runButtonAction` `settle` holds the spinner until the
+  reload has actually repainted.
 
-- **Tables** — a self-managed module renders every *interactive or reconciling* data
-  table with `plainTable(s, cols, rows)` (a thin keyed-render wrapper: `rows` are
-  arrays of cells, each cell a string or a DOM node such as an `actGroup`), NOT a
-  hand-built `<table>`. This gives it the same cell-diffing, styling, and action-cell
-  handling as the keyed panels. The scope is tables with rows the user acts on or
-  that re-render on a refresh (SNMP users/communities, flash files, captures). A handful of read-only, one-shot or live-append display tables
-  elsewhere — the tech-support parse output, the OID results grid, the syslog stream,
-  the dot1x trap matrix, the SNMP view grid — deliberately stay as hand-built
-  `<table>` elements: they already carry the shared `data-table` class (so they are
-  visually consistent), nothing reconciles them, and the cell-diffing/action-cell
-  machinery buys them nothing while the conversion carries risk. `plainTable` is the
-  rule for interactive/reconciling tables; a purely static display table may use
-  `data-table` directly. The engine's own `<table>` inside `keyedTable` is the source
-  of the pattern, not an instance of it.
-- **Refresh** — a self-managed module's render runs inside `selfManagedRender(s,
-  renderFn)`, which captures scroll before `renderFn` clears+rebuilds and restores it
-  after (standard A7), so a rebuild never jumps the page. Its loader is awaited via
-  `selfManagedReload(s, loaderFn)` (or simply by returning the async loader's
-  promise), so a write's `runButtonAction` `settle` holds the spinner until the
-  reload has actually repainted — the same guarantee `refreshTables` gives family (b).
-
-Obligations, then: VISUAL rules (Part A) in full; WRITE rules (§B6) in full
-(`snmpSet`/`snmpSetResult`, `runButtonAction`, `markConfigDirty`, shared index
-helpers); tables via `plainTable`; refresh wrapped in `selfManagedRender` and awaited
-so the spinner holds. The only thing family (c) does differently from (b) is *where
-the rows come from* — never *how they are rendered or how scroll/spinners behave*.
-
-**A write refreshes ONLY the section it changed, never the whole module.** A
-whole-module reload (re-fetching every section) on a single create/delete is the
-family-(c) failure mode: snmpcfg's reload was 6 serial fetches for one community
-change. Each section renders into a stable wrapper node kept on the module's state;
-a write's `settle` re-fetches and re-renders just that section's wrapper
-(`reloadSnmpSection(s, which)` is the pattern — re-fetch one section's data, replace
-its wrapper via `selfManagedRender`, optionally refresh a dependent section like a
-target-integrity banner). This matches how a keyed panel reconciles only the tables
-whose data changed. A full reload is allowed only as a cold-start fallback (the panel
-hasn't rendered its wrappers yet).
+Obligations for every module, whatever its family: VISUAL rules (Part A) in full;
+WRITE rules (§B6) in full (`snmpSet`/`snmpSetResult` or the module's one write
+helper, `runButtonAction`, `markConfigDirty`, shared index helpers); a write's
+`settle` returns the promise of the re-read so the spinner holds.
 
 ## B2. The paint function contract
 
@@ -546,8 +523,8 @@ on the periodic timer is a cost decision, not just a correctness one.
   budget, by itself).
 - **This decides family placement (§B1).** If a module's data is cheap to walk, it
   belongs on the periodic cycle (family a/b). If its load is a large burst, it stays
-  lazy (family c, test 2) — loaded on first open, refreshed on the cycle only while
-  open, and never added to the always-on walk. Do not "make it load like the other
+  lazy with its own loader (family b2, test 2) — loaded once per visit, re-read on
+  its Refresh and after its own writes, and never added to the always-on walk. Do not "make it load like the other
   modules" if that puts a heavy burst on every refresh for data the user may not be
   viewing.
 - **Large tables are `onDemand`.** A big table (the full route table, a per-port walk
@@ -583,7 +560,7 @@ on the periodic timer is a cost decision, not just a correctness one.
   deviation (rule 8). **Compose with a confirm** the established way — a two-tap
   confirm wraps a handler that calls `runButtonAction`:
   `withConfirm(btn, (e) => runButtonAction(e.currentTarget, { … }))` (what
-  `actBtnConfirm` does, and the interface-settings and snmpcfg editors). A multi-field
+  `actBtnConfirm` does, and the interface-settings editor). A multi-field
   editor's `run` performs the whole ordered batch and returns `{ ok, failures }`; its
   `settle` does the computed re-read; detailed per-field errors may go to the form's
   own message line via `error` rather than a toast.
@@ -656,10 +633,11 @@ on the periodic timer is a cost decision, not just a correctness one.
 | Reconcile one panel's keyed tables in place | `reconcilePanelInPlace(s, p)` |
 | Build/diff a data table | `mountKeyedTable(s, p, id, cols, rows, opts)` |
 | Place a table (multi-table panels) | `mountInto(container, s, p, id, cols, rows, opts)` |
-| Render a table in a self-managed module | `plainTable(s, cols, rows)` |
+| Render a table in a self-managed module (capture, flash only) | `plainTable(s, cols, rows)` |
 | Preserve scroll around a self-managed rebuild | `selfManagedRender(s, renderFn)` |
 | Await a self-managed loader (settle) | `selfManagedReload(s, loaderFn)` |
-| Refresh one section in place (family c) | per-section reload, e.g. `reloadSnmpSection(s, which)` |
+| Load / re-read one section of a module with its own loader (b2) | `snmpLoad(s)`, `snmpRefresh(s, sections)` |
+| A text input / a select from `[{label, value}]` | `textInput(value, placeholder)`, `selectInput(options, value)` |
 | ~~Old button lifecycle — REMOVED~~ | `beginApply` / `resetApply` deleted (no callers); `flashButtonOk` is now internal to `runButtonAction` only → always use `runButtonAction` |
 | Wrap existing cell arrays as keyed rows | `keyedRowsFrom(cells, rows, keyFn)` |
 | Write SNMP (throws) | `snmpSet(s, vb)` |

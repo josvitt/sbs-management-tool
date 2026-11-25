@@ -2,6 +2,24 @@
   // 09-aaa.js: 802.1X global settings and AAA (RADIUS/TACACS+) servers.
   // =================================================================
 
+  // Open an inline editor directly under a table row (the AAA server edit).
+  // Returns the host <div> inside a full-width cell. Any existing inline editor
+  // is closed first.
+  function openRowEditor(tr, colspan) {
+    closeRowEditors(tr.closest('table'));
+    const editTr = el('tr', 'snmp-edit-row');
+    const td = el('td'); td.colSpan = colspan;
+    const host = el('div', 'snmp-edit-host');
+    td.appendChild(host); editTr.appendChild(td);
+    tr.insertAdjacentElement('afterend', editTr);
+    host.scrollIntoView({ block: 'nearest' });
+    return host;
+  }
+  function closeRowEditors(scope) {
+    const root = scope || document;
+    root.querySelectorAll('.snmp-edit-row').forEach((r) => r.remove());
+  }
+
   // AAA server inventory (RADIUS + TACACS+) for the Authentication panel. Each
   // server is one summary row with an expander revealing the deep detail:
   // timeouts/retries/deadtime, shared-key status, and (RADIUS) the full RFC

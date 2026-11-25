@@ -1156,7 +1156,10 @@
     connected: ['macTable', 'interfaces', 'bridgePorts', 'dot1xHosts'],
     stp: ['stpPorts', 'stpExtPorts', 'interfaces', 'bridgePorts', 'mstpPorts'],
     routing: ['sviAddrs', 'interfaces', 'vlans', 'portL2L3', 'routeTable', 'staticRoutes', 'dnsDomains', 'dnsServersV2', 'dnsHosts', 'scalars'],
-    acl: ['aclNames', 'aclAces', 'aclTuples']
+    acl: ['aclNames', 'aclAces', 'aclTuples'],
+    // SNMP configuration has its own loader (17-snmp-config.js); no health
+    // table feeds it, so a table refresh never repaints it.
+    snmpcfg: []
   };
   function panelDependsOn(key, changedTables) {
     const deps = PANEL_TABLE_DEPS[key];
@@ -1194,7 +1197,7 @@
 
   // ---- Self-managed module refresh (standard B1 family (c), B5) ----
   // The keyed-panel modules refresh through refreshTables, which preserves scroll
-  // for them. The self-managed config modules (acl, snmpcfg, capture, flash) own
+  // for them. The self-managed config modules (capture, flash) own
   // their own fetch + DOM rebuild, so each one used to hand-roll the same
   // "capture scroll, clear, rebuild, restore scroll" dance - and each was a place
   // the scroll-preservation fix had to be applied separately. These two helpers
@@ -1440,6 +1443,13 @@
     // Interactive, write-driven panels don't come from the health poll; a
     // refresh just re-paints them rather than walking the whole switch.
     if (p.key === 'capture' || p.key === 'flash') { if (p._body) paintPanelBody(s, p); return; }
+    // SNMP configuration re-runs its own loader (a server-computed view, not
+    // health tables) and reconciles in place.
+    if (p.key === 'snmpcfg') {
+      if (btn) { btn.disabled = true; btn.classList.add('spin'); }
+      snmpLoad(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });
+      return;
+    }
 
     const tables = PANEL_TABLES[p.key];
     if (!tables) { loadHealth(s); return; }   // whole-switch panel
