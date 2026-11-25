@@ -121,7 +121,7 @@ async function main() {
     const r = await post('/api/system/sntp/add', { address });
     const s = await status();
     const row = s.time.servers.find((x) => x.address === address);
-    check('add SNTP server ' + address, r.httpOk && !!row, r.error || (row ? 'polled ' + row.polled + ', status ' + row.status : 'not listed'));
+    check('add SNTP server ' + address, r.httpOk && !!row, r.error || (row ? 'form "' + r.shape + '", polled ' + row.polled + ', status ' + row.status : 'not listed'));
     const rm = await post('/api/system/sntp/remove', { address });
     const s2 = await status();
     check('remove SNTP server ' + address, rm.httpOk && !s2.time.servers.some((x) => x.address === address), rm.error || '');
@@ -161,16 +161,20 @@ async function main() {
       const r = await post('/api/system/user/add', { name, password: pw, privilege: 1 });
       let s = await status();
       let u = s.users.list.find((x) => x.name === name);
-      check('add user sbstest with privilege 1', r.httpOk && u && u.privilege === 1, r.error || (u ? 'privilege ' + u.privilege : 'not listed'));
-      if (u && loginCheck) {
+      check('add user sbstest with privilege 1', r.httpOk && u && u.privilege === 1, r.error || (u ? 'password form "' + r.passwordForm + '", privilege ' + u.privilege : 'not listed'));
+      if (!r.httpOk && !u) say('  (the add removed its own row again, as it should)');
+      if (r.httpOk && u && loginCheck) {
         say('  Sign in over SSH now: ssh ' + name + '@' + host + '  password ' + pw, true);
         await pressEnter('  Did the sign-in work? Note it, then press Enter to go on. ');
       }
+      if (!u) {
+        say('SKIP the other user steps: sbstest was not added');
+      } else {
       const pr = await post('/api/system/user/privilege', { name, privilege: 7 });
       s = await status(); u = s.users.list.find((x) => x.name === name);
       check('change its privilege to 7', pr.httpOk && u && u.privilege === 7, pr.error || (u ? 'privilege ' + u.privilege : 'not listed'));
       const pw2 = await post('/api/system/user/password', { name, password: 'Sb' + crypto.randomBytes(6).toString('hex') + '-8' });
-      check('change its password', pw2.httpOk, pw2.error || '');
+      check('change its password', pw2.httpOk, pw2.error || ('form "' + pw2.passwordForm + '"'));
       const admins = s.users.list.filter((x) => x.privilege === 15);
       if (admins.length === 1) {
         const g = await post('/api/system/user/delete', { name: admins[0].name });
@@ -180,6 +184,7 @@ async function main() {
       const del = await post('/api/system/user/delete', { name });
       s = await status();
       check('delete user sbstest', del.httpOk && !s.users.list.some((x) => x.name === name), del.error || '');
+      }
     }
   }
 

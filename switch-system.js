@@ -290,7 +290,7 @@ function setVarbinds(session, varbinds) {
 
 const I = (oid, value) => ({ oid, type: snmp.ObjectType.Integer, value });
 const OS = (oid, value) => ({ oid, type: snmp.ObjectType.OctetString, value: Buffer.from(String(value), 'utf8') });
-const ROW = { active: 1, createAndGo: 4, destroy: 6 };
+const ROW = { active: 1, createAndGo: 4, createAndWait: 5, destroy: 6 };
 
 /** Arcs for a length-prefixed string index. */
 function stringIndex(str) {
@@ -345,13 +345,36 @@ function serverIndex(address) {
 }
 
 /** Add an SNTP server, polled. */
+// Try each shape until the switch takes one; report which. A refusal is
+// not proof the feature is missing (governing rule 6), so every shape is
+// tried and every refusal is reported.
+async function firstAccepted(session, shapes) {
+  const refused = [];
+  for (const sh of shapes) {
+    try {
+      await setVarbinds(session, sh.varbinds);
+      return { shape: sh.name, refused };
+    } catch (e) {
+      refused.push(sh.name + ': ' + e.message);
+    }
+  }
+  throw new Error('The switch refused every form (' + refused.join('; ') + ').');
+}
+
+/**
+ * Add an SNTP server. On 4.1.9.92 a createAndGo that also sets the polled
+ * column is refused (InconsistentValue), so the row is created on its own
+ * first; polled defaults to true in the switch's own rows.
+ */
 async function addSntpServer(session, address) {
   const { index, kind } = serverIndex(address);
-  await setVarbinds(session, [
-    I(SNTP_SERVERS + '.3.' + index, 1),
-    I(SNTP_SERVERS + '.10.' + index, ROW.createAndGo)
+  const status = SNTP_SERVERS + '.10.' + index;
+  const r = await firstAccepted(session, [
+    { name: 'createAndGo', varbinds: [I(status, ROW.createAndGo)] },
+    { name: 'createAndWait then active', varbinds: [I(status, ROW.createAndWait)] }
   ]);
-  return { added: String(address).trim(), kind };
+  if (r.shape === 'createAndWait then active') await setVarbinds(session, [I(status, ROW.active)]);
+  return { added: String(address).trim(), kind, shape: r.shape };
 }
 
 async function removeSntpServer(session, address) {
@@ -401,23 +424,51 @@ async function guardLastAdmin(session, name) {
   }
 }
 
-/** Add a user. The password goes as clear text ("$" prefix, per the MIB). */
+const PW_SET = V + '.79.68.1';   // rlAAALocalUserPasswordVerificationAndSettingTable
+
+/**
+ * The forms tried for setting a password. On 4.1.9.92 the "$" clear-text
+ * form the MIB describes is refused with CommitFailed, so the plain text
+ * and the separate setting table (new password and its confirmation) are
+ * tried too; the one the switch takes is reported.
+ */
+function passwordShapes(name, password) {
+  const idx = stringIndex(name);
+  return [
+    { name: 'plain text', varbinds: [OS(userOid(2, name), password)] },
+    { name: 'setting table', varbinds: [
+      OS(PW_SET + '.3.' + idx, password),
+      OS(PW_SET + '.4.' + idx, password)
+    ] },
+    { name: '$ clear text', varbinds: [OS(userOid(2, name), '$' + password)] }
+  ];
+}
+
+/**
+ * Add a user: create the row, set the password, then the privilege.
+ * If no password form is taken, the new row is removed again.
+ */
 async function addUser(session, name, password, privilege) {
   const n = checkUserName(name), p = checkPassword(password), pr = checkPrivilege(privilege);
   const existing = await readUsers(session);
   if (existing.some((u) => u.name === n)) throw new Error('There is already a user called ' + n + '.');
-  await setVarbinds(session, [
-    OS(userOid(2, n), '$' + p),
-    I(userOid(3, n), pr),
-    I(userOid(4, n), ROW.createAndGo)
-  ]);
-  return { added: n, privilege: pr };
+  // Created at privilege 1 and raised only once the password is set, so a
+  // row left behind by a failure can never be an admin without a password.
+  await setVarbinds(session, [I(userOid(3, n), 1), I(userOid(4, n), ROW.createAndGo)]);
+  try {
+    const r = await firstAccepted(session, passwordShapes(n, p));
+    if (pr !== 1) await setVarbinds(session, [I(userOid(3, n), pr)]);
+    return { added: n, privilege: pr, passwordForm: r.shape };
+  } catch (e) {
+    try { await setVarbinds(session, [I(userOid(4, n), ROW.destroy)]); } catch (e2) { /* reported below */ }
+    throw new Error('The user was not added: ' + e.message);
+  }
 }
 
 async function setUserPassword(session, name, password) {
   const n = checkUserName(name), p = checkPassword(password);
-  await setVarbinds(session, [OS(userOid(2, n), '$' + p)]);
-  return { user: n };
+  const r = await firstAccepted(session, passwordShapes(n, p));
+  return { user: n, passwordForm: r.shape };
 }
 
 async function setUserPrivilege(session, name, privilege) {
