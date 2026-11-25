@@ -23,6 +23,10 @@
  *                   image slot. Use the version the switch already runs
  *                   unless you mean to upgrade: the old inactive image is
  *                   overwritten.
+ *   --save-first    saves running to startup before the round trip (the
+ *                   owner's choice, on the test switch only), so startup
+ *                   starts as a known copy and a rewritten one can be put
+ *                   back by saving again.
  *   --diff-only     writes nothing: reads running and startup and prints
  *                   where they differ, as line numbers and each line's
  *                   first word only (never whole lines, which can hold
@@ -47,6 +51,7 @@ const imageAt = args.indexOf('--image');
 const imagePath = imageAt > 0 ? args[imageAt + 1] : null;
 const doReboot = args.includes('--reboot');
 const diffOnly = args.includes('--diff-only');
+const saveFirst = args.includes('--save-first');
 const outDir = args.filter((a, i) => i > 0 && !a.startsWith('--') && i !== imageAt + 1)[0] || null;
 const community = process.env.SBS_COMM;
 if (!host || !community || (imageAt > 0 && !imagePath)) {
@@ -199,6 +204,11 @@ async function main() {
 
   // ---- 4. startup configuration round trip ----------------------------------
   let startupText = null;
+  let savedNow = saved0 === true;
+  if (saveFirst && !savedNow) {
+    const sv = await post('/api/config/sync', { target, from: 'running', to: 'startup' });
+    savedNow = check('save running to startup first (--save-first)', sv.httpOk && !sv.error && (await isSaved()) === true, sv.error || '');
+  }
   try {
     const a = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
     startupText = a.text;
@@ -208,12 +218,18 @@ async function main() {
     const b = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
     const same = maint.sameConfig(a.text, b.text);
     check('startup reads back the same', same, same ? '' : a.lines + ' lines before, ' + b.lines + ' after');
-    if (saved0 === true) check('the switch still says running and startup are equal', (await isSaved()) === true);
+    if (savedNow) check('the switch still says running and startup are equal', (await isSaved()) === true);
     if (!same) {
       say('  Where startup changed (before -> after):');
       for (const l of diffSummary(a.text, b.text)) say(l);
-      say('  Putting startup back: copying the text read at the start into startup again.');
-      await maint.pushFile(session, { host, dest: 'startup', buffer: Buffer.from(startupText, 'utf8'), tftpPort });
+      if (savedNow) {
+        // Running still holds what startup was, so saving it is the exact put-back.
+        say('  Putting startup back: saving running to startup.');
+        await configFetch.copyConfig(session, { host, from: 'running', to: 'startup' });
+      } else {
+        say('  Putting startup back: copying the text read at the start into startup again.');
+        await maint.pushFile(session, { host, dest: 'startup', buffer: Buffer.from(startupText, 'utf8'), tftpPort });
+      }
       const c = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
       check('startup put back', maint.sameConfig(a.text, c.text));
     }
