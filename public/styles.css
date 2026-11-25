@@ -59,6 +59,9 @@ body { display: flex; flex-direction: column; }
   border-radius: 10px; padding: 0 5px; margin-left: 5px; font-weight: 700;
 }
 .icon-btn.has-errors .badge { display: inline; }
+/* The Updates button's badge: green, because a release is a thing to do (A2). */
+.icon-btn .badge-update { background: var(--green); color: #06110b; }
+.icon-btn.has-update .badge-update { display: inline; }
 
 /* ---------- switch tab bar ---------- */
 #tab-bar {
@@ -616,6 +619,28 @@ th.sticky-col { z-index: 3; }
   border: 1px solid var(--panel-border); border-radius: 6px; padding: 18px;
 }
 .dialog-card .row-split .btn { width: 100%; }
+
+/* ---------- updates window (25-updates.js) ---------- */
+#update-dialog {
+  position: absolute; inset: 0; background: rgba(6,10,9,0.72);
+  display: none; align-items: flex-start; justify-content: center;
+  z-index: 95; padding: 60px 16px 16px; overflow-y: auto;
+}
+#update-dialog.open { display: flex; }
+#update-dialog .dialog-card { max-width: 560px; }
+#update-dialog .section-title:first-child { margin-top: 0; }
+.update-line { font-size: 11.5px; color: var(--text); line-height: 1.6; }
+.update-msg { font-size: 11.5px; color: var(--muted); line-height: 1.5; margin-top: 8px; white-space: pre-wrap; word-break: break-word; }
+.update-msg.good { color: var(--green); }
+.update-msg.crit { color: var(--red); }
+.update-actions { margin-top: 10px; }
+.update-notes {
+  max-height: 260px; overflow: auto; margin: 0; padding: 9px 10px;
+  background: var(--panel-2); border: 1px solid var(--panel-border); border-radius: 3px;
+  font-family: var(--mono); font-size: 11.5px; color: var(--text); line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+}
+.update-auto { margin-top: 14px; font-size: 11.5px; white-space: normal; }
 
 /* ---------- MIB explorer ---------- */
 #mib-panel {

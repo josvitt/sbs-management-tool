@@ -57,6 +57,42 @@ The server does the health collection, alerting, and trap/syslog capture itself,
 so the browser is only a viewer — closing it never stops collection. See
 `docs/SERVER-STANDARD.md` for how that works.
 
+### Updating it from GitHub
+
+The **Updates** button (top right, beside Log) shows the installed version
+and the newest release on GitHub with its notes. The app checks once a day
+(the box in that window turns this off) and shows a green **NEW** badge when
+a release is out. **It never installs on its own**: you click **Install**.
+
+Because the repository is private, the app needs a GitHub token to see the
+releases. Make one at GitHub → Settings → Developer settings →
+Fine-grained tokens → Generate new token, with *Repository access* set to
+only this repository and *Permissions → Contents* set to **Read-only**
+(nothing else). Paste it into the Updates window once. It is stored
+encrypted with the vault key in `updates/token.enc`, sent only to
+api.github.com, and never shown again. (`SBS_UPDATE_TOKEN` in the
+environment is used instead, if set.)
+
+What **Install** does:
+
+1. Downloads the release, unpacks it beside the running app under
+   `updates/staging/`, runs `npm ci` in it and checks every module loads. The
+   running app is not touched; if any step fails it says why and nothing
+   changes.
+2. Restarts. Before anything loads, the files the release ships (and
+   `node_modules`) are moved to `updates/backup/<old version>/` and the new
+   ones moved in. Your saved switches (`state.enc`, `.state-key`), `logs/`,
+   `history.json`, `layouts.json`, `known-hosts.json`, `config-history/` and
+   the Windows service's `daemon/` folder are never moved.
+3. If the new version does not stay up for a minute over three starts, the
+   app goes back to the old one by itself. After a good update the window
+   offers **Go back to <old version>** until the next update.
+
+As a service (Windows or systemd), the service restarts it. Run
+interactively, `start.bat` restarts it (it runs `node scripts/run.js`); with
+plain `npm start`, start it again yourself. The machine needs to reach
+api.github.com, codeload.github.com and registry.npmjs.org.
+
 ## How it is organised
 
 One **tab per switch**, draggable to reorder, with a **+** beside them.

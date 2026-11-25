@@ -26,6 +26,13 @@
  * Then open: http://localhost:3000
  */
 
+// First, before anything else loads: finish (or undo) a self-update. When it
+// changed the app's files this process is the old version, so it exits and
+// the service, or scripts/run.js, starts the new one (update-boot.js).
+const updateBoot = require('./update-boot');
+const bootResult = updateBoot.run();
+if (bootResult === updateBoot.RESTART) process.exit(bootResult);
+
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const log = require('./logger');
@@ -65,6 +72,9 @@ require('./routes/streams')(app);
 require('./routes/ports')(app);
 require('./routes/layouts')(app);
 require('./routes/health')(app);
+
+const updater = require('./updater').create({ log, restart: () => shutdown('update', updateBoot.RESTART) });
+require('./routes/update')(app, updater);
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, verifyClient: guard.verifyClient(log) });
@@ -122,20 +132,24 @@ server.listen(PORT, BIND, () => {
   // Also print plainly so it's obvious in the console which build is live.
   console.log('BUILD:', BUILD_MARKER);
   startCollector();
+  // Daily update check (it never installs on its own), and, after an update,
+  // marking the new version good once it has stayed up for a minute.
+  updater.start();
 });
 
 // Persist any pending metric history before the process exits, so a restart
 // (or Ctrl-C) never loses the last batch of samples. flush() is synchronous and
 // safe to call more than once.
 let shuttingDown = false;
-function shutdown(signal) {
+function shutdown(signal, exitCode) {
   if (shuttingDown) return;
   shuttingDown = true;
   try { collector.stop(); } catch (e) { /* best effort */ }
+  try { updater.stop(); } catch (e) { /* best effort */ }
   try { history.flush(); } catch (e) { /* best effort */ }
   log.info('server', 'Shutting down, metric history flushed', { signal });
   // Give the log a tick to write, then exit.
-  setTimeout(() => process.exit(0), 50);
+  setTimeout(() => process.exit(exitCode || 0), 50);
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
