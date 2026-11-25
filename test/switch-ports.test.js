@@ -33,10 +33,14 @@ function sample() {
   v[ports.SWIF + '.38.5'] = int(10);
   v[ports.SWIF + '.39.5'] = int(3);
   v[ports.SWIF + '.40.5'] = int(99);   // the next column, past the walk
-  // Storm control on ifIndex 5: broadcast on at 10000.
-  v[ports.STORM + '.1.5'] = int(1);
-  v[ports.STORM + '.6.5'] = int(1);
-  v[ports.STORM + '.7.5'] = [T.Gauge, 10000];
+  // ifIndex 5 is a present Ethernet port; 1000 is a port channel.
+  v[ports.PRESENT_TYPE + '.5'] = int(6);
+  v[ports.PRESENT_TYPE + '.1000'] = int(161);
+  v[ports.SWIF + '.8.1000'] = int(2);
+  // Storm control on ifIndex 5: broadcast at 10000.
+  v[ports.STORM + '.2.5.1'] = [T.Gauge, 10000];
+  v[ports.STORM + '.3.5.1'] = int(2);
+  v[ports.STORM + '.4.5.1'] = int(1);
   // Errdisable: port-security recovery on; ifIndex 7 shut by BPDU guard.
   v[ports.ERRDIS + '.2.1.2.2'] = int(1);
   v[ports.ERRDIS + '.2.1.2.5'] = int(2);
@@ -67,9 +71,8 @@ test('readPorts reads PoE, security, storm control, errdisable, discovery, EEE, 
   assert.deepEqual(r.poe, [{ group: 1, port: 5, admin: true, detection: 'deliveringPower', priority: 'high', powerClass: 4,
     powerMw: 7500, limitMw: 30000, operLimitMw: 30000, poeType: 'poeplus' }]);
   assert.deepEqual(r.security, [{ ifIndex: 5, locked: true, operLocked: true, mode: 'dynamic', maxMacs: 10, macCount: 3 }]);
-  assert.equal(r.storm[0].broadcast.on, true);
-  assert.equal(r.storm[0].broadcast.rate, 10000);
-  assert.equal(r.storm[0].multicast.on, null);
+  assert.deepEqual(r.ports, [5]);
+  assert.deepEqual(r.storm, [{ ifIndex: 5, traffic: { broadcast: { rate: 10000, unit: 2, action: 1 } } }]);
   assert.equal(r.errdisable.intervalSec, 300);
   assert.deepEqual(r.errdisable.causes.map((c) => [c.cause, c.recover]), [['port-security', true], ['stp-bpdu-guard', false]]);
   assert.deepEqual(r.errdisable.ports, [{ ifIndex: 7, reason: 'stp-bpdu-guard', recover: true, secondsLeft: 120 }]);

@@ -15,8 +15,13 @@
  *     .9 LockOperStatus, .37 LockLimitationMode (disabled 1, dynamic 2,
  *     secure-permanent 3, secure-delete-on-reset 4), .38 LockMaxMacAddresses,
  *     .39 LockMacAddressesCount
- *   rlStormCtrlTable V.77.8.1 (ifIndex): .1 RateType, .2/.3 unknown unicast
- *     enable/rate, .4/.5 unknown multicast, .6/.7 broadcast, .8/.9 multicast
+ *   rlStormCtrlRateLimCfgTable V.77.12.1 (ifIndex, traffic: broadcast 1,
+ *     multicastRegistered 2, multicastUnregistered 3, multicastAll 4,
+ *     unknownUnicast 5, all 6): .2 Rate, .3 Unit, .4 Action. (The older
+ *     rlStormCtrlTable, V.77.8, is empty on a C1300 on 4.1.9.92.)
+ *   rlifPresentType V.54.43.1.3 (ifIndex): which interfaces exist. Most
+ *     per-port tables carry a row for every possible ifIndex (416 on a
+ *     24-port C1300), so the present Ethernet ports are read with a GET each.
  *   rlErrdisableRecovery V.128: .1 Interval (s), .2.1 cause table
  *     (.2 Enable), .3.1 per-port table (.1 Reason, .2 Enable, .3 TimeToRecover)
  *   lldpPortConfigTable 1.0.8802.1.1.2.1.1.6.1 (port number): .2 AdminStatus
@@ -37,7 +42,8 @@ const V = '1.3.6.1.4.1.9.6.1.101';
 const PETH = '1.3.6.1.2.1.105.1.1.1';
 const RL_PETH = V + '.108.1.1';
 const SWIF = V + '.43.1.1';
-const STORM = V + '.77.8.1';
+const STORM = V + '.77.12.1';
+const PRESENT_TYPE = V + '.54.43.1.3';
 const ERRDIS = V + '.128';
 const LLDP_PORTS = '1.0.8802.1.1.2.1.1.6.1';
 const CDP_IF = '1.3.6.1.4.1.9.9.23.1.1.1.1';
@@ -66,6 +72,7 @@ const SPAN_PORT_TYPE = { 1: 'monitor-only', 2: 'network' };
 const SRC_TYPE = { 1: 'port', 2: 'vlan', 3: 'flow', 4: 'remote-vlan' };
 const DIRECTION = { 1: 'rx', 2: 'tx', 3: 'both' };
 const PHY_TYPE = { 2: 'cableStatus', 3: 'cableFault', 4: 'cableLength', 13: 'pair1', 14: 'pair2', 15: 'pair3', 16: 'pair4' };
+const TRAFFIC = { 1: 'broadcast', 2: 'multicastRegistered', 3: 'multicastUnregistered', 4: 'multicastAll', 5: 'unknownUnicast', 6: 'all' };
 const PHY_STATUS = { 1: 'none', 2: 'success', 3: 'inProgress', 4: 'notSupported', 5: 'unableToRun', 6: 'aborted', 7: 'failed' };
 
 const num = (v) => (v == null ? null : Number(v));
@@ -113,6 +120,43 @@ async function walkColumns(session, table, cols) {
   return Array.from(rows.values());
 }
 
+/**
+ * The present front-panel Ethernet ports' ifIndexes, from rlifPresentType.
+ * Port channels start at 1000; above that, an Ethernet row is the
+ * out-of-band management port (1800 on a C1300), which has none of these
+ * features.
+ */
+async function presentPorts(session) {
+  return (await walk(session, PRESENT_TYPE))
+    .map((vb) => ({ ifIndex: Number(vb.oid.slice(PRESENT_TYPE.length + 1)), type: Number(vb.value) }))
+    .filter((p) => p.type === 6 && p.ifIndex < 1000)
+    .map((p) => p.ifIndex)
+    .sort((a, b) => a - b);
+}
+
+/**
+ * Some columns of the rows at the given indexes, by GET, 30 varbinds a
+ * request. Resolves [{ index, key, cols }] for the rows that answered.
+ */
+async function getRows(session, table, cols, keys) {
+  const oids = [];
+  for (const k of keys) for (const c of cols) oids.push(table + '.' + c + '.' + k);
+  const got = new Map();
+  for (let i = 0; i < oids.length; i += 30) {
+    const vbs = await getChunk(session, oids.slice(i, i + 30));
+    for (const vb of vbs) {
+      if (!vb || snmp.isVarbindError(vb) || vb.value == null) continue;
+      const rest = vb.oid.slice(table.length + 1);
+      const dot = rest.indexOf('.');
+      const c = Number(rest.slice(0, dot)), key = rest.slice(dot + 1);
+      if (!got.has(key)) got.set(key, {});
+      got.get(key)[c] = vb.value;
+    }
+  }
+  return keys.map(String).filter((k) => got.has(k))
+    .map((k) => ({ index: k.split('.').map(Number), key: k, cols: got.get(k) }));
+}
+
 async function readPoe(session) {
   const std = await walkColumns(session, PETH, [3, 6, 7, 10]);
   const rl = new Map((await walkColumns(session, RL_PETH, [5, 6, 9, 13])).map((r) => [r.key, r.cols]));
@@ -130,8 +174,8 @@ async function readPoe(session) {
   });
 }
 
-async function readSecurity(session) {
-  return (await walkColumns(session, SWIF, [8, 9, 37, 38, 39])).map((r) => ({
+async function readSecurity(session, ifs) {
+  return (await getRows(session, SWIF, [8, 9, 37, 38, 39], ifs)).map((r) => ({
     ifIndex: r.index[0],
     locked: r.cols[8] == null ? null : Number(r.cols[8]) === 1,
     operLocked: r.cols[9] == null ? null : Number(r.cols[9]) === 1,
@@ -141,15 +185,17 @@ async function readSecurity(session) {
   }));
 }
 
-async function readStorm(session) {
-  return (await walkColumns(session, STORM, [1, 2, 3, 4, 5, 6, 7, 8, 9])).map((r) => ({
-    ifIndex: r.index[0],
-    rateType: num(r.cols[1]),
-    unknownUnicast: { on: truth(r.cols[2]), rate: num(r.cols[3]) },
-    unknownMulticast: { on: truth(r.cols[4]), rate: num(r.cols[5]) },
-    broadcast: { on: truth(r.cols[6]), rate: num(r.cols[7]) },
-    multicast: { on: truth(r.cols[8]), rate: num(r.cols[9]) }
-  }));
+async function readStorm(session, ifs) {
+  const keys = [];
+  for (const i of ifs) for (const t of [1, 2, 3, 4, 5, 6]) keys.push(i + '.' + t);
+  const rows = await getRows(session, STORM, [2, 3, 4], keys);
+  const out = new Map();
+  for (const r of rows) {
+    const [ifIndex, t] = r.index;
+    if (!out.has(ifIndex)) out.set(ifIndex, { ifIndex, traffic: {} });
+    out.get(ifIndex).traffic[TRAFFIC[t] || String(t)] = { rate: num(r.cols[2]), unit: num(r.cols[3]), action: num(r.cols[4]) };
+  }
+  return Array.from(out.values());
 }
 
 async function readErrdisable(session, interval) {
@@ -205,17 +251,18 @@ async function readCableTests(session) {
 async function readPorts(session) {
   const s = await getScalars(session).catch(() => ({}));
   const safe = (p, empty) => p.catch(() => empty);
+  const ifs = await safe(presentPorts(session), []);
   const poe = await safe(readPoe(session), []);
-  const security = await safe(readSecurity(session), []);
-  const storm = await safe(readStorm(session), []);
+  const security = await safe(readSecurity(session, ifs), []);
+  const storm = await safe(readStorm(session, ifs), []);
   const errdisable = await safe(readErrdisable(session, s.errdisInterval), { intervalSec: num(s.errdisInterval), causes: [], ports: [] });
-  const lldpPorts = await safe(walkColumns(session, LLDP_PORTS, [2]), []);
-  const cdpPorts = await safe(walkColumns(session, CDP_IF, [2]), []);
-  const eeePorts = await safe(walkColumns(session, EEE_PORTS, [1, 3, 4]), []);
+  const lldpPorts = await safe(getRows(session, LLDP_PORTS, [2], ifs), []);
+  const cdpPorts = await safe(getRows(session, CDP_IF, [2], ifs), []);
+  const eeePorts = await safe(getRows(session, EEE_PORTS, [1, 3, 4], ifs), []);
   const mirror = await safe(readMirror(session), { destinations: [], sources: [] });
   const cableTests = await safe(readCableTests(session), []);
   return {
-    poe, security, storm, errdisable,
+    ports: ifs, poe, security, storm, errdisable,
     lldp: { enabled: truth(s.lldp), ports: lldpPorts.map((r) => ({ port: r.index[0], admin: named(LLDP_ADMIN, r.cols[2]) })) },
     cdp: { enabled: truth(s.cdp), ports: cdpPorts.map((r) => ({ ifIndex: r.index[0], on: truth(r.cols[2]) })) },
     eee: {
@@ -227,7 +274,7 @@ async function readPorts(session) {
 }
 
 module.exports = {
-  readPorts, walkColumns, SCALARS,
+  readPorts, walkColumns, getRows, SCALARS, PRESENT_TYPE, TRAFFIC,
   PETH, RL_PETH, SWIF, STORM, ERRDIS, LLDP_PORTS, CDP_IF, EEE_PORTS, SPAN_DEST, SPAN_SRC, PHY_GET,
   CAUSES, LOCK_MODE, LLDP_ADMIN, POE_PRIORITY
 };
