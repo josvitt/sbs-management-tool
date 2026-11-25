@@ -586,18 +586,9 @@
     return { sec, body };
   }
 
-  // Walk the candidate ACL tables and show what each returns, including the
-  // actual row contents of the QoS ACL/ACE/Ref tables (where this switch keeps
-  // its ACLs) so we can see the real structure, not just counts.
-
-  // Helper: a classification value accessor (display or value) for ACL cells.
+  // A cell's display text, falling back to its raw value (ACL and port-channel
+  // cells).
   function dvc(cell) { return cell ? (cell.display !== undefined && cell.display !== null && cell.display !== '' ? cell.display : cell.value) : ''; }
-  // A sub-heading inside the ACL panel (mirrors the SNMP sub-sections).
-  function section2(root, title, note) {
-    const h = el('div', 'aaa-sub', title);
-    if (note) h.appendChild(el('span', 'st-note', '  ' + note));
-    root.appendChild(h);
-  }
 
   const q2 = (s, sel) => s.pane.querySelector(sel);
 
@@ -1342,8 +1333,8 @@
     // interactive and does not come from the health poll, so it loads
     // lazily (on expand / its own refresh) and is always offered.
     { key: 'snmpcfg', title: 'SNMP configuration', span: 12, h: 0, needs: () => true },
-    // Standard IP ACLs: interactive write module (list / add / delete rules,
-    // bind to interfaces), loaded on demand like snmpcfg.
+    // IP access lists (the QoS ACL tables): a keyed write panel whose tables
+    // are loaded on demand once per visit (14-acl.js).
     { key: 'acl', title: 'IP access lists', span: 12, h: 0, needs: () => true },
     // IPv4 Addressing: every interface address (VLAN SVIs and routed ports,
     // static or DHCP), global L3 status, the forwarding table, static routes,
@@ -1375,7 +1366,9 @@
       'radiusServers', 'radiusStats', 'tacacsServers',
       'dot1xHostStats', 'dot1xHostDiag', 'dot1xHostSession', 'vlans'],
     stp: ['stpPorts', 'stpExtPorts', 'mstpPorts', 'mstpInstances',
-          'pvstPorts', 'pvstVlans', 'pvstInconsistencies', 'stpxInconsistencies']
+          'pvstPorts', 'pvstVlans', 'pvstInconsistencies', 'stpxInconsistencies'],
+    // The panel's Refresh re-reads its own on-demand tables, not the whole switch.
+    acl: ['aclNames', 'aclAces', 'aclTuples']
   };
 
   // Open on the two panels that answer "how is this switch", and leave the
@@ -2607,9 +2600,11 @@
     // the regular poll, so a fresh full health has them empty. Carry the last
     // fetched copy forward rather than wiping it - otherwise an open panel that
     // needs it would re-fetch on every update ("ACL/MAC reloads on every open").
+    // An empty list that was actually read is carried too (a switch with no
+    // ACLs), so the panel does not fall back to "Waiting for data".
     if (s.health) {
       for (const k of ['macTable', 'aclNames', 'aclAces', 'aclTuples']) {
-        if ((!body[k] || !body[k].length) && s.health[k] && s.health[k].length) body[k] = s.health[k];
+        if ((!body[k] || !body[k].length) && Array.isArray(s.health[k]) && (s.health[k].length || !Array.isArray(body[k]))) body[k] = s.health[k];
       }
     }
     s.health = body;
@@ -6520,7 +6515,7 @@
     // SNMP configuration does not depend on a health collection, so it is
     // handled before the "no data yet" gate the health panels sit behind.
     if (key === 'snmpcfg') { paintSnmpPanel(s, body); return; }
-    if (key === 'acl') { paintAclPanel(s, body); return; }
+    if (key === 'acl') { paintAclPanel(s, body, p); return; }
     if (key === 'routing') { paintRoutingPanel(s, body, p); return; }
     if (key === 'vlans') { paintVlanPanel(s, body, p); return; }
     if (key === 'capture') { paintCapturePanel(s, body); return; }
@@ -9156,62 +9151,15 @@
   }
 
   // =================================================================
-  // 14-acl.js: IP access lists and QoS ACEs, and their interface/VLAN bindings.
+  // 14-acl.js: IP access lists (the QoS ACL tables) and their interface/VLAN
+  // bindings.
   // =================================================================
 
-  // Packet capture (OPC) panel. The C1300's onboard capture records
-  // control-plane traffic only. A single named capture point: configure buffer
-  // and filter, start/stop, and export (to flash, then copied to this app over
-  // TFTP for download). All actions are writes guarded by writeBusy.
-  // Flash files module: list the switch flash, download a file over TFTP, or
-  // ===================================================================
-  // IP access-list module (standard IP ACLs: rlIpStdAclTable).
-  // ===================================================================
-  // A rule (ACE) is indexed by { aclName, aceIndex }. The SNMP index arrives as
-  // dotted sub-identifiers: <nameLen>.<name bytes...>.<aceIndex>. Decode it.
-  const ACL_OIDS = {
-    srcClass: '1.3.6.1.4.1.9.6.1.101.207.1.1.3',
-    srcType:  '1.3.6.1.4.1.9.6.1.101.207.1.1.4',
-    srcAddr:  '1.3.6.1.4.1.9.6.1.101.207.1.1.5',
-    srcPref:  '1.3.6.1.4.1.9.6.1.101.207.1.1.6',
-    dstClass: '1.3.6.1.4.1.9.6.1.101.207.1.1.7',
-    dstType:  '1.3.6.1.4.1.9.6.1.101.207.1.1.8',
-    dstAddr:  '1.3.6.1.4.1.9.6.1.101.207.1.1.9',
-    dstPref:  '1.3.6.1.4.1.9.6.1.101.207.1.1.10',
-    action:   '1.3.6.1.4.1.9.6.1.101.207.1.1.11',
-    rowStatus:'1.3.6.1.4.1.9.6.1.101.207.1.1.12',
-    freeAce:  '1.3.6.1.4.1.9.6.1.101.207.2.0'
-  };
-  const ACL_CLASS = { 1: 'any', 2: 'ipv4', 3: 'ipv6any', 4: 'ipv6' };
-  const ACL_ACTION = { 1: 'drop', 2: 'permit' };
-
-  // Turn an ACL table row index ("<len>.<bytes>.<ace>") into { name, ace }.
-  function parseAclIndex(idx) {
-    const parts = String(idx).split('.').map((n) => parseInt(n, 10));
-    if (!parts.length) return null;
-    const len = parts[0];
-    if (!Number.isFinite(len) || parts.length < len + 2) return null;
-    const name = parts.slice(1, 1 + len).map((c) => String.fromCharCode(c)).join('');
-    const ace = parts[1 + len];
-    return { name, ace };
-  }
-  // Build the index suffix for a given ACL name + ACE index.
-  function aclIndexSuffix(name, ace) {
-    const bytes = String(name).split('').map((ch) => ch.charCodeAt(0));
-    return [bytes.length].concat(bytes).concat([ace]).join('.');
-  }
-
-  // ACL is a keyed panel (standard B1b): its three tables (aclNames/aclAces/
-  // aclTuples) are raw-mode health tables, loaded on demand and refreshed on the
-  // health cycle. The panel reads them via s._acl.{acls,aces,tuples} pointers set
-  // from s.health, so the existing client-side join (renderAclPanel) is unchanged.
+  // ACL is a keyed panel (standard B1b), built like VLANs and IPv4 Addressing.
+  // Its three tables (aclNames/aclAces/aclTuples) are raw-mode health tables,
+  // loaded on demand once per visit (B4) and refreshed through refreshTables
+  // (B5). The panel joins them client-side: ACL header -> ACEs -> tuple values.
   const ACL_TABLES = ['aclNames', 'aclAces', 'aclTuples'];
-  function aclSyncFromHealth(s) {
-    s._acl = s._acl || {};
-    s._acl.acls = (s.health && s.health.aclNames) || [];
-    s._acl.aces = (s.health && s.health.aclAces) || [];
-    s._acl.tuples = (s.health && s.health.aclTuples) || [];
-  }
   function aclRefresh(s) {
     if (!s.target) return Promise.resolve();
     s._aclFetchedAt = Date.now();
@@ -9223,19 +9171,9 @@
     s._aclFetching = true;
     aclRefresh(s).then(() => { s._aclFetching = false; }, () => { s._aclFetching = false; });
   }
-  function paintAclPanel(s, body) {
-    if (!s._ktReconcile) clear(body);
-    if (!s.target) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Add SNMP credentials for this switch first.')); return; }
-    s._acl = s._acl || {};
-    if (!s._ktReconcile) {
-      const root = el('div', 'acl-cfg');
-      body.appendChild(root);
-      s._acl.root = root;
-      ensureAclLoaded(s);
-    }
-    aclSyncFromHealth(s);
-    if (s._acl.root) renderAclPanel(s);
-  }
+  // The ACL tables have been read at least once (an empty list is still an
+  // answer). Until then the panel says "Waiting for data", not "no lists".
+  function aclLoaded(s) { return !!(s.health && Array.isArray(s.health.aclNames)); }
 
   // --- QoS ACL tables (where this switch actually stores ACLs) ---
   const QOS_ACL = {
@@ -9244,11 +9182,13 @@
     type:   '1.3.6.1.4.1.9.6.1.101.88.7.1.3',   // rlQosAclType (AclObjectType: mac1 ip2 ipv6 3)
     aclStatus:'1.3.6.1.4.1.9.6.1.101.88.7.1.4', // rlQosAclStatus (RowStatus)
     numAces:'1.3.6.1.4.1.9.6.1.101.88.7.1.5',
+    bound:  '1.3.6.1.4.1.9.6.1.101.88.7.1.6',  // rlQosAclIsBoundToInterface (TruthValue)
+    origin: '1.3.6.1.4.1.9.6.1.101.88.7.1.8',  // rlQosAclOriginType (static 1 / dynamic 2 / system 3)
     // ACE table (88.31), indexed by aclIndex.aceIndex.
     aceTidx:'1.3.6.1.4.1.9.6.1.101.88.31',
     aceAction:'1.3.6.1.4.1.9.6.1.101.88.31.1.3',  // rlQosAceTidxAction
     aceType:'1.3.6.1.4.1.9.6.1.101.88.31.1.4',    // rlQosAceTidxType
-    aceTupleBase: '1.3.6.1.4.1.9.6.1.101.88.31.1.', // +col (5..15) for Tuple1..11
+    aceTupleBase: '1.3.6.1.4.1.9.6.1.101.88.31.1.', // +col, see ACE_TUPLE_COLS
     aceStatus:'1.3.6.1.4.1.9.6.1.101.88.31.1.14', // rlQosAceTidxStatus (RowStatus)
     // Tuple table (88.5), indexed by tupleIndex.
     tuple:  '1.3.6.1.4.1.9.6.1.101.88.5',
@@ -9257,11 +9197,12 @@
     tupVal2:'1.3.6.1.4.1.9.6.1.101.88.5.1.4',   // rlQosTupleValue2 (OctetString value||mask)
     tupStatus:'1.3.6.1.4.1.9.6.1.101.88.5.1.5'  // rlQosTupleStatus (RowStatus)
   };
-  // The Tuple column index for each ACE Tuple pointer (Tuple1..11 -> cols 5..15).
-  const ACE_TUPLE_COLS = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+  // The column of each ACE Tuple pointer, from CISCOSB-qosclimib: Tuple1..8 are
+  // columns 5..12 and Tuple9..11 are 17..19 (13 is Accounting, 14 the RowStatus,
+  // 15 the time range, so the pointers are not one contiguous run).
+  const ACE_TUPLE_COLS = [5, 6, 7, 8, 9, 10, 11, 12, 17, 18, 19];
   // Reverse maps for building writes.
   const TUPLE_TYPE_VAL = { protocol: 1, 'ip-src': 2, 'ip-dest': 3, 'tcp-src': 8, 'tcp-dst': 9, 'udp-src': 6, 'udp-dst': 7, 'tcp-flags': 18 };
-  const ACE_ACTION_VAL = { permit: 1, deny: 2, 'deny-shutdown': 3, 'deny-log': 4, 'permit-log': 5 };
   const ACE_TYPE_VAL = { ip: 1, 'ip-tcp': 2, 'ip-udp': 3 };
   // ACE action enum (rlQosAceTidxAction / AceActionType), verified from the MIB.
   const ACE_ACTION = { 1: 'permit', 2: 'deny', 3: 'deny-shutdown', 4: 'deny-log', 5: 'permit-log' };
@@ -9338,18 +9279,6 @@
   }
   // TCP flag bit layout and helpers.
   const TCP_FLAGS = [['urg', 0x20], ['ack', 0x10], ['psh', 0x08], ['rst', 0x04], ['syn', 0x02], ['fin', 0x01]];
-  function tcpFlagNames(flags, mask) {
-    const out = [];
-    for (const [name, bit] of TCP_FLAGS) { if ((mask & bit) && (flags & bit)) out.push(name); }
-    return out;
-  }
-  // A routable unicast IPv4: first octet 1-223, not loopback/link-local. Rules
-  // out the 0.x / uninitialised placeholders a DHCP interface shows before it
-  // has a lease. Shared by the VLAN table and the IPv4 editor.
-  function isRealIp(ip) {
-    const o = String(ip).split('.').map(Number);
-    return o.length === 4 && o.every((n) => n >= 0 && n <= 255) && o[0] >= 1 && o[0] <= 223 && o[0] !== 127 && !(o[0] === 169 && o[1] === 254);
-  }
 
   // "192.168.1.0/24" -> { any:false, ip:'192.168.1.0', pref:24 } for pre-filling.
   function parseCidr(text) {
@@ -9371,83 +9300,119 @@
     return out;   // e.g. { ack:'set', fin:'set', urg:'unset', ... }
   }
 
-  function renderAclPanel(s) {
-    const root = s._acl.root;
-    // ACL is a keyed panel: scroll is preserved by repaintPanel's scrollKeeper
-    // around the reconcile paint (standard A7), so this just clears and rebuilds.
-    clear(root);
-    // ACL names: index -> name.
-    const nameByIdx = new Map();
-    const typeByIdx = new Map();
-    for (const r of (s._acl.acls || [])) {
-      const col = r.column || '';
-      if (/QosAclName$/.test(col)) nameByIdx.set(String(r.index), String(dvc(r)));
-      else if (/QosAclType$/.test(col)) typeByIdx.set(String(r.index), aclNum(r));
+  // ---- The joined model ----
+  // Join the three raw tables into ACLs -> rules, the one place the panel, the
+  // write paths and the binding editor read them from. Only ACLs with a name
+  // row are listed (as before); an ACE whose ACL is unknown is ignored.
+  function aclModel(h) {
+    h = h || {};
+    const byIdx = new Map();
+    for (const r of (h.aclNames || [])) {
+      if (!/QosAclName$/.test(r.column || '')) continue;
+      const idx = String(r.index);
+      byIdx.set(idx, { idx, name: String(dvc(r)), type: null, aces: new Map() });
     }
-    // Tuple values.
-    const tupleMap = buildTupleMap(s._acl.tuples || []);
-    // ACEs grouped by ACL index. Each ACE index is "<aclIdx>.<aceIdx>".
-    const aceByAcl = new Map();   // aclIdx -> Map(aceIdx -> {action, type, tuples:[]})
-    for (const r of (s._acl.aces || [])) {
+    for (const r of (h.aclNames || [])) {
+      const acl = byIdx.get(String(r.index));
+      if (acl && /QosAclType$/.test(r.column || '')) acl.type = parseInt(aclNum(r), 10);
+    }
+    for (const r of (h.aclAces || [])) {
       const parts = String(r.index).split('.');
       if (parts.length < 2) continue;
-      const aclIdx = parts[0], aceIdx = parts.slice(1).join('.');
-      if (!aceByAcl.has(aclIdx)) aceByAcl.set(aclIdx, new Map());
-      const bucket = aceByAcl.get(aclIdx);
-      if (!bucket.has(aceIdx)) bucket.set(aceIdx, { tuples: [] });
-      const ace = bucket.get(aceIdx);
+      const acl = byIdx.get(parts[0]);
+      if (!acl) continue;
+      const aceIdx = parts.slice(1).join('.');
+      if (!acl.aces.has(aceIdx)) acl.aces.set(aceIdx, { idx: aceIdx, tuples: [] });
+      const ace = acl.aces.get(aceIdx);
       const col = r.column || '';
       if (/TidxAction$/.test(col)) ace.action = parseInt(aclNum(r), 10);
       else if (/TidxType$/.test(col)) ace.type = parseInt(aclNum(r), 10);
-      else if (/TidxTuple\d+$/.test(col)) { const p = parseInt(dvc(r), 10); if (p > 0) ace.tuples.push(String(p)); }
+      else if (/TidxTuple\d+$/.test(col)) { const ptr = parseInt(dvc(r), 10); if (ptr > 0) ace.tuples.push(String(ptr)); }
     }
+    const acls = Array.from(byIdx.values());
+    for (const a of acls) a.aceList = Array.from(a.aces.values()).sort((x, y) => parseInt(x.idx, 10) - parseInt(y.idx, 10));
+    return { acls, byIdx, tupleMap: buildTupleMap(h.aclTuples || []) };
+  }
 
-
-    if (!nameByIdx.size) {
-      root.appendChild(el('div', 'card-sub', 'No access lists found.'));
+  // One rule as the table shows it, plus the values that pre-fill its editor.
+  function aclRuleView(ace, tupleMap) {
+    const action = ACE_ACTION[ace.action] || (ace.action ? ('action ' + ace.action) : '?');
+    let proto = ACE_TYPE[ace.type] || 'ip', src = 'any', dst = 'any';
+    const extra = [];
+    const init = { action: ace.action, proto: 'ip', src: { any: true }, dst: { any: true } };
+    if (ace.type === 2) init.proto = 'tcp'; else if (ace.type === 3) init.proto = 'udp';
+    for (const tp of ace.tuples) {
+      const t = tupleMap.get(tp);
+      const dec = decodeTuple(t);
+      if (!dec) continue;
+      if (dec.field === 'src') { src = dec.text; init.src = parseCidr(dec.text); }
+      else if (dec.field === 'dst') { dst = dec.text; init.dst = parseCidr(dec.text); }
+      else if (dec.field === 'proto') proto = dec.text;
+      else if (dec.field === 'flags') { extra.push(dec.text); init.flags = parseFlagsTuple(t); }
+      else extra.push(dec.text);
     }
+    return { action, isPermit: /permit/.test(action), proto, src, dst, extra, init };
+  }
 
-    for (const [aclIdx, name] of nameByIdx) {
-      const aces = aceByAcl.get(aclIdx) || new Map();
-      const aceList = Array.from(aces.entries()).sort((a, b) => parseInt(a[0], 10) - parseInt(b[0], 10));
-      section2(root, 'ACL \u00b7 ' + name, aceList.length + ' rule(s)');
-      const cols = ['#', 'Action', 'Protocol', 'Source', 'Destination', 'Extra', ''];
-      const rowClicks = [];
-      const trows = aceList.map(([aceIdx, ace]) => {
-        const action = ACE_ACTION[ace.action] || (ace.action ? ('action ' + ace.action) : '?');
-        const isPermit = /permit/.test(action);
-        const actionPill = el('span', 'pill ' + (isPermit ? 'good' : 'warn'), action);
-        // Resolve the ACE's tuples - both for display and to pre-fill an edit.
-        let proto = ACE_TYPE[ace.type] || 'ip', src = 'any', dst = 'any', extra = [];
-        const init = { action: ace.action, proto: 'ip', src: { any: true }, dst: { any: true } };
-        if (ace.type === 2) init.proto = 'tcp'; else if (ace.type === 3) init.proto = 'udp';
-        for (const tp of ace.tuples) {
-          const t = tupleMap.get(tp);
-          const dec = decodeTuple(t);
-          if (!dec) continue;
-          if (dec.field === 'src') { src = dec.text; init.src = parseCidr(dec.text); }
-          else if (dec.field === 'dst') { dst = dec.text; init.dst = parseCidr(dec.text); }
-          else if (dec.field === 'proto') proto = dec.text;
-          else if (dec.field === 'flags') { extra.push(dec.text); init.flags = parseFlagsTuple(t); }
-          else extra.push(dec.text);
-        }
-        const openEdit = () => openEditPopout(s, 'Edit rule', (pane) => qosAceAddForm(s, pane, null, { edit: { aclIdx, aceIdx, aclName: name, init } }));
-        rowClicks.push(openEdit);
-        const editBtn = actBtn('Edit', openEdit);
-        const delBtn = actBtnConfirm('Delete', () => deleteQosAce(s, aclIdx, aceIdx), 'danger', 'Delete this rule');
-        const delCell = actGroup([editBtn, delBtn]);
-        return [String(aceIdx), actionPill, proto, src, dst, extra.join(', ') || '\u2014', delCell];
+  // The panel (standard B2): scaffolding on a full paint only, keyed tables
+  // through mountInto on every pass, and each ACL's rule count kept in a stable
+  // note refreshed in place so it stays right after a write.
+  function paintAclPanel(s, body, p) {
+    if (!s._ktReconcile) clear(body);
+    if (!s.target) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Add SNMP credentials for this switch first.')); return; }
+    if (!s._ktReconcile) ensureAclLoaded(s);
+    if (!aclLoaded(s)) {
+      if (!s._ktReconcile) { body.appendChild(el('div', 'card-sub', 'Waiting for data…')); p._aclWaiting = true; }
+      return;
+    }
+    // The first load arrived while "Waiting for data" was showing: that is a
+    // structural change (no tables existed yet), so ask for a full repaint.
+    if (s._ktReconcile && p._aclWaiting) { s._ktStructural = true; return; }
+    p._aclWaiting = false;
+
+    const section = (title, note, addLabel, onAdd) => {
+      if (s._ktReconcile) return null;
+      const st = el('div', 'section-title', title);
+      const noteEl = el('span', 'st-note', note || '');
+      st.appendChild(noteEl);
+      body.appendChild(st);
+      if (addLabel && s.target) body.appendChild(addControl(addLabel, onAdd));
+      return noteEl;
+    };
+    const emptyNote = (msg) => { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', msg)); };
+
+    const model = aclModel(s.health);
+    section('Access lists', model.acls.length ? model.acls.length + ' list(s)' : '', 'New ACL', () => openAclRuleForm(s, { newAcl: true }));
+    if (!model.acls.length) { emptyNote('No access lists configured.'); return; }
+
+    if (!s._ktReconcile) p._aclNotes = {};
+    const cols = ['#', 'Action', 'Protocol', 'Source', 'Destination', 'Extra', ''];
+    for (const acl of model.acls) {
+      const noteEl = section('ACL · ' + acl.name, '', 'Add rule', () => openAclRuleForm(s, { aclIdx: acl.idx, aclName: acl.name }));
+      if (noteEl) p._aclNotes[acl.idx] = noteEl;
+      const note = p._aclNotes && p._aclNotes[acl.idx];
+      if (note) note.textContent = acl.aceList.length + ' rule(s)';
+      if (!acl.aceList.length) { emptyNote('No rules.'); continue; }
+      const rows = acl.aceList.map((ace) => {
+        const v = aclRuleView(ace, model.tupleMap);
+        const del = actGroup([actBtnConfirm('Delete', (e) => {
+          runButtonAction(e.currentTarget, {
+            failLabel: 'Delete rule',
+            run: () => deleteQosAce(s, acl.idx, ace.idx),
+            ok: (r) => r && r.ok,
+            error: (r) => (r && r.error) || 'the switch rejected it',
+            onApplied: () => markConfigDirty(s),
+            settle: () => aclRefresh(s)
+          });
+        }, 'danger', 'Delete rule ' + ace.idx)]);
+        return { key: 'ace:' + acl.idx + '.' + ace.idx, cells: [
+          { v: ace.idx, click: { open: () => openAclRuleEditor(s, acl.idx, ace.idx) } },
+          { cellNode: el('span', 'pill ' + (v.isPermit ? 'good' : 'warn'), v.action), sig: 'a:' + v.action },
+          { v: v.proto }, { v: v.src }, { v: v.dst }, { v: v.extra.join(', ') || '—' },
+          { cellNode: del, sig: 'del' } ] };
       });
-      // Clicking a row (anywhere but the action buttons) opens its edit pane.
-      root.appendChild(plainTable(s, cols, trows, (rowIdx) => { const h = rowClicks[rowIdx]; if (h) h(); }));
-      // Per-ACL add control: the ACL is known, so no list picker is needed.
-      root.appendChild(addControl('Add rule to ' + name, () => openEditPopout(s, 'Add rule to ' + name, (pane, close) => qosAceAddForm(s, pane, close, { fixedAcl: name }))));
+      mountInto(body, s, p, 'acl:' + acl.idx, cols, rows);
     }
-
-    // Top-level control: create a brand-new ACL (and its first rule).
-    const newRow = el('div', 'acl-new-row');
-    newRow.appendChild(addControl('New ACL', () => openEditPopout(s, 'New access list', (pane, close) => qosAceAddForm(s, pane, close, { newAcl: true }))));
-    root.appendChild(newRow);
   }
 
   // ---- Interface / VLAN ACL binding (rlQosIfPolicyTable, base 88.13) ----
@@ -9458,7 +9423,6 @@
     defIn:   '1.3.6.1.4.1.9.6.1.101.88.13.1.12',   // rlQosAclDefaultAction (ingress)
     defOut:  '1.3.6.1.4.1.9.6.1.101.88.13.1.22'    // rlQosAclDefaultActionOut
   };
-  const ACL_DEFACTION = { 1: 'deny-all', 2: 'forward-all', 3: 'application-specific' };
   const IFTYPE_PORT = 2, IFTYPE_VLAN = 1;
 
   // Read the current binding for an interface (ifIndex + ifType). Returns
@@ -9475,28 +9439,29 @@
 
   // Build the ACL-binding editor for an interface. ifType port(2) or vlan(1).
   // For VLANs, pass opts.noDirection to show a single (default-action-only) set.
+  // The list of ACLs comes from the panel's own tables (loaded first if the
+  // panel has not been opened this visit), not a separate walk.
   async function buildIfAclBinding(s, detail, pane, opts) {
     opts = opts || {};
     const ifType = opts.ifType || IFTYPE_PORT;
     const ifIndex = detail.ifIndex;
-    pane.appendChild(el('div', 'card-sub', 'Loading ACL binding\u2026'));
-    // Need the list of ACLs (index -> name) to offer in the picker.
-    let acls = [];
+    pane.appendChild(el('div', 'card-sub', 'Loading ACL binding…'));
     try {
-      const [aclRes, bind] = await Promise.all([
-        apiPost('/api/snmp/walk', { target: s.target, oid: QOS_ACL.name, mode: 'getbulk' }),
-        readIfAclBinding(s, ifIndex, ifType)
-      ]);
-      acls = (aclRes.body && aclRes.body.results) || [];
+      if (!aclLoaded(s)) await aclRefresh(s);
+      const bind = await readIfAclBinding(s, ifIndex, ifType);
       clear(pane);
-      renderIfAclBinding(s, pane, ifIndex, ifType, acls, bind, opts);
+      renderIfAclBinding(s, pane, ifIndex, ifType, aclModel(s.health).acls, bind, opts);
     } catch (e) { clear(pane); pane.appendChild(el('div', 'sw-err', 'Could not read ACL binding: ' + e.message)); }
   }
 
-  function renderIfAclBinding(s, pane, ifIndex, ifType, aclRows, bind, opts) {
+  function renderIfAclBinding(s, pane, ifIndex, ifType, acls, bind, opts) {
+    // The in/out columns hold an IPv4 ACL (IPv6 ACLs have their own columns),
+    // so offer the IP lists, plus whatever is bound now if it is something else.
     const aclOptions = [{ label: '(none)', value: '0' }];
-    const nameByIdx = {};
-    for (const r of aclRows) { if (/QosAclName$/.test(r.column || '')) { const idx = String(r.index); nameByIdx[idx] = String(dvc(r)); aclOptions.push({ label: String(dvc(r)), value: idx }); } }
+    for (const a of acls) {
+      const current = String(a.idx) === String(bind.inAcl) || String(a.idx) === String(bind.outAcl);
+      if (a.type === 2 || a.type == null || current) aclOptions.push({ label: a.name, value: String(a.idx) });
+    }
     const defOptions = [{ label: 'Deny Any', value: '1' }, { label: 'Permit Any (forward)', value: '2' }];
 
     const form = el('div', 'snmp-form acl-form');
@@ -9519,9 +9484,10 @@
       controls.push(mkDir('Output', QOS_IFPOL.aclOut, QOS_IFPOL.defOut, bind.outAcl, bind.defOut));
     }
 
-    const { actions, apply } = applyActions('Apply binding');
-    const msg = el('div', 'port-detail-msg');
-    withConfirm(apply, async () => {
+    // Binding an ACL can stop traffic on the interface, so this keeps its
+    // two-tap confirm (standard B8: confirm when the click is drastic).
+    const { actions, apply, msg } = applyActions('Apply binding');
+    withConfirm(apply, (ev) => {
       const suffix = ifIndex + '.' + ifType;
       const vbs = [];
       const changedCtls = [];
@@ -9531,13 +9497,21 @@
         changedCtls.push(c.aclSel, c.defSel);
       }
       clear(msg);
-      runButtonAction(apply, {
+      runButtonAction(ev.currentTarget, {
         failLabel: 'Apply binding',
         run: () => snmpSet(s, vbs).then(() => ({ ok: true }), (e) => ({ ok: false, error: e.message })),
         ok: (r) => r && r.ok,
-        error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not apply binding \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+        error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not apply binding — ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
         onApplied: () => markConfigDirty(s, changedCtls),
-        settle: () => Promise.resolve()
+        // Read the binding back and re-read the ACL tables, so the form shows
+        // what the switch now holds before the spinner turns to Done.
+        settle: () => Promise.all([
+          readIfAclBinding(s, ifIndex, ifType).then((b) => {
+            const vals = opts.noDirection ? [[b.inAcl, b.defIn]] : [[b.inAcl, b.defIn], [b.outAcl, b.defOut]];
+            vals.forEach(([a, d], i) => { if (controls[i]) { controls[i].aclSel.value = String(a || 0); controls[i].defSel.value = d === 2 ? '2' : '1'; } });
+          }).catch(() => {}),
+          aclRefresh(s)
+        ])
       });
     });
     form.appendChild(actions); form.appendChild(msg);
@@ -9545,9 +9519,9 @@
   }
 
   // ---- ACL writes (QoS tuple model) ----
-  // The write path mirrors what we learned from the live data: an ACE is a row
-  // in rlQosAceTidxTable that points (via Tuple columns) at value rows in
-  // rlQosTupleTable, all under an ACL in rlQosAclTable. So creating a rule is:
+  // An ACE is a row in rlQosAceTidxTable that points (via Tuple columns) at
+  // value rows in rlQosTupleTable, all under an ACL in rlQosAclTable. So
+  // creating a rule is:
   //   1. ensure the ACL exists (create it if the name is new),
   //   2. create one tuple row per match field (type + value||mask + createAndGo),
   //   3. create the ACE row (action, type, the tuple pointers, createAndGo).
@@ -9556,7 +9530,7 @@
   // because this firmware exposes no free-index scalar for these tables.
 
   // Highest index currently in a walked set of rows (by their first index arc).
-  function maxIndex(rows, firstArcOnly) {
+  function maxIndex(rows) {
     let m = 0;
     for (const r of rows || []) {
       const first = parseInt(String(r.index).split('.')[0], 10);
@@ -9565,17 +9539,11 @@
     return m;
   }
 
-  // Delete one ACE: destroy its rlQosAceTidxTable row via the shared
-  // rowStatusDelete (so it gets the notInService->destroy fallback for a row the
-  // switch won't destroy directly), consistent with every other RowStatus delete.
-  function deleteQosAce(s, aclIdx, aceIdx) {
-    const suffix = aclIdx + '.' + aceIdx;
-    rowStatusDelete(s, QOS_ACL.aceStatus + '.' + suffix)
-      .then((res) => {
-        if (!res.ok || (res.body && res.body.error)) { toast('Could not delete rule: ' + ((res.body && res.body.error) || 'the switch rejected it'), 'error'); return; }
-        markConfigDirty(s);
-        aclRefresh(s);
-      }).catch((e) => toast('Could not delete rule: ' + e.message, 'error'));
+  // Delete one ACE with the shared rowStatusDelete (destroy, falling back to
+  // notInService -> destroy). Returns { ok, error } for runButtonAction.
+  async function deleteQosAce(s, aclIdx, aceIdx) {
+    try { return interpretSet(await rowStatusDelete(s, QOS_ACL.aceStatus + '.' + aclIdx + '.' + aceIdx)); }
+    catch (e) { return { ok: false, error: e.message }; }
   }
 
   // Build the value||mask octet string for an ip-src/ip-dest tuple from a
@@ -9592,15 +9560,16 @@
   // protocol tuple value||mask: 1 value byte + 1 exact mask (ff).
   function protoTupleHex(proto) { return proto.toString(16).padStart(2, '0') + 'ff'; }
 
-  // Create a rule. cfg: { aclName, aclType(1 ip), action, aceType, srcAny, srcIp,
-  // srcPref, dstAny, dstIp, dstPref, proto }. Returns on success, throws with the
-  // failing step on error.
+  // Create a rule. cfg: { aclName, aclType(2 ip), action, aceType, srcAny, srcIp,
+  // srcPref, dstAny, dstIp, dstPref, proto, tcpFlags }. Throws with the failing
+  // step on error.
   async function createQosAce(s, cfg) {
+    const h = s.health || {};
     // 1. Resolve or create the ACL by name.
     let aclIdx = null;
-    for (const r of (s._acl.acls || [])) { if (/QosAclName$/.test(r.column || '') && String(dvc(r)) === cfg.aclName) aclIdx = String(r.index); }
+    for (const a of aclModel(h).acls) { if (a.name === cfg.aclName) aclIdx = a.idx; }
     if (aclIdx === null) {
-      aclIdx = String(maxIndex(s._acl.acls || []) + 1);
+      aclIdx = String(maxIndex(h.aclNames) + 1);
       try {
         await snmpSet(s, [
           { oid: QOS_ACL.aclStatus + '.' + aclIdx, type: 'Integer', value: 4 },         // createAndGo
@@ -9611,8 +9580,7 @@
     }
 
     // 2. Create the tuple rows for each requested match field.
-    const tupleRows = s._acl.tuples || [];
-    let nextTuple = maxIndex(tupleRows) + 1;
+    let nextTuple = maxIndex(h.aclTuples) + 1;
     const pointers = [];   // tuple indices this ACE will reference
     const addTuple = async (typeVal, valueHex) => {
       const tIdx = String(nextTuple++);
@@ -9626,8 +9594,8 @@
       pointers.push(tIdx);
     };
     if (cfg.proto) await addTuple(TUPLE_TYPE_VAL.protocol, protoTupleHex(cfg.proto));
-    if (!cfg.srcAny) { const h = ipTupleHex(cfg.srcIp, cfg.srcPref); if (!h) throw new Error('bad source address'); await addTuple(TUPLE_TYPE_VAL['ip-src'], h); }
-    if (!cfg.dstAny) { const h = ipTupleHex(cfg.dstIp, cfg.dstPref); if (!h) throw new Error('bad destination address'); await addTuple(TUPLE_TYPE_VAL['ip-dest'], h); }
+    if (!cfg.srcAny) { const hx = ipTupleHex(cfg.srcIp, cfg.srcPref); if (!hx) throw new Error('bad source address'); await addTuple(TUPLE_TYPE_VAL['ip-src'], hx); }
+    if (!cfg.dstAny) { const hx = ipTupleHex(cfg.dstIp, cfg.dstPref); if (!hx) throw new Error('bad destination address'); await addTuple(TUPLE_TYPE_VAL['ip-dest'], hx); }
     // TCP flags tuple: byte1 = value (Set bits), byte2 = don't-care mask.
     // e.g. ACK+FIN Set, rest Unset-and-cared -> "11 00" (matches the switch).
     if (cfg.tcpFlags) {
@@ -9636,9 +9604,8 @@
     }
 
     // 3. Create the ACE under the ACL, pointing at the tuples.
-    const aceRows = s._acl.aces || [];
     let maxAce = 0;
-    for (const r of aceRows) { const parts = String(r.index).split('.'); if (parts[0] === aclIdx) { const a = parseInt(parts[1], 10); if (a > maxAce) maxAce = a; } }
+    for (const r of (h.aclAces || [])) { const parts = String(r.index).split('.'); if (parts[0] === aclIdx) { const a = parseInt(parts[1], 10); if (a > maxAce) maxAce = a; } }
     const aceIdx = String(maxAce + 1);
     const suffix = aclIdx + '.' + aceIdx;
     const vbs = [
@@ -9654,21 +9621,12 @@
 
   // Edit an ACE. The tuple model has no clean in-place "change the match fields"
   // operation (the ACE points at tuple rows; changing the match means different
-  // tuples), so editing is: destroy the old ACE, then create the replacement
-  // under the same ACL. The ACE index may change - fine, ACEs are index-ordered.
+  // tuples), so editing is: remove the old ACE, re-read the tables through the
+  // panel's refresh, then create the replacement under the same ACL.
   async function editQosAce(s, aclIdx, aceIdx, cfg) {
-    try {
-      await snmpSet(s, { oid: QOS_ACL.aceStatus + '.' + aclIdx + '.' + aceIdx, type: 'Integer', value: 6 });
-    } catch (e) { throw new Error('removing the old rule: ' + e.message); }
-    // Re-read so createQosAce picks correct free indices after the delete.
-    try {
-      const [aces, tuples] = await Promise.all([
-        apiPost('/api/snmp/walk', { target: s.target, oid: QOS_ACL.aceTidx, mode: 'getbulk' }),
-        apiPost('/api/snmp/walk', { target: s.target, oid: QOS_ACL.tuple, mode: 'getbulk' })
-      ]);
-      s._acl.aces = (aces.body && aces.body.results) || [];
-      s._acl.tuples = (tuples.body && tuples.body.results) || [];
-    } catch (e) { /* fall back to existing cached rows */ }
+    const del = await deleteQosAce(s, aclIdx, aceIdx);
+    if (!del.ok) throw new Error('removing the old rule: ' + del.error);
+    await aclRefresh(s);   // so createQosAce picks free indices after the delete
     await createQosAce(s, cfg);
   }
   // An address group: "Any" toggle + IP + prefix, wired so the inputs enable
@@ -9696,19 +9654,37 @@
   //   { fixedAcl: name }          -> add a rule to that existing ACL
   //   { newAcl: true }            -> create a new ACL by name
   //   { edit: {aclIdx, aceIdx, aclName, init} } -> edit an existing ACE
-  function qosAceAddForm(s, pane, close, opts) {
-    opts = opts || {};
+
+  // Open the rule form in the standard popout (Esc or x closes it). opts:
+  //   { newAcl: true }              -> create a new ACL by name with its first rule
+  //   { aclIdx, aclName }           -> add a rule to that existing ACL
+  //   { edit: {aclIdx, aceIdx, aclName, init} } -> edit an existing rule
+  function openAclRuleForm(s, opts) {
+    const title = opts.edit ? ('ACL · ' + opts.edit.aclName + ' · rule ' + opts.edit.aceIdx)
+      : (opts.newAcl ? 'New access list' : ('Add rule to ' + opts.aclName));
+    const tab = opts.edit ? 'Rule' : (opts.newAcl ? 'New ACL' : 'Add rule');
+    openTabbedPopout(s, title, [{ label: tab, fill: (pane, close) => aclRuleForm(s, pane, close, opts) }], []);
+  }
+  // A table row opens its rule, looked up from the current tables so the form
+  // is always pre-filled with what the switch holds now.
+  function openAclRuleEditor(s, aclIdx, aceIdx) {
+    const model = aclModel(s.health);
+    const acl = model.byIdx.get(String(aclIdx));
+    const ace = acl && acl.aces.get(String(aceIdx));
+    if (!acl || !ace) return;
+    openAclRuleForm(s, { edit: { aclIdx: acl.idx, aceIdx: ace.idx, aclName: acl.name, init: aclRuleView(ace, model.tupleMap).init } });
+  }
+
+  function aclRuleForm(s, pane, close, opts) {
     const editing = !!opts.edit;
     const init = (opts.edit && opts.edit.init) || {};
-    const aclName = opts.fixedAcl || (opts.edit && opts.edit.aclName) || '';
+    const aclName = opts.aclName || (opts.edit && opts.edit.aclName) || '';
     const form = el('div', 'snmp-form acl-form');
-    const title = editing ? ('Edit rule \u00b7 ' + aclName) : (opts.fixedAcl ? ('Add rule to ' + opts.fixedAcl) : 'New access list');
-    form.appendChild(el('h5', '', title));
 
     // --- Section: the list (only when naming a new one) + the basics ---
-    const basics = formSection(editing ? 'Rule' : (opts.fixedAcl ? 'Rule' : 'List & rule'));
+    const basics = formSection(opts.newAcl ? 'List & rule' : 'Rule');
     let nameIn = null;
-    if (!opts.fixedAcl && !editing) {
+    if (opts.newAcl) {
       nameIn = el('input'); nameIn.type = 'text'; nameIn.maxLength = 32; nameIn.placeholder = 'list name';
       basics.body.appendChild(field('ACL name', nameIn));
     }
@@ -9762,12 +9738,14 @@
     protoSel.addEventListener('change', syncFlagsVisible);
     syncFlagsVisible();
 
-    const { actions, apply } = applyActions(editing ? 'Save rule' : (opts.fixedAcl ? 'Add rule' : 'Create ACL'));
-    const msg = el('div', 'port-detail-msg');
-    withConfirm(apply, async () => {
+    // Adding is one tap; saving an edit replaces the rule, so it asks for a
+    // second tap (standard B8: confirm only when the click is drastic).
+    const { actions, apply, msg } = applyActions(editing ? 'Save rule' : (opts.newAcl ? 'Create ACL' : 'Add rule'));
+    withConfirm(apply, (ev) => {
       const name = aclName || (nameIn ? (nameIn.value || '').trim() : '');
       clear(msg);
       if (!name) { msg.appendChild(el('div', 'sw-err', 'Enter an ACL name.')); return; }
+      if (opts.newAcl && aclModel(s.health).acls.some((a) => a.name === name)) { msg.appendChild(el('div', 'sw-err', 'An ACL named “' + name + '” already exists. Use its Add rule instead.')); return; }
       if (!src.any.checked && !ipv4ToHex(src.ip.value)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid source IPv4 address.')); return; }
       if (!dst.any.checked && !ipv4ToHex(dst.ip.value)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid destination IPv4 address.')); return; }
       const protoName = protoSel.value;
@@ -9789,10 +9767,9 @@
         dstAny: dst.any.checked, dstIp: dst.ip.value, dstPref: parseInt(dst.pref.value, 10),
         tcpFlags
       };
-      clear(msg);
-      runButtonAction(apply, {
+      runButtonAction(ev.currentTarget, {
         failLabel: editing ? 'Save rule' : 'Add rule',
-        spinLabel: editing ? 'Saving\u2026' : (opts.fixedAcl ? 'Adding\u2026' : 'Creating\u2026'),
+        spinLabel: editing ? 'Saving…' : (opts.newAcl ? 'Creating…' : 'Adding…'),
         run: async () => {
           try {
             if (editing) await editQosAce(s, opts.edit.aclIdx, opts.edit.aceIdx, cfg);
@@ -9801,11 +9778,11 @@
           } catch (e) { return { ok: false, error: e.message }; }
         },
         ok: (r) => r && r.ok,
-        error: (r) => { msg.appendChild(el('div', 'sw-err', (editing ? 'Could not save rule \u2014 ' : 'Could not add rule \u2014 ') + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
-        onApplied: () => { const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove(); markConfigDirty(s); },
-        settle: () => aclRefresh(s)
+        error: (r) => { msg.appendChild(el('div', 'sw-err', (editing ? 'Could not save rule — ' : 'Could not add rule — ') + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+        onApplied: () => markConfigDirty(s),
+        settle: () => aclRefresh(s).then(() => close())
       });
-    });
+    }, { when: () => editing });
     form.appendChild(actions); form.appendChild(msg);
     pane.appendChild(form);
   }
@@ -9833,6 +9810,13 @@
     status:   '1.3.6.1.4.1.9.6.1.101.76.3.1.2',  // rlDhcpClActionStatus (RowStatus to enable)
     hostName: '1.3.6.1.4.1.9.6.1.101.76.3.1.3'
   };
+  // A routable unicast IPv4: first octet 1-223, not loopback/link-local. Rules
+  // out the 0.x / uninitialised placeholders a DHCP interface shows before it
+  // has a lease.
+  function isRealIp(ip) {
+    const o = String(ip).split('.').map(Number);
+    return o.length === 4 && o.every((n) => n >= 0 && n <= 255) && o[0] >= 1 && o[0] <= 223 && o[0] !== 127 && !(o[0] === 169 && o[1] === 254);
+  }
   // Prefix length -> dotted netmask.
   function prefToMask(p) { p = Math.max(0, Math.min(32, p | 0)); const m = p === 0 ? 0 : (0xffffffff << (32 - p)) >>> 0; return [24, 16, 8, 0].map((sh) => (m >>> sh) & 0xff).join('.'); }
   // Dotted netmask -> prefix length.

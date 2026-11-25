@@ -44,8 +44,8 @@
     // interactive and does not come from the health poll, so it loads
     // lazily (on expand / its own refresh) and is always offered.
     { key: 'snmpcfg', title: 'SNMP configuration', span: 12, h: 0, needs: () => true },
-    // Standard IP ACLs: interactive write module (list / add / delete rules,
-    // bind to interfaces), loaded on demand like snmpcfg.
+    // IP access lists (the QoS ACL tables): a keyed write panel whose tables
+    // are loaded on demand once per visit (14-acl.js).
     { key: 'acl', title: 'IP access lists', span: 12, h: 0, needs: () => true },
     // IPv4 Addressing: every interface address (VLAN SVIs and routed ports,
     // static or DHCP), global L3 status, the forwarding table, static routes,
@@ -77,7 +77,9 @@
       'radiusServers', 'radiusStats', 'tacacsServers',
       'dot1xHostStats', 'dot1xHostDiag', 'dot1xHostSession', 'vlans'],
     stp: ['stpPorts', 'stpExtPorts', 'mstpPorts', 'mstpInstances',
-          'pvstPorts', 'pvstVlans', 'pvstInconsistencies', 'stpxInconsistencies']
+          'pvstPorts', 'pvstVlans', 'pvstInconsistencies', 'stpxInconsistencies'],
+    // The panel's Refresh re-reads its own on-demand tables, not the whole switch.
+    acl: ['aclNames', 'aclAces', 'aclTuples']
   };
 
   // Open on the two panels that answer "how is this switch", and leave the
@@ -1309,9 +1311,11 @@
     // the regular poll, so a fresh full health has them empty. Carry the last
     // fetched copy forward rather than wiping it - otherwise an open panel that
     // needs it would re-fetch on every update ("ACL/MAC reloads on every open").
+    // An empty list that was actually read is carried too (a switch with no
+    // ACLs), so the panel does not fall back to "Waiting for data".
     if (s.health) {
       for (const k of ['macTable', 'aclNames', 'aclAces', 'aclTuples']) {
-        if ((!body[k] || !body[k].length) && s.health[k] && s.health[k].length) body[k] = s.health[k];
+        if ((!body[k] || !body[k].length) && Array.isArray(s.health[k]) && (s.health[k].length || !Array.isArray(body[k]))) body[k] = s.health[k];
       }
     }
     s.health = body;

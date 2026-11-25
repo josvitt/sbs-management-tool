@@ -21,6 +21,13 @@
     status:   '1.3.6.1.4.1.9.6.1.101.76.3.1.2',  // rlDhcpClActionStatus (RowStatus to enable)
     hostName: '1.3.6.1.4.1.9.6.1.101.76.3.1.3'
   };
+  // A routable unicast IPv4: first octet 1-223, not loopback/link-local. Rules
+  // out the 0.x / uninitialised placeholders a DHCP interface shows before it
+  // has a lease.
+  function isRealIp(ip) {
+    const o = String(ip).split('.').map(Number);
+    return o.length === 4 && o.every((n) => n >= 0 && n <= 255) && o[0] >= 1 && o[0] <= 223 && o[0] !== 127 && !(o[0] === 169 && o[1] === 254);
+  }
   // Prefix length -> dotted netmask.
   function prefToMask(p) { p = Math.max(0, Math.min(32, p | 0)); const m = p === 0 ? 0 : (0xffffffff << (32 - p)) >>> 0; return [24, 16, 8, 0].map((sh) => (m >>> sh) & 0xff).join('.'); }
   // Dotted netmask -> prefix length.

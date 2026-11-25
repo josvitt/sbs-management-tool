@@ -200,10 +200,6 @@ const TABLE_WALKS = {
   aclNames:  { raw: true, onDemand: true, maxRows: 2000, oid: '1.3.6.1.4.1.9.6.1.101.88.7.1' },     // name(.2)+type(.3)
   aclAces:   { raw: true, onDemand: true, maxRows: 4000, oid: '1.3.6.1.4.1.9.6.1.101.88.31' },      // ACE table (action/type/tuple ptrs)
   aclTuples: { raw: true, onDemand: true, maxRows: 4000, oid: '1.3.6.1.4.1.9.6.1.101.88.5' },       // tuple values
-  aclRules:   { oid: 'rlIpStdAclTable', maxRows: 2000, onDemand: true, columns: [
-    'rlIpStdAclSrcClassificationType', 'rlIpStdAclSrcIpAddr', 'rlIpStdAclSrcPrefLen',
-    'rlIpStdAclDstClassificationType', 'rlIpStdAclDstIpAddr', 'rlIpStdAclDstPrefLen',
-    'rlIpStdAclAction'] },
   bridgePorts: { oid: 'dot1dBasePortTable', maxRows: 1000, columns: ['dot1dBasePortIfIndex'] },
   // The operational VLAN table. Switches populate this even when the
   // static table is sparse, which is why membership has to come from here
