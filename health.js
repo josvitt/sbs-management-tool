@@ -1267,9 +1267,15 @@ async function collect({ get, walk, only, previous }) {
     // form.
     if (spec.raw) {
       const oids = spec.oids || [spec.oid];
+      // `raw` here means "do not pivot". The shared walk has its own `raw`
+      // option (bare varbinds with no index or column), so it must not be
+      // passed through, or every row loses the index and column the panel
+      // joins on and the tables read as empty.
+      const walkOpts = Object.assign({}, spec);
+      delete walkOpts.raw;
       const out = [];
       for (const oid of oids) {
-        try { for (const r of await walk(oid, spec)) out.push(r); }
+        try { for (const r of await walk(oid, walkOpts)) out.push(r); }
         catch (e) { /* a subtree this model lacks is not a failed table */ }
       }
       return out;
