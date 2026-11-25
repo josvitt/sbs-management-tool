@@ -393,7 +393,7 @@
             ['Source', cur.source], ['Shared key', cur.key]]
           : [['Address', cur.addr], ['Port', cur.port], ['Connection', cur.status], ['Type', cur.type],
             ['Priority', cur.priority], ['Timeout (s)', cur.timeout], ['Shared key', cur.key]];
-        for (const [k, v] of pairs) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
+        for (const [k, v] of pairs) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', enumWord(String(v)))); }
         pane.appendChild(dl);
       } });
     }
@@ -405,7 +405,7 @@
           const val = (v && typeof v === 'object') ? (v.display !== undefined ? v.display : v.value) : v;
           if (val === undefined || val === null || val === '') continue;
           dl.appendChild(el('dt', '', k.replace(/^radiusAuthClient/, '').replace(/^radiusAuthServer/, 'Server ').replace(/([A-Z])/g, ' $1').trim()));
-          dl.appendChild(el('dd', '', String(val)));
+          dl.appendChild(el('dd', '', enumWord(String(val))));
         }
         pane.appendChild(dl);
       } });

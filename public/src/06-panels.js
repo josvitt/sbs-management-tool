@@ -499,7 +499,7 @@
   function openDetailDialog(s, title, pairs, sections) {
     const grid = (ps) => {
       const dl = el('dl', 'port-detail-grid');
-      for (const [k, v] of ps) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
+      for (const [k, v] of ps) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', enumWord(String(v)))); }
       return dl;
     };
     openTabbedPopout(s, title, [{ label: 'Details', fill: (pane) => {
@@ -568,7 +568,7 @@
     // ---- Port tab: identity fields + PoE, then physical settings below ----
     tabs.push({ label: 'Port', fill: (pane) => {
       const defs = el('dl', 'port-detail-grid');
-      const addField = (k, v) => { if (v === undefined || v === null || v === '') return; defs.appendChild(el('dt', '', k)); defs.appendChild(el('dd', '', String(v))); };
+      const addField = (k, v) => { if (v === undefined || v === null || v === '') return; defs.appendChild(el('dt', '', k)); defs.appendChild(el('dd', '', enumWord(String(v)))); };
       for (const k in (detail.fields || {})) addField(k, detail.fields[k]);
       if (detail.poe) { for (const k in detail.poe) addField('PoE ' + k, detail.poe[k]); }
       if (defs.children.length) pane.appendChild(defs);
@@ -629,7 +629,7 @@
         }, 10000);
         popTimers.push(ctrTimer);
         const cActions = el('div', 'snmp-form-actions'); cActions.style.marginTop = '8px';
-        const clearBtn = el('button', 'btn btn-small btn-amber', 'Clear counters'); clearBtn.type = 'button';
+        const clearBtn = el('button', 'btn btn-small btn-danger', 'Clear counters'); clearBtn.type = 'button';
         const cMsg = el('div', 'sw-msg');
         clearBtn.addEventListener('click', (ev) => {
           clear(cMsg);

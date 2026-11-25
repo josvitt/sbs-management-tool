@@ -589,7 +589,7 @@
         ? 'The running configuration has not been saved. A reload would revert these ' +
           changed + ' line(s) to the startup configuration.'
         : 'The switch reports unsaved changes. Saving clears that.'));
-      const go = el('button', 'btn btn-amber', 'Save running to startup');
+      const go = el('button', 'btn', 'Save running to startup');
       go.type = 'button'; go.style.width = 'auto';
       go.title = 'Copies running-config over startup-config on the switch';
       // Two taps (B8): the first arms the button, the second overwrites startup.

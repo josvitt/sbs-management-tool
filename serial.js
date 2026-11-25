@@ -19,8 +19,9 @@ let loadError = null;
 try {
   SerialPort = require('serialport').SerialPort;
 } catch (e) {
-  loadError = e.message;
-  log.warn('serial', 'Serial support unavailable', { message: e.message });
+  // The stack and paths go to the log; the person sees what to do.
+  loadError = 'Serial support isn\u2019t installed on this computer. Run npm install in the app folder (or reinstall the app) to add it, then restart the app.';
+  log.warn('serial', 'Serial support unavailable', { message: e.message, stack: e.stack });
 }
 
 // The rates a Catalyst console actually uses, most likely first. 115200 is
@@ -79,7 +80,7 @@ async function release(path) {
  */
 async function listPorts() {
   if (!SerialPort) {
-    return { available: false, error: loadError || 'serialport module not installed', ports: [] };
+    return { available: false, error: loadError || 'Serial support isn\u2019t installed on this computer.', ports: [] };
   }
   try {
     const ports = await SerialPort.list();

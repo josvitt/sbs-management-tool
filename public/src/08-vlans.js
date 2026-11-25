@@ -417,7 +417,7 @@
       cosIn.value = String(scn('vlanVoiceAutoAdminVpt') || '0');
       const dscpIn = el('input'); dscpIn.type = 'number'; dscpIn.min = '0'; dscpIn.max = '63'; dscpIn.style.width = '58px';
       dscpIn.value = String(scn('vlanVoiceAutoAdminDscp') || '0');
-      const applyCfg = el('button', 'btn btn-small btn-blue', 'Apply'); applyCfg.type = 'button'; applyCfg.style.marginLeft = '6px';
+      const applyCfg = el('button', 'btn btn-small', 'Apply'); applyCfg.type = 'button'; applyCfg.style.marginLeft = '6px';
       applyCfg.addEventListener('click', (e) => {
         const curMode = scn('vlanVoiceAdminState');
         const mode = parseInt(modeSel.value, 10);
@@ -529,7 +529,7 @@
       const cosIn = el('input'); cosIn.type = 'number'; cosIn.min = '0'; cosIn.max = '7'; cosIn.style.width = '52px'; cosIn.value = String(cos != null ? cos : 0);
       const remarkChk = el('input'); remarkChk.type = 'checkbox'; remarkChk.checked = (remark === 1);
       const agingIn = el('input'); agingIn.type = 'number'; agingIn.min = '1'; agingIn.max = '43200'; agingIn.style.width = '72px'; agingIn.value = String(aging != null ? aging : 1);
-      const apply = el('button', 'btn btn-small btn-blue', 'Apply'); apply.type = 'button'; apply.style.marginLeft = '6px';
+      const apply = el('button', 'btn btn-small', 'Apply'); apply.type = 'button'; apply.style.marginLeft = '6px';
       apply.addEventListener('click', (e) => {
         const nc = parseInt(cosIn.value, 10), na = parseInt(agingIn.value, 10), nr = remarkChk.checked ? 1 : 2;
         const vbs = [];

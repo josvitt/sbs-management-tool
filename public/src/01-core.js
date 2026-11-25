@@ -225,7 +225,7 @@
   function applyActions(label, opts) {
     opts = opts || {};
     const actions = el('div', 'snmp-form-actions');
-    const apply = el('button', 'btn btn-small btn-blue', label || 'Apply'); apply.type = 'button';
+    const apply = el('button', 'btn btn-small', label || 'Apply'); apply.type = 'button';
     const msg = el('div', opts.msgClass || 'port-detail-msg');
     actions.appendChild(apply);
     for (const b of opts.extra || []) if (b) actions.appendChild(b);
@@ -589,8 +589,21 @@
     return { sec, body };
   }
 
+  // Values are words, not SNMP codes (MODULE-STANDARD A3): the server writes
+  // an enum as "up (1)"; on screen it reads "up". Anything else is unchanged.
+  // enumCode gives the number back, for a tooltip.
+  function enumWord(v) {
+    if (typeof v !== 'string') return v;
+    const m = /^([A-Za-z][\w-]*) \((-?\d+)\)$/.exec(v.trim());
+    return m ? m[1] : v;
+  }
+  function enumCode(v) {
+    const m = typeof v === 'string' ? /^([A-Za-z][\w-]*) \((-?\d+)\)$/.exec(v.trim()) : null;
+    return m ? m[2] : null;
+  }
+
   // A cell's display text, falling back to its raw value (ACL and port-channel
-  // cells).
+  // cells). Logic parses this, so it keeps the code; show it with enumWord.
   function dvc(cell) { return cell ? (cell.display !== undefined && cell.display !== null && cell.display !== '' ? cell.display : cell.value) : ''; }
 
   const q2 = (s, sel) => s.pane.querySelector(sel);

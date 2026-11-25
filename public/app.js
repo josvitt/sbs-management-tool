@@ -237,7 +237,7 @@
   function applyActions(label, opts) {
     opts = opts || {};
     const actions = el('div', 'snmp-form-actions');
-    const apply = el('button', 'btn btn-small btn-blue', label || 'Apply'); apply.type = 'button';
+    const apply = el('button', 'btn btn-small', label || 'Apply'); apply.type = 'button';
     const msg = el('div', opts.msgClass || 'port-detail-msg');
     actions.appendChild(apply);
     for (const b of opts.extra || []) if (b) actions.appendChild(b);
@@ -601,8 +601,21 @@
     return { sec, body };
   }
 
+  // Values are words, not SNMP codes (MODULE-STANDARD A3): the server writes
+  // an enum as "up (1)"; on screen it reads "up". Anything else is unchanged.
+  // enumCode gives the number back, for a tooltip.
+  function enumWord(v) {
+    if (typeof v !== 'string') return v;
+    const m = /^([A-Za-z][\w-]*) \((-?\d+)\)$/.exec(v.trim());
+    return m ? m[1] : v;
+  }
+  function enumCode(v) {
+    const m = typeof v === 'string' ? /^([A-Za-z][\w-]*) \((-?\d+)\)$/.exec(v.trim()) : null;
+    return m ? m[2] : null;
+  }
+
   // A cell's display text, falling back to its raw value (ACL and port-channel
-  // cells).
+  // cells). Logic parses this, so it keeps the code; show it with enumWord.
   function dvc(cell) { return cell ? (cell.display !== undefined && cell.display !== null && cell.display !== '' ? cell.display : cell.value) : ''; }
 
   const q2 = (s, sel) => s.pane.querySelector(sel);
@@ -1242,8 +1255,9 @@
     if (st) st.classList.toggle('disabled', !on);
   }
 
-  /** Tint the whole sub-tab, so the Health tab carries the same verdict
-   *  colour as the Overview badge rather than only a small dot. */
+  /** Colour the sub-tab's dot with the verdict, so the Overview tab carries
+   *  the same colour as the Overview badge. Only the dot: the underline is
+   *  the open tab's. */
   function subTint(s, view, sev) {
     const st = s.subtabs.find((x) => x.dataset.view === view);
     if (!st) return;
@@ -2829,9 +2843,21 @@
 
   // ---------- rendering ----------
   const SEV_ORDER = { critical: 0, warning: 1, info: 2, ok: 3 };
-  const stateClass = (v) => /normal|^on\b|^up|^ok$/i.test(v) ? 'good'
-    : (/critical|shutdown|notFunctioning|faulty|fail/i.test(v) ? 'crit'
-    : (/notPresent|notAvailable|^off|^down/i.test(v) ? 'idle' : 'warn'));
+  // A status word's pill: healthy words are good, broken ones crit, the
+  // states that need a look warn, and anything else neutral. The word is
+  // matched without the SNMP code ("ok (1)" is ok). An unknown word is never
+  // a warning: on a healthy switch most of the screen is states nobody
+  // listed here.
+  const STATE_GOOD = /^(normal|on|up|ok|good|green|active|enabled|true|yes|present|operational|forwarding|designated|root|deliveringPower|configured|connected|established|authorized|running|success|complete|completed)$/i;
+  const STATE_CRIT = /critical|shutdown|notFunctioning|faulty|fault|fail|error|^red$|^bad$|unauthorized|errDisabled|err-disabled/i;
+  const STATE_WARN = /^(warning|degraded|testing|yellow|amber|overload|otherFault|lowerLayerDown|dormant|unknown|inconsistent|broken|denied|stale)$/i;
+  const stateClass = (v) => {
+    const w = String(enumWord(String(v == null ? '' : v))).trim();
+    if (STATE_GOOD.test(w)) return 'good';
+    if (STATE_CRIT.test(w)) return 'crit';
+    if (STATE_WARN.test(w)) return 'warn';
+    return 'idle';
+  };
 
   // ============================================================================
   // Keyed table reconciliation engine
@@ -2849,7 +2875,8 @@
   //
   // Cell specs are the same shapes the legacy table() builder accepts:
   //   plain string/number            -> text cell
-  //   { v, pill }                    -> coloured status pill
+  //   { v, pill }                    -> coloured status pill (pill: true picks the
+  //                                     colour from the word; 'good'|'warn'|'crit'|'idle' sets it)
   //   { v, click:{open} }            -> row-opens-detail link cell
   //   { actions }                    -> port action buttons (via portActionsCell)
   //   { vlanDelete }                 -> VLAN delete cell
@@ -2906,14 +2933,20 @@
     const pillText = c && c.pill ? String(c.v === undefined || c.v === null ? '' : c.v).trim() : '';
     if (c && c.pill && pillText) {
       const td = document.createElement('td');
-      td.appendChild(el('span', 'pill ' + stateClass(pillText), c.v));
+      const pv = typeof c.pill === 'string' ? c.pill : stateClass(pillText);
+      const sp = el('span', 'pill ' + pv, enumWord(pillText));
+      if (enumCode(pillText) !== null) sp.title = pillText;
+      td.appendChild(sp);
       return td;
     }
     if (c && c.pill) return el('td', 'col-value', '');
     const text = (c && typeof c === 'object')
       ? (c.v === undefined || c.v === null ? '' : c.v)
       : (c === undefined || c === null ? '' : c);
-    return el('td', 'col-value', typeof text === 'object' ? '' : text);
+    if (typeof text === 'object') return el('td', 'col-value', '');
+    const td = el('td', 'col-value', enumWord(text));
+    if (enumCode(text) !== null) td.title = text;
+    return td;
   }
 
   // A stable signature of a cell's rendered content, used to decide whether a
@@ -3664,7 +3697,7 @@
   function openDetailDialog(s, title, pairs, sections) {
     const grid = (ps) => {
       const dl = el('dl', 'port-detail-grid');
-      for (const [k, v] of ps) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
+      for (const [k, v] of ps) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', enumWord(String(v)))); }
       return dl;
     };
     openTabbedPopout(s, title, [{ label: 'Details', fill: (pane) => {
@@ -3733,7 +3766,7 @@
     // ---- Port tab: identity fields + PoE, then physical settings below ----
     tabs.push({ label: 'Port', fill: (pane) => {
       const defs = el('dl', 'port-detail-grid');
-      const addField = (k, v) => { if (v === undefined || v === null || v === '') return; defs.appendChild(el('dt', '', k)); defs.appendChild(el('dd', '', String(v))); };
+      const addField = (k, v) => { if (v === undefined || v === null || v === '') return; defs.appendChild(el('dt', '', k)); defs.appendChild(el('dd', '', enumWord(String(v)))); };
       for (const k in (detail.fields || {})) addField(k, detail.fields[k]);
       if (detail.poe) { for (const k in detail.poe) addField('PoE ' + k, detail.poe[k]); }
       if (defs.children.length) pane.appendChild(defs);
@@ -3794,7 +3827,7 @@
         }, 10000);
         popTimers.push(ctrTimer);
         const cActions = el('div', 'snmp-form-actions'); cActions.style.marginTop = '8px';
-        const clearBtn = el('button', 'btn btn-small btn-amber', 'Clear counters'); clearBtn.type = 'button';
+        const clearBtn = el('button', 'btn btn-small btn-danger', 'Clear counters'); clearBtn.type = 'button';
         const cMsg = el('div', 'sw-msg');
         clearBtn.addEventListener('click', (ev) => {
           clear(cMsg);
@@ -4589,7 +4622,7 @@
     const d = detail.dot1x;
     // Current state, always shown.
     const dl = el('dl', 'port-detail-grid');
-    const row = (k, v) => { if (v) { dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', v)); } };
+    const row = (k, v) => { if (v) { dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', enumWord(v))); } };
     row('Port-control', d.control || '(not set)');
     row('Status', d.status || '(unknown)');
     row('Host-mode', d.hostMode || '(not set)');
@@ -4794,7 +4827,7 @@
       const val = vb.display !== undefined && vb.display !== null && vb.display !== String(vb.value)
         ? vb.display : vb.value;
       dlg.appendChild(el('dt', '', row[0]));
-      dlg.appendChild(el('dd', '', String(val === undefined || val === null ? '' : val)));
+      dlg.appendChild(el('dd', '', enumWord(String(val === undefined || val === null ? '' : val))));
     }
     if (dlg.children.length) {
       wrap.appendChild(dlg);
@@ -5307,7 +5340,7 @@
       cosIn.value = String(scn('vlanVoiceAutoAdminVpt') || '0');
       const dscpIn = el('input'); dscpIn.type = 'number'; dscpIn.min = '0'; dscpIn.max = '63'; dscpIn.style.width = '58px';
       dscpIn.value = String(scn('vlanVoiceAutoAdminDscp') || '0');
-      const applyCfg = el('button', 'btn btn-small btn-blue', 'Apply'); applyCfg.type = 'button'; applyCfg.style.marginLeft = '6px';
+      const applyCfg = el('button', 'btn btn-small', 'Apply'); applyCfg.type = 'button'; applyCfg.style.marginLeft = '6px';
       applyCfg.addEventListener('click', (e) => {
         const curMode = scn('vlanVoiceAdminState');
         const mode = parseInt(modeSel.value, 10);
@@ -5419,7 +5452,7 @@
       const cosIn = el('input'); cosIn.type = 'number'; cosIn.min = '0'; cosIn.max = '7'; cosIn.style.width = '52px'; cosIn.value = String(cos != null ? cos : 0);
       const remarkChk = el('input'); remarkChk.type = 'checkbox'; remarkChk.checked = (remark === 1);
       const agingIn = el('input'); agingIn.type = 'number'; agingIn.min = '1'; agingIn.max = '43200'; agingIn.style.width = '72px'; agingIn.value = String(aging != null ? aging : 1);
-      const apply = el('button', 'btn btn-small btn-blue', 'Apply'); apply.type = 'button'; apply.style.marginLeft = '6px';
+      const apply = el('button', 'btn btn-small', 'Apply'); apply.type = 'button'; apply.style.marginLeft = '6px';
       apply.addEventListener('click', (e) => {
         const nc = parseInt(cosIn.value, 10), na = parseInt(agingIn.value, 10), nr = remarkChk.checked ? 1 : 2;
         const vbs = [];
@@ -5837,7 +5870,7 @@
             ['Source', cur.source], ['Shared key', cur.key]]
           : [['Address', cur.addr], ['Port', cur.port], ['Connection', cur.status], ['Type', cur.type],
             ['Priority', cur.priority], ['Timeout (s)', cur.timeout], ['Shared key', cur.key]];
-        for (const [k, v] of pairs) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', String(v))); }
+        for (const [k, v] of pairs) { if (v === undefined || v === null || v === '') continue; dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', enumWord(String(v)))); }
         pane.appendChild(dl);
       } });
     }
@@ -5849,7 +5882,7 @@
           const val = (v && typeof v === 'object') ? (v.display !== undefined ? v.display : v.value) : v;
           if (val === undefined || val === null || val === '') continue;
           dl.appendChild(el('dt', '', k.replace(/^radiusAuthClient/, '').replace(/^radiusAuthServer/, 'Server ').replace(/([A-Z])/g, ' $1').trim()));
-          dl.appendChild(el('dd', '', String(val)));
+          dl.appendChild(el('dd', '', enumWord(String(val))));
         }
         pane.appendChild(dl);
       } });
@@ -6517,7 +6550,7 @@
           qa.appendChild(b);
           return b;
         };
-        act(s.tech ? 'Recollect tech-support' : 'Collect tech-support', 'btn-amber',
+        act(s.tech ? 'Recollect tech-support' : 'Collect tech-support', '',
           () => startTechCollect(s), s.techBusy, 'Runs show tech-support over SSH');
         if (s.tech) {
           act('View tech-support', '', () => openOverlay(s, 'techOverlay'));
@@ -6551,7 +6584,7 @@
           if (value === null || value === undefined || value === '') return;
           const c = el('div', 'card');
           c.appendChild(el('div', 'card-label', label));
-          c.appendChild(el('div', 'card-value' + (cls ? ' ' + cls : ''), value));
+          c.appendChild(el('div', 'card-value' + (cls ? ' ' + cls : ''), enumWord(value)));
           if (sub) c.appendChild(el('div', 'card-sub', sub));
           if (trend) {
             const spark = sparkline(
@@ -7513,7 +7546,7 @@
             if (v === undefined || v === null || v === '') continue;
             const row = el('div', 'kv-row');
             row.appendChild(el('div', 'k', k));
-            row.appendChild(el('div', 'v', v));
+            row.appendChild(el('div', 'v', enumWord(v)));
             box.appendChild(row);
           }
         };
@@ -8284,7 +8317,7 @@
     row.appendChild(el('span', 'card-sub', 'Send'));
     row.appendChild(sev);
 
-    const go = el('button', 'btn btn-amber', 'Configure this switch');
+    const go = el('button', 'btn', 'Configure this switch');
     go.type = 'button'; go.style.width = 'auto';
     // Two taps (B8): the first arms the button, the second writes.
     withConfirm(go, () => configureSyslog(s, sev.value), {
@@ -8913,7 +8946,7 @@
         ? 'The running configuration has not been saved. A reload would revert these ' +
           changed + ' line(s) to the startup configuration.'
         : 'The switch reports unsaved changes. Saving clears that.'));
-      const go = el('button', 'btn btn-amber', 'Save running to startup');
+      const go = el('button', 'btn', 'Save running to startup');
       go.type = 'button'; go.style.width = 'auto';
       go.title = 'Copies running-config over startup-config on the switch';
       // Two taps (B8): the first arms the button, the second overwrites startup.
@@ -9906,7 +9939,7 @@
       pane.appendChild(el('div', 'card-sub', iface.name + ' has no IPv4 interface configured.'));
       if (sviIfIndex == null) pane.appendChild(el('div', 'sw-err', 'Could not resolve this ' + iface.noun + '\u2019s L3 ifIndex (needed to add an address).'));
       const addRow = el('div', 'snmp-form-actions'); addRow.style.marginTop = '10px';
-      const addBtn = el('button', 'btn btn-small btn-blue', iface.addLabel || 'Add IPv4 address'); addBtn.type = 'button';
+      const addBtn = el('button', 'btn btn-small', iface.addLabel || 'Add IPv4 address'); addBtn.type = 'button';
       addBtn.disabled = sviIfIndex == null;
       addBtn.addEventListener('click', () => { clear(pane); sviConfigForm(s, iface, sviIfIndex, pane, null, false, done); });
       addRow.appendChild(addBtn); pane.appendChild(addRow);
@@ -10558,7 +10591,7 @@
       body.appendChild(field('Metric', metricIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add route'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add route'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const dest = destIn.value.trim(), mask = maskIn.value.trim(), nh = nhIn.value.trim();
         const metric = parseInt(metricIn.value, 10) || 1;
@@ -10588,7 +10621,7 @@
       body.appendChild(field('Domain name', nameIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add domain'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add domain'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const name = nameIn.value.trim();
         if (!name) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a domain name.')); return; }
@@ -10615,7 +10648,7 @@
       body.appendChild(field('Server IP', addrIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add nameserver'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add nameserver'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const addr = addrIn.value.trim();
         const vbs = nameserverVarbinds(addr);
@@ -10645,7 +10678,7 @@
       body.appendChild(field('IP address', addrIn));
       form.appendChild(sec);
       const msg = el('div', 'port-detail-msg');
-      const apply = el('button', 'btn btn-small btn-blue', 'Add mapping'); apply.type = 'button';
+      const apply = el('button', 'btn btn-small', 'Add mapping'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const name = nameIn.value.trim(), addr = addrIn.value.trim();
         if (!name || !/^\d+\.\d+\.\d+\.\d+$/.test(addr)) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a host name and a valid IPv4 address.')); return; }
@@ -13809,6 +13842,13 @@
 
   function openMib() {
     mibPanel.classList.add('open');
+    // Two blank panes say nothing; say what to do (design review finding 17).
+    if (!mibResults.children.length && !mibQ.value.trim()) {
+      mibResults.appendChild(el('div', 'empty-state', 'Search by name or OID, or pick a filter above.'));
+    }
+    if (!mibDetail.children.length) {
+      mibDetail.appendChild(el('div', 'empty-state', 'Pick an object to see its OID, access, description and values.'));
+    }
     loadProducts().then(() => {
       // Populate the product picker once, from the registry.
       if (mibProduct && !mibProduct.options.length) {
@@ -13974,7 +14014,7 @@
     });
     acts.appendChild(add);
 
-    const copy = el('button', 'btn btn-amber', 'Copy OID');
+    const copy = el('button', 'btn btn-blue', 'Copy OID');
     copy.type = 'button';
     copy.addEventListener('click', () => {
       const text = e.oid;
@@ -14192,7 +14232,7 @@
       'Only needed if checks say GitHub\'s hourly limit is used up, for example when many PCs share one internet address. ' +
       'Make one on GitHub: Settings → Developer settings → Fine-grained tokens → Generate, with Public repositories (read-only) access and no permissions. It is sent only to api.github.com.'));
     const tokRow = el('div', 'row-split update-actions');
-    const saveTok = el('button', 'btn btn-blue', 'Save token'); saveTok.type = 'button';
+    const saveTok = el('button', 'btn', 'Save token'); saveTok.type = 'button';
     saveTok.addEventListener('click', () => runButtonAction(saveTok, {
       failLabel: 'Save token',
       run: () => tokenInput.value.trim()

@@ -477,6 +477,11 @@ const disp = (row, col) => {
 function sensorValue(row) {
   const raw = Number(val(row, 'entPhySensorValue'));
   if (!Number.isFinite(raw)) return null;
+  // C1300 and C1300X firmware report temperature sensors with precision 1
+  // but whole degrees in the value (41-53 on two running switches, 25 Nov
+  // 2026: 4.1-5.3 degrees is not possible indoors, and the Hardware panel has
+  // always shown the raw value). So a Celsius reading is whole degrees.
+  if (/celsius|^8$/i.test(String(val(row, 'entPhySensorType') || ''))) return raw;
   const precision = Number(val(row, 'entPhySensorPrecision')) || 0;
   return precision > 0 ? raw / Math.pow(10, precision) : raw;
 }

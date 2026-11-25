@@ -173,14 +173,21 @@ Text:
 Accents — **each color carries one meaning; do not use a color against its meaning**:
 - `--amber: #e8a33d` — **structure & headings**. Section titles, table headers,
   panel heads, form-section titles. Amber is the "this is a label/heading" color.
-  It is never an action color.
-- `--green: #4fd88a` — **action & healthy**. Add/apply buttons, the primary `.btn`,
-  the "good/ON/active" pill. Green is "do this" and "this is well".
+  It is never an action color and never a status color.
+- `--warn: #e6cf4a` — **warning**. The `warn` pill, the `.sw-warn` line and a
+  warning alert. Yellow, so a warning never reads as a heading.
+- `--green: #4fd88a` — **apply & healthy**. Every apply, save, add or run button
+  (the primary `.btn`, `.tbl-add-btn`), the "good/ON/active" pill. Green is "do
+  this" and "this is well".
 - `--red: #e2604f` — **danger & critical**. Delete/destroy buttons, the "crit" pill,
   error states.
-- `--blue: #5fb3e8` — **informational / a distinct secondary action** (`.btn-blue`,
-  e.g. a form's primary Add inside a modal where green is the row control).
-- `--violet: #b08bf0` — **special/rare** category (used sparingly, ~5 places).
+- `--blue: #5fb3e8` — **informational / secondary action** (`.btn-blue`): an action
+  beside the primary one that is not the form's purpose (Open console, Test,
+  Refresh this table), and informational text such as an INFO log level.
+- `--violet: #b08bf0` — **special/rare** category for data only (a topology or
+  chart category, ~5 places). Never a button.
+- Buttons come in three colors only: green (apply/save/run), blue (secondary),
+  red (destructive). There are no amber or violet buttons.
 - There is a parallel `--t-*` palette scoped to the topology view only; outside
   topology, use the palette above.
 
@@ -191,8 +198,9 @@ Type & chrome:
 ## A3. Typography scale (use these sizes; do not introduce new ones)
 
 Monospace throughout. The established scale (by frequency in the app):
-- **10px** — section titles, panel heads, table headers, pills, `card-sub` notes.
-  Uppercase + `letter-spacing: 0.1em` for titles/heads.
+- **10px** — the smallest size. Section titles, panel heads, table headers, pills,
+  `card-sub` notes, badges and counts. Uppercase + `letter-spacing: 0.1em` for
+  titles/heads.
 - **10.5–11px** — buttons (`tbl-add-btn`, `tbl-act-btn`), small controls.
 - **11.5px** — table cell data (`data-table td`), the primary `.btn`.
 - **12px** — form field labels.
@@ -200,15 +208,23 @@ Monospace throughout. The established scale (by frequency in the app):
 - **14px** — body base.
 - Larger (15–22px) is reserved for headline figures (e.g. `poe-used`).
 
+Nothing is smaller than 10px, and there are no sizes between the steps above
+(no 8.5, 9, 9.5 or 12.5px).
+
 Rules: titles/headers/pills are **uppercase with letter-spacing**; body and table
-data are not. Never bold for emphasis in prose — hierarchy comes from size, color,
-and the amber rule, not weight.
+data are not. **Form field labels are sentence case** ("IP address", "Capture
+name"), never uppercase, in Settings and popouts alike. Never bold for emphasis in
+prose — hierarchy comes from size, color, and the amber rule, not weight.
+
+**Values are words, not SNMP codes.** A displayed enum reads `up`, `true`, `green`,
+`celsius`, never `up (1)`. `enumWord(cell)` (01-core.js) drops the code; the code
+stays in the cell's tooltip and in the MIB Explorer.
 
 ## A4. Spacing & shape
 
 - **Radius scale**: `3px` (default — pills, `.btn`, chips), `4px` (buttons, flashed
-  cells), `5px` (panels, inputs). Larger radii (6–8px) exist for banners only. Use
-  the smallest that fits the component class.
+  cells), `5px` (panels, inputs), `8px` (banners and overlays). A circle (a dot) is
+  `50%`. No other radii.
 - **Panel padding**: `.panel-body`/`.scroll-body` own their padding (10–14px); a
   module does not add its own outer padding.
 - **Section rhythm**: `.section-title` carries `margin: 16px 0 7px` and a
@@ -237,8 +253,8 @@ here), never as inline styles on a one-off node.
   A muted bordered button that colors to its variant (`danger` → red) on intent.
   The standard per-row Delete/edit affordance.
 - **Primary/secondary buttons** — `.btn` (green, full-width, uppercase) and variants
-  `.btn-blue/.btn-danger/.btn-amber/.btn-violet`; `.btn-small` for inline. Color by
-  meaning (A2).
+  `.btn-blue` (secondary) and `.btn-danger` (destructive); `.btn-small` for inline.
+  Color by meaning (A2). A form's apply button is always green.
 - **Form** — a modal via `openTabbedPopout(s, title, tabs, [])`; inside, group with
   `formSection(title)` (amber ruled title) and lay out fields with `field(label,
   control)` (`.snmp-field`: stacked label + input). `openTabbedPopout` is the only
@@ -256,6 +272,17 @@ Motion exists only to confirm change, never to decorate:
 - A button action spins, then shows ✓ Done briefly, then reverts — owned entirely
   by `runButtonAction` (§B6). A module never writes its own spinner/done logic.
 - Hover transitions on buttons are 0.12s fill. Nothing else animates.
+- **Reduced motion**: under `prefers-reduced-motion: reduce` the change flash and
+  hover transitions are off and spinners stop turning (the label still says what
+  is happening). One rule in `styles.css` covers it; a module adds no motion of its
+  own.
+
+## A6a. Keyboard focus
+
+Every control (buttons, links, tabs, selects, inputs, port links) shows the same
+focus ring when reached by keyboard: `:focus-visible { outline: 2px solid
+var(--green); outline-offset: 1px }`, set once in `styles.css`. A module never sets
+`outline: none` without that ring taking its place. Mouse clicks show no ring.
 
 ## A7. Layout & scroll
 
