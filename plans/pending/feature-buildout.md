@@ -88,8 +88,10 @@ Verified when: on .253 a saved config version is restored to startup and a
 reboot brings it up running that version, and an image is uploaded, set as the
 next boot image and booted.
 
-- Step 3.1: Reboot now, or schedule a reboot (`rlManualReboot`, `rlRebootDelay`),
-  with confirm text that names the switch. Size: S.
+- Step 3.1: Reboot now, or schedule a reboot (`rlRebootDelay`, with `rndAction`
+  reset(1) as the fallback for "now"), with confirm text that names the switch.
+  Size: S. (The plan first named `rlManualReboot`; the MIB shows it is
+  read-only and only says whether the last restart was orderly.)
 - Step 3.2: Restore a config-history version to the startup config over the
   built-in TFTP server (`rlCopyTable`, TFTP to startup), then offer a reboot.
   The diff against the running config shows first. Size: M. Blocked by: 3.1.
@@ -201,7 +203,7 @@ A new **QoS** panel.
 | --- | --- |
 | 1 Half-built | Done (v1.7.0): switch test 31/31 on .253, recordings of .253 and .254 |
 | 2 Design review | Done (v1.8.0): words not codes, warning color, button colors, focus ring, temperature fix |
-| 3 Restore, reboot, firmware | Not started |
+| 3 Restore, reboot, firmware | Built; waiting on the switch test (scripts/switch-test-maint.js) |
 | 4 System | Not started |
 | 5 Ports and PoE | Not started |
 | 6 Spanning tree | Not started |
