@@ -56,7 +56,8 @@ addressing and the switchport undo work on .253 and restore cleanly.
 - A read-only recording adds ACL, route table, SNMP configuration, capture and
   flash data to `test/fixtures/live/`, scrubbed like the existing one. The replay
   test covers those panels. The request counts in the v1.6.0 notes are replaced
-  with measured ones.
+  with measured ones. The same read-only check runs on .254 (the "Example"
+  community works again, Joe, 25 Nov 2026).
 - Blocked by: none
 
 #### Step 1.5: Supervised routed and IPv4 test on .253 (Size: S)
@@ -187,7 +188,6 @@ A new **QoS** panel.
 - Phase 4.4: whether `usmUserCloneFrom` works on this firmware. A probe answers
   this; it is not a question for Joe.
 - Phase 11: which QoS tables the C1300 actually populates. Probe at pickup.
-- Switch .254 stays untested until its community is known.
 
 ## Always / Never
 - Always: SNMP first; a confirm on every write that is hard to undo; the
