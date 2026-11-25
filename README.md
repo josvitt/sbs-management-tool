@@ -553,6 +553,17 @@ What changed, and why:
   is deliberately low - six was only 6% faster than three, and a switch CPU
   that is already busy is exactly the one you are trying to measure.
   `SNMP_CONCURRENCY` overrides it.
+- **A full collection asks for what it shows, and no more (v1.5.0).** On the
+  recorded C1300-24MGP-4X it went from about 1,200 SNMP requests and 21 s to
+  about 140 requests and under 2 s, with the same tables. Per-port tables are
+  read for the interfaces that exist instead of all 424 port slots; a table's
+  columns travel in one GETBULK stream; settings (inventory, DNS, RADIUS,
+  TACACS+, static routes, voice OUIs, port-channel slots) are re-read only
+  after a change, a reboot, a manual Refresh, or hourly. Every request to a
+  switch passes one gate, `SNMP_MAX_RPS` (default 100 a second);
+  `SNMP_BULK_VARBINDS` (default 40) and `SETTINGS_MAX_AGE_MS` (default 1 h)
+  tune the rest. The page skips the redraw when the server has no newer
+  collection, and Refresh during a poll waits for that poll.
 
 One thing deliberately *not* changed: MIB Explorer search scans all 11,426
 objects including their descriptions on every keystroke, which sounded

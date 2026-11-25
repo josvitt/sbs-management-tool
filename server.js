@@ -44,7 +44,8 @@ const events = require('./events');
 const configHistory = require('./config-history');
 const collector = require('./collector');
 const guard = require('./request-guard');
-const { buildSnmpSession } = require('./snmp-core');
+const { buildSnmpSession, onSwitchWrite } = require('./snmp-core');
+const { SETTINGS_TABLES } = require('./health');
 const { probeSwitch, collectHealthFor } = require('./collection');
 
 // Catch anything that would otherwise silently kill the process.
@@ -114,8 +115,13 @@ function startCollector() {
       });
       return r && r.text;
     },
+    // Tables the collector carries between full reads (health.js `settings`).
+    settingsTables: SETTINGS_TABLES,
     history, events, log, configHistory
   });
+  // Any successful SNMP write from the app marks that switch's settings for a
+  // fresh read on its next full collection.
+  onSwitchWrite((host) => collector.flagSettingsChange(host));
 }
 
 // Only this PC can open the dashboard: the web server listens on the

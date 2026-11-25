@@ -2627,7 +2627,8 @@
       ? fetch('/api/collect/now', { method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ target: s.target }) })
           .then((r) => r.json().then((b) => ({ at: b && b.at, data: b && b.data, error: b && b.error })))
-      : fetch('/api/collector/snapshot?host=' + encodeURIComponent(s.host))
+      : fetch('/api/collector/snapshot?host=' + encodeURIComponent(s.host) +
+          (s.health && s.health.collectedAt ? '&have=' + encodeURIComponent(s.health.collectedAt) : ''))
           .then((r) => (r.status === 404 ? { none: true } : r.json()));
     return req.then((res) => {
       if (nudge && s.refreshBtn) { showSpinner(s, false); s.refreshBtn.disabled = false; }
@@ -2635,6 +2636,17 @@
         // No snapshot yet (switch just added / collector hasn't polled). Nudge
         // once to populate; if a nudge already came back empty, wait a cycle.
         return nudge ? undefined : syncView(s, { nudge: true });
+      }
+      if (res.unchanged) {
+        // The server still holds the collection this page shows: nothing to
+        // download or repaint. The switch answered its last probe, and the
+        // metric graph moves every 30 s, so those still update.
+        const wasDown = s.reachable === false;
+        s.reachable = true;
+        if (wasDown) paintReachability(s);
+        s.snapshotAt = res.at || Date.now();
+        loadHistory(s, s.graphRange);
+        return;
       }
       if (res.error && !res.data) {
         s.reachable = false;

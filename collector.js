@@ -45,11 +45,15 @@ const MAX_INTERVAL_MS = 3600000;
 const SWITCH_PACE_MS = Number(process.env.COLLECT_PACE_MS) || 1500;              // stagger between switches so N don't fire at once
 const CONFIG_PULL_MIN_GAP_MS = Number(process.env.CONFIG_PULL_MIN_GAP_MS) || 60000;
 const INITIAL_DELAY_MS = Number(process.env.COLLECT_INITIAL_DELAY_MS) || 3000;
+// Settings tables (deps.settingsTables) are carried from the last full read
+// between collections, and re-read after a config change, a reboot, an app
+// write, a manual Refresh, or at the latest this often.
+const SETTINGS_MAX_AGE_MS = Number(process.env.SETTINGS_MAX_AGE_MS) || 3600000;
 
 let deps = null;         // { probe, collect, loadSwitches, fetchConfig, history, events, log }
 let running = false;
 const timers = new Map();       // key -> timeout id for the next scheduled tick
-const inflight = new Set();     // key currently polling (never poll one switch twice at once)
+const inflight = new Map();     // key -> promise of the poll in progress (never poll one switch twice at once)
 
 // key -> { at, host, target, data? , error? }   latest snapshot per switch
 const snapshots = new Map();
@@ -72,7 +76,10 @@ function freshState() {
     configTripPending: false,
     alertSigs: new Map(),      // sig -> alert, the alerts standing as of last full poll
     lastFullAt: 0,             // when the full collection last ran
-    lastData: null             // last full-collection data, kept for the snapshot between full polls
+    lastData: null,            // last full-collection data, kept for the snapshot between full polls
+    settingsGen: 1,            // bumped by anything that may have changed the switch's settings
+    settingsReadGen: 0,        // the settingsGen the settings tables were last read at
+    lastSettingsAt: 0          // when the settings tables were last read
   };
 }
 
@@ -165,6 +172,15 @@ async function maybeConfigDiff(host, target, st, rebooted) {
   st.configHash = hash;
 }
 
+// The settings tables of a full collection, to carry into the next one.
+function settingsFrom(data) {
+  const keys = (deps && deps.settingsTables) || [];
+  if (!data || !keys.length) return null;
+  const out = {};
+  for (const k of keys) if (Array.isArray(data[k])) out[k] = data[k];
+  return Object.keys(out).length ? out : null;
+}
+
 // One tick for a switch. ALWAYS does the cheap probe (reachability, reboot,
 // config-flag, and a CPU/PoE/pps metric sample - the fast pulse the graph
 // needs). ADDITIONALLY does the full collection (alerts, temp, fan, config
@@ -208,6 +224,7 @@ async function pollOnce(entry, opts) {
   if (upNow != null && st.sysUpTime != null && upNow < st.sysUpTime) {
     rebooted = true;
     st.configTripPending = true;
+    st.settingsGen++;
     deps.events.record(host, { type: 'reboot', fromTicks: st.sysUpTime, toTicks: upNow });
     deps.log && deps.log.info('collector', 'Reboot detected (sysUpTime reset)', { host });
   }
@@ -217,6 +234,7 @@ async function pollOnce(entry, opts) {
   const configEqual = (p.configSaved === true || p.configSaved === false) ? p.configSaved : null;
   if (st.lastConfigEqual !== null && configEqual !== null && configEqual !== st.lastConfigEqual) {
     st.configTripPending = true;
+    st.settingsGen++;
   }
   if (configEqual !== null) st.lastConfigEqual = configEqual;
 
@@ -231,11 +249,18 @@ async function pollOnce(entry, opts) {
   const due = !!(opts && opts.full) || (now - (st.lastFullAt || 0)) >= intervalMsFor(entry);
   if (due) {
     let data = null;
-    try { data = await deps.collect(target, {}); }
+    // Carry the settings tables forward unless something may have changed
+    // them (or they are an hour old, or this is a manual Refresh).
+    const gen = st.settingsGen;
+    const settingsDue = !!(opts && opts.full) || !st.lastData || st.settingsReadGen !== gen ||
+      (now - st.lastSettingsAt) >= SETTINGS_MAX_AGE_MS;
+    const reuse = settingsDue ? null : settingsFrom(st.lastData);
+    try { data = await deps.collect(target, reuse ? { reuse } : {}); }
     catch (e) { deps.log && deps.log.warn('collector', 'Collection failed after reachable probe', { host, message: e.message }); }
     if (data) {
       st.lastData = data;
       st.lastFullAt = now;
+      if (!reuse) { st.settingsReadGen = gen; st.lastSettingsAt = now; }
       snapshots.set(key, { at: Date.now(), host, target, data, probe: p });
       diffAlerts(host, st, data);
       // add the slow-moving environment readings to this tick's point
@@ -291,8 +316,9 @@ async function tickAndReschedule(key) {
   const entry = entriesByKey().get(key);
   if (!entry) { timers.delete(key); return; }   // removed meanwhile
   if (!inflight.has(key)) {
-    inflight.add(key);
-    try { await pollOnce(entry, {}); }
+    const run = pollOnce(entry, {});
+    inflight.set(key, run);
+    try { await run; }
     catch (e) { deps.log && deps.log.error('collector', 'Tick failed', { message: e.message }); }
     inflight.delete(key);
   }
@@ -348,15 +374,25 @@ function reload() {
 
 // Manual "Refresh" (MODULE-STANDARD manual-refresh = nudge server to poll now):
 // force a FULL poll of one switch out of cycle and return its fresh snapshot.
-// Respects the in-flight guard so it never double-polls a switch mid-tick.
+// Respects the in-flight guard so it never double-polls a switch mid-tick: if
+// a poll is already running it waits for that one, and returns it when it was
+// a full collection; after a probe-only tick it then runs the full poll. (It
+// used to return the previous snapshot at once, so a click could show old data.)
 async function nudge(target) {
   if (!running || !deps || !target || !target.host) return null;
   const key = keyOf(target);
-  if (inflight.has(key)) return snapshots.get(key) || null;
-  inflight.add(key);
-  try { return await pollOnce({ target }, { full: true }); }
+  const fullBefore = st0(key);
+  while (inflight.has(key)) {
+    try { await inflight.get(key); } catch (e) { /* that poll's failure is logged by its owner */ }
+    if (!running) return snapshots.get(key) || null;
+    if (st0(key) !== fullBefore) return snapshots.get(key) || null;   // a full collection just landed
+  }
+  const run = pollOnce({ target }, { full: true });
+  inflight.set(key, run);
+  try { return await run; }
   finally { inflight.delete(key); }
 }
+const st0 = (key) => { const st = state.get(key); return st ? st.lastFullAt : 0; };
 
 // An external signal (a config-related trap, or an app-driven config write)
 // asks the next poll of this host to re-check the running config.
@@ -364,9 +400,19 @@ function flagConfigChange(host) {
   if (!host) return;
   for (const [key, st] of state) {
     // keyOf is host:port; split at the LAST colon so an IPv6 host survives.
-    if (key.slice(0, key.lastIndexOf(':')) === host) { st.configTripPending = true; return; }
+    if (key.slice(0, key.lastIndexOf(':')) === host) { st.configTripPending = true; st.settingsGen++; return; }
   }
   pendingConfigHosts.add(host);
+}
+
+// The app wrote to this switch (snmp-core's write listener): read the settings
+// tables afresh on the next full collection. Does not pull the config; the
+// saved/unsaved flag the probe reads already covers that.
+function flagSettingsChange(host) {
+  if (!host) return;
+  for (const [key, st] of state) {
+    if (key.slice(0, key.lastIndexOf(':')) === host) st.settingsGen++;
+  }
 }
 
 function snapshotByKey(key) { return snapshots.get(key) || null; }
@@ -387,7 +433,7 @@ function status() {
 }
 
 module.exports = {
-  start, stop, reload, nudge, flagConfigChange,
+  start, stop, reload, nudge, flagConfigChange, flagSettingsChange,
   snapshotFor, snapshotByKey, snapshotByHost, status,
   _internals: { alertSig, fanStateCode, colDisp, keyOf, intervalMsFor, pollOnce }   // for offline tests
 };

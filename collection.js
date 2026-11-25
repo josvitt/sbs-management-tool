@@ -116,7 +116,7 @@ const lastCollection = new Map();
 // "4,812 since boot" says nothing on a switch up 160 days, but "up 43 in the
 // last two minutes" is a fault.
 async function collectHealthFor(target, opts) {
-  const { mode, only } = opts || {};
+  const { mode, only, reuse } = opts || {};
   const session = buildSnmpSession(target);
   session.on('error', (err) => {
     log.error('health', 'SNMP session error', { message: err.message });
@@ -135,9 +135,12 @@ async function collectHealthFor(target, opts) {
     }
     const data = await health.collect({
       only,
+      reuse,
       previous: lastCollection.get(key),
       get: (oids) => snmpGetPromise(session, resolveOids(oids)),
-      walk: (oid, spec) => boundedWalkPromise(session, mib.resolveOid(oid), mode, spec)
+      // One OID, or an array of column OIDs walked together (snmp-core).
+      walk: (oid, spec) => boundedWalkPromise(session,
+        Array.isArray(oid) ? oid.map((o) => mib.resolveOid(o)) : mib.resolveOid(oid), mode, spec)
     });
     if (!data.partial) {
       lastCollection.set(key, {
