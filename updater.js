@@ -7,8 +7,9 @@
  * user's click prepares that release beside the running app, under
  * updates/staging/<version>/:
  *
- *   1. download the release's source archive (the repository is private, so
- *      with a read-only token kept encrypted with the vault key);
+ *   1. download the release's source archive (the repository is public, so
+ *      no token is needed; an optional one, kept encrypted with the vault
+ *      key, only raises GitHub's rate limit);
  *   2. unpack it (targz.js) and check its package.json says that version;
  *   3. `npm ci --omit=dev` in it, so its own dependencies are ready;
  *   4. `node scripts/self-check.js` in it: every module of the new version
@@ -59,6 +60,7 @@ function create(deps) {
   let phase = 'idle';       // idle | checking | downloading | preparing | restarting
   let phaseError = null;
   let timer = null;
+  let tokenRefused = false;  // the last call with the token was refused
 
   // ---- versions ----
   function currentVersion() {
@@ -98,6 +100,7 @@ function create(deps) {
   }
   function saveToken(value) {
     value = String(value || '').trim();
+    tokenRefused = false;
     if (!value) { boot.remove(files.token); return; }
     if (!/^[A-Za-z0-9_]{20,255}$/.test(value)) throw new Error('That does not look like a GitHub token.');
     fs.mkdirSync(p.dir, { recursive: true });
@@ -105,18 +108,38 @@ function create(deps) {
   }
 
   // ---- GitHub ----
-  function headers() {
+  // The repository is public: every call works without a token. A token,
+  // when one is set, only lifts GitHub's limit of 60 unauthenticated API
+  // calls an hour per address (it matters on a shared office connection).
+  function headers(withToken) {
     const h = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'sbs-management-tool-updater', 'X-GitHub-Api-Version': '2022-11-28' };
-    const t = token().value;
+    const t = withToken ? token().value : null;
     if (t) h.Authorization = 'Bearer ' + t;
     return h;
   }
-  function explain(status, hasToken) {
-    if (status === 401) return 'GitHub refused the token (it may have expired or been revoked).';
-    if (status === 403) return 'GitHub refused the request (rate limit, or the token lacks read access to Contents).';
-    if (status === 404) return hasToken
-      ? 'GitHub could not find ' + REPO + ' or a release in it with this token. Check the token has read access to this repository.'
-      : 'GitHub could not find ' + REPO + '. The repository is private: add a read-only token.';
+  // One API call. A token GitHub refuses (expired or revoked, typically one
+  // saved while the repository was private) must not stop updates: ask
+  // again without it, and say so in the status.
+  async function api(url, opts) {
+    const hasToken = !!token().value;
+    let r = await doFetch(url, Object.assign({}, opts, { headers: headers(true) }));
+    if (r.status === 401 && hasToken) {
+      if (!tokenRefused) log.warn('update', 'GitHub refused the saved token; continuing without it');
+      tokenRefused = true;
+      r = await doFetch(url, Object.assign({}, opts, { headers: headers(false) }));
+    } else if (hasToken && r.ok) {
+      tokenRefused = false;
+    }
+    return r;
+  }
+  function explain(r) {
+    const status = r.status;
+    const limited = r.headers && r.headers.get && r.headers.get('x-ratelimit-remaining') === '0';
+    if (status === 401) return 'GitHub refused the request.';
+    if (status === 403 || status === 429) return limited || status === 429
+      ? 'GitHub\'s hourly limit for update checks from this address is used up. Try again in an hour, or add an optional token under GitHub access.'
+      : 'GitHub refused the request (HTTP ' + status + ').';
+    if (status === 404) return 'GitHub could not find a release in ' + REPO + '.';
     return 'GitHub answered HTTP ' + status + '.';
   }
 
@@ -128,8 +151,8 @@ function create(deps) {
     const prior = (boot.readJson(files.latest) || {}).latest || null;
     const record = { checkedAt: new Date().toISOString(), latest: prior, error: null };
     try {
-      const r = await doFetch(API + '/repos/' + REPO + '/releases/latest', { headers: headers(), signal: AbortSignal.timeout(30000) });
-      if (!r.ok) throw new Error(explain(r.status, !!token().value));
+      const r = await api(API + '/repos/' + REPO + '/releases/latest', { signal: AbortSignal.timeout(30000) });
+      if (!r.ok) throw new Error(explain(r));
       const b = await r.json();
       const version = String(b.tag_name || '').replace(/^v/, '');
       if (!parseVersion(version)) throw new Error('The newest release is tagged "' + b.tag_name + '", not vX.Y.Z.');
@@ -150,10 +173,10 @@ function create(deps) {
   }
 
   async function download(tag) {
-    // The API answers with a redirect to a short-lived signed link on
-    // codeload.github.com; the token goes to api.github.com only.
-    const r = await doFetch(API + '/repos/' + REPO + '/tarball/' + encodeURIComponent(tag),
-      { headers: headers(), redirect: 'manual', signal: AbortSignal.timeout(60000) });
+    // The API answers with a redirect to codeload.github.com; a token, when
+    // one is set, goes to api.github.com only.
+    const r = await api(API + '/repos/' + REPO + '/tarball/' + encodeURIComponent(tag),
+      { redirect: 'manual', signal: AbortSignal.timeout(60000) });
     let res = r;
     if (r.status >= 300 && r.status < 400) {
       const loc = r.headers.get('location');
@@ -162,7 +185,7 @@ function create(deps) {
       }
       res = await doFetch(loc, { headers: { 'User-Agent': 'sbs-management-tool-updater' }, signal: AbortSignal.timeout(5 * 60000) });
     }
-    if (!res.ok) throw new Error('Download failed: ' + explain(res.status, !!token().value));
+    if (!res.ok) throw new Error('Download failed: ' + explain(res));
     const len = Number(res.headers.get('content-length') || 0);
     if (len > MAX_DOWNLOAD) throw new Error('The release archive is larger than expected.');
     const buf = Buffer.from(await res.arrayBuffer());
@@ -274,7 +297,7 @@ function create(deps) {
     const t = token();
     return {
       current, repo: REPO,
-      token: { set: !!t.value, source: t.source },
+      token: { set: !!t.value, source: t.source, refused: !!(t.value && tokenRefused) },
       settings: settings(),
       checkedAt: rec.checkedAt || null,
       checkError: rec.error || null,

@@ -252,15 +252,39 @@ const releaseRoute = (version) => [/\/releases\/latest$/, () => fakeResponse(200
   published_at: '2026-11-24T10:00:00Z', html_url: 'https://github.com/x/y/releases/tag/v' + version
 })];
 
-test('a private repository with no token gets a plain explanation', async () => {
+test('the public repository is checked with no token at all', async () => {
   const { app } = installedApp();
-  const { u } = makeUpdater(app, []);
+  const { u, calls } = makeUpdater(app, [releaseRoute('1.2.0')]);
   const st = await u.check();
-  assert.equal(st.available, false);
-  assert.match(st.checkError, /private: add a read-only token/);
+  assert.equal(st.checkError, null);
+  assert.equal(st.available, true);
+  assert.deepEqual(st.token, { set: false, source: null, refused: false });
+  assert.equal(calls[0].auth, undefined, 'no Authorization header without a token');
 });
 
-test('a newer release is offered; the token is used for GitHub but never shown', async () => {
+test('a missing release and a used-up rate limit get plain explanations', async () => {
+  const { app } = installedApp();
+  assert.match((await makeUpdater(app, []).u.check()).checkError, /could not find a release/);
+  const limited = makeUpdater(app, [[/releases\/latest$/, () => fakeResponse(403, {}, { 'x-ratelimit-remaining': '0' })]]).u;
+  assert.match((await limited.check()).checkError, /hourly limit.*optional token/);
+});
+
+test('a token GitHub refuses does not stop updates: it checks again without it', async () => {
+  const { app } = installedApp();
+  const { u, calls } = makeUpdater(app, [[/\/releases\/latest$/, (url, opts) => (opts.headers.Authorization
+    ? fakeResponse(401, {})
+    : releaseRoute('1.2.0')[1]())]]);
+  u.saveToken('github_pat_' + 'C'.repeat(40));
+  const st = await u.check();
+  assert.equal(st.checkError, null);
+  assert.equal(st.available, true);
+  assert.equal(st.token.refused, true);
+  assert.deepEqual(calls.map((c) => !!c.auth), [true, false]);
+  u.saveToken('');
+  assert.deepEqual(u.status().token, { set: false, source: null, refused: false });
+});
+
+test('an optional token is used for GitHub but never shown', async () => {
   const { app } = installedApp();
   const { u, calls } = makeUpdater(app, [releaseRoute('1.2.0')]);
   u.saveToken('github_pat_' + 'A'.repeat(40));
@@ -270,7 +294,7 @@ test('a newer release is offered; the token is used for GitHub but never shown',
   assert.equal(st.available, true);
   assert.equal(st.latest.version, '1.2.0');
   assert.equal(st.latest.notes, 'Notes for 1.2.0');
-  assert.deepEqual(st.token, { set: true, source: 'saved' });
+  assert.deepEqual(st.token, { set: true, source: 'saved', refused: false });
   assert.doesNotMatch(JSON.stringify(st), /github_pat_/);
   assert.equal(calls[0].auth, 'Bearer github_pat_' + 'A'.repeat(40));
   // A later failed check keeps showing the release it already found.

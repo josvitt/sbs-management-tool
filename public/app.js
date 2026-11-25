@@ -13916,7 +13916,8 @@
 
   // =================================================================
   // 25-updates.js: The Updates window: the installed version, the newest
-  // GitHub release and its notes, the GitHub token, Install and Go back.
+  // GitHub release and its notes, Install and Go back, and an optional
+  // GitHub token (the repository is public, so none is needed).
   // =================================================================
   // The server does the work (updater.js, update-boot.js). This window only
   // shows its status and asks it to act; nothing installs without a click.
@@ -14045,18 +14046,24 @@
     }
 
     // ---- GitHub access ----
-    updateBodyEl.appendChild(el('div', 'section-title', 'GitHub access'));
+    // The repository is public, so updates need no token. One only lifts
+    // GitHub's hourly limit, for many PCs behind one shared address.
+    updateBodyEl.appendChild(el('div', 'section-title', 'GitHub access (optional)'));
     const tokenNote = st.token.source === 'environment'
       ? 'Using the token in SBS_UPDATE_TOKEN.'
-      : (st.token.set ? 'A token is saved (encrypted with the vault key). Paste a new one to replace it.' : 'No token saved. ' + st.repo + ' is private, so one is needed.');
+      : (st.token.set ? 'A token is saved (encrypted with the vault key). Paste a new one to replace it.' : 'No token needed: updates come from the public repository ' + st.repo + '.');
     updateBodyEl.appendChild(el('div', 'update-line', tokenNote));
+    if (st.token.refused) {
+      updateBodyEl.appendChild(el('div', 'update-msg', 'GitHub refused this token (it may have expired), so the app checked without it. ' +
+        (st.token.source === 'saved' ? 'You can remove it.' : 'You can remove SBS_UPDATE_TOKEN.')));
+    }
     const tokenInput = el('input'); tokenInput.type = 'password'; tokenInput.autocomplete = 'off'; tokenInput.spellcheck = false;
     tokenInput.placeholder = 'github_pat_…';
-    const tokenField = field('Read-only token', tokenInput, 'field');
+    const tokenField = field('Token (optional)', tokenInput, 'field');
     updateBodyEl.appendChild(tokenField);
     updateBodyEl.appendChild(el('div', 'card-sub',
-      'Make one on GitHub: Settings → Developer settings → Fine-grained tokens → Generate. Repository access: only ' + st.repo +
-      '. Permissions: Contents → Read-only (nothing else). It is sent only to api.github.com.'));
+      'Only needed if checks say GitHub\'s hourly limit is used up, for example when many PCs share one internet address. ' +
+      'Make one on GitHub: Settings → Developer settings → Fine-grained tokens → Generate, with Public repositories (read-only) access and no permissions. It is sent only to api.github.com.'));
     const tokRow = el('div', 'row-split update-actions');
     const saveTok = el('button', 'btn btn-blue', 'Save token'); saveTok.type = 'button';
     saveTok.addEventListener('click', () => runButtonAction(saveTok, {

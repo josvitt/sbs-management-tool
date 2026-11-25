@@ -521,7 +521,7 @@ loaded, and Windows will not rename a folder holding a loaded file.
 - **`updater.js` (while running)** checks `releases/latest` once a day
   (`settings.json` `autoCheck`, never an install) and on a click prepares the
   release under `updates/staging/<version>/`: download the source tarball
-  (the API redirects to a signed codeload link; the token goes only to
+  (the API redirects to codeload.github.com; a token, if set, goes only to
   api.github.com), `extractTarGz`, check its `package.json` version, `npm ci
   --omit=dev` (cache in `updates/npm-cache`, since the service account may have
   no usable home and systemd allows writes only to the app folder), carry
@@ -552,11 +552,17 @@ loaded, and Windows will not rename a folder holding a loaded file.
 - **Restart.** Exit code 75 is restarted by node-windows' wrapper (any exit)
   and systemd (`Restart=on-failure`); `start.bat` runs `scripts/run.js`, which
   restarts on 75 only.
-- **Token.** A fine-grained token, read-only Contents on this repository, in
-  `updates/token.enc`, encrypted with the vault's `encrypt`. It comes in
-  through `POST /api/update/token` and goes out nowhere: the status says
-  only whether one is set. `SBS_UPDATE_TOKEN` overrides it;
-  `SBS_UPDATE_REPO` names another repository.
+- **Token (optional).** The repository is public, so checks and downloads
+  need no token. One only lifts GitHub's limit of 60 unauthenticated API
+  calls an hour per address. When set (a fine-grained token with public
+  repositories read-only access) it lives in `updates/token.enc`, encrypted
+  with the vault's `encrypt`; it comes in through `POST /api/update/token`
+  and goes out nowhere: the status says only whether one is set, where it
+  came from, and `refused` when GitHub answered 401 to it. A refused token
+  never blocks an update: that call is made again without it (old installs
+  still hold a token saved while the repository was private, and those
+  expire). `SBS_UPDATE_TOKEN` overrides the saved one; `SBS_UPDATE_REPO`
+  names another repository.
 - **Routes** (`routes/update.js`): `GET /api/update/status`,
   `POST /api/update/check | install | rollback | token | settings`, all behind
   the request guard like every route.
