@@ -23,6 +23,10 @@
  *                   image slot. Use the version the switch already runs
  *                   unless you mean to upgrade: the old inactive image is
  *                   overwritten.
+ *   --diff-only     writes nothing: reads running and startup and prints
+ *                   where they differ, as line numbers and each line's
+ *                   first word only (never whole lines, which can hold
+ *                   keys).
  *   --reboot        then reboots the switch, waits for it to come back,
  *                   and checks the image it runs and that its running
  *                   configuration is the restored startup one. Refused
@@ -42,6 +46,7 @@ const host = args[0];
 const imageAt = args.indexOf('--image');
 const imagePath = imageAt > 0 ? args[imageAt + 1] : null;
 const doReboot = args.includes('--reboot');
+const diffOnly = args.includes('--diff-only');
 const outDir = args.filter((a, i) => i > 0 && !a.startsWith('--') && i !== imageAt + 1)[0] || null;
 const community = process.env.SBS_COMM;
 if (!host || !community || (imageAt > 0 && !imagePath)) {
@@ -58,6 +63,27 @@ function check(name, ok, detail) {
   return !!ok;
 }
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Where two configurations differ, without printing their contents: line
+// numbers, + or -, and each line's first word. The file header lines the
+// switch writes itself are shown whole, since they hold no settings.
+function diffSummary(aText, bText) {
+  const norm = (t) => String(t).replace(/\r\n?/g, '\n').replace(/\n+$/, '').split('\n').map((l) => l.replace(/\s+$/, ''));
+  const a = norm(aText), b = norm(bText);
+  const n = a.length, m = b.length;
+  const L = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = a[i] === b[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  const HEADER = /^(config-file-header|v\d[\w./ -]*|CLI v[\d.]+|file SSD indicator \w+|@|!|exit|unit-type-control-(start|end))$/;
+  const show = (l) => (HEADER.test(l.trim()) ? '"' + l.trim() + '"' : (l.trim().split(/\s+/)[0] || '(blank)').slice(0, 24) + ' ...');
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && a[i] === b[j]) { i++; j++; }
+    else if (j < m && (i >= n || L[i][j + 1] >= L[i + 1][j])) { out.push('    + line ' + (j + 1) + ': ' + show(b[j])); j++; }
+    else { out.push('    - line ' + (i + 1) + ': ' + show(a[i])); i++; }
+  }
+  return out;
+}
 
 async function startApp() {
   const out = console.log;
@@ -129,6 +155,18 @@ async function main() {
   say('  running configuration saved: ' + saved0);
   const unit0 = st0.units[0] || {};
 
+  if (diffOnly) {
+    try {
+      const run = await configFetch.fetchConfig(session, { host, kind: 'running', tftpPort });
+      const start = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
+      say('  running ' + run.lines + ' lines, startup ' + start.lines + ' lines. Where startup differs from running:');
+      const d = diffSummary(run.text, start.text);
+      for (const l of d) say(l);
+      check('read and compare running and startup', true, d.length + ' line(s) differ');
+    } catch (e) { check('read and compare running and startup', false, e.message); }
+    return finish(server, 'NOTHING WRITTEN');
+  }
+
   // ---- 2. schedule and cancel ---------------------------------------------
   const sch = await post('/api/maint/reboot', { target, seconds: 3600 });
   if (check('schedule a reboot in an hour', sch.httpOk && sch.ok, sch.error || ('via ' + sch.via))) {
@@ -172,6 +210,8 @@ async function main() {
     check('startup reads back the same', same, same ? '' : a.lines + ' lines before, ' + b.lines + ' after');
     if (saved0 === true) check('the switch still says running and startup are equal', (await isSaved()) === true);
     if (!same) {
+      say('  Where startup changed (before -> after):');
+      for (const l of diffSummary(a.text, b.text)) say(l);
       say('  Putting startup back: copying the text read at the start into startup again.');
       await maint.pushFile(session, { host, dest: 'startup', buffer: Buffer.from(startupText, 'utf8'), tftpPort });
       const c = await configFetch.fetchConfig(session, { host, kind: 'startup', tftpPort });
