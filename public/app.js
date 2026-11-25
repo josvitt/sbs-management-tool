@@ -4266,6 +4266,20 @@
     return box;
   }
 
+  // The port as it is now, for the undo of a switchport change: its mode and
+  // VLANs, and (for a routed port) its IPv4 addresses.
+  function switchportBefore(s, detail) {
+    const sw = detail.sw;
+    const ifx = parseInt(detail.ifIndex, 10);
+    return {
+      mode: sw.mode,
+      access: sw.mode === 'access' ? sw.untagged[0] : undefined,
+      native: sw.mode === 'trunk' ? sw.untagged[0] : undefined,
+      tagged: sw.mode === 'trunk' ? (sw.tagged || []).slice() : [],
+      addrs: sw.l2l3 === 'L3' ? ipv4Addresses(s).filter((a) => a.ifIndex === ifx).map((a) => ({ ip: a.ip, mask: a.mask, owner: a.owner })) : []
+    };
+  }
+
   // The switchport mode/VLAN editor inside the port dialog. Shows the current
   // configuration and an inline form: mode (access / trunk / routed), the
   // access VLAN, or the trunk native + tagged VLANs — all chosen from VLANs
@@ -4376,7 +4390,7 @@
       return 'Make routed: removes ' + detail.name + (vl.length ? ' from VLAN ' + vl.join(', ') : ' from its VLANs');
     };
     withConfirm(save, (ev) => {
-      const cfg = { ifIndex: detail.ifIndex, mode: modeSel.value, wasRouted: sw.l2l3 === 'L3' };
+      const cfg = { ifIndex: detail.ifIndex, mode: modeSel.value, wasRouted: sw.l2l3 === 'L3', before: switchportBefore(s, detail) };
       clear(msg);
       if (cfg.mode === 'routed' && cfg.wasRouted) { msg.appendChild(el('div', 'card-sub', 'No changes.')); return; }
       if (cfg.mode === 'trunk') {
@@ -4391,7 +4405,11 @@
         ok: (res) => res && res.ok,
         error: (res) => {
           const box2 = el('div', 'sw-err');
-          box2.appendChild(el('div', '', 'Some steps failed:'));
+          box2.appendChild(el('div', '', res && res.restored === true
+            ? 'The switch refused the change, so the port was put back as it was:'
+            : res && res.restored === false
+              ? 'The switch refused the change, and putting the port back failed too. Check this port:'
+              : 'Some steps failed:'));
           const pre = el('pre'); pre.className = 'diff'; pre.textContent = (res && res.log ? res.log.join('\n') : 'unknown error');
           box2.appendChild(pre); msg.appendChild(box2);
           return 'some steps failed';
@@ -4421,67 +4439,141 @@
     return box;
   }
 
-  // The production write. Returns { ok, log:[] }. Sends the SET sequence proven
-  // against this firmware: VlanIndex as Gauge, native always in the allowed
-  // bitmap, mode flipped last so a rejected VLAN write can't leave a port in a
-  // new mode with no membership.
-  //
-  // Category changes (cfg.wasRouted vs cfg.mode === 'routed') go through
-  // vlanSwitchPortModeCategory: routed = 2 ("no switchport"), one SET; back to
-  // a switchport = first remove the port's IPv4 address and DHCP client
-  // (teardownSvi, the same teardown a VLAN delete uses), then 1 ("switchport"),
-  // then the usual access/trunk steps. If the category step fails the VLAN
-  // steps are not sent.
-  async function applySwitchportConfig(s, cfg) {
-    const log = [];
-    if (!s.target) return { ok: false, log: ['Not connected.'] };
-    // Suspend health polling during the write: this firmware has crashed when a
-    // full multi-table walk lands on top of a config-touching SNMP write.
-    const ownsBusy = !s.writeBusy;
-    if (ownsBusy) s.writeBusy = true;
-    const if_ = cfg.ifIndex;
+  // The SET steps that put a port into one switchport state. VlanIndex as
+  // Gauge, native always in the allowed bitmap (all four blocks, so the list is
+  // exact), mode flipped last so a rejected VLAN write can't leave a port in a
+  // new mode with no membership. state: { mode: 'access'|'trunk', access,
+  // native, tagged }. Each step is [title, varbinds].
+  function switchportSteps(if_, st) {
     const steps = [];
-    const CATEGORY = 'vlanSwitchPortModeCategory.' + if_;
-    if (cfg.mode === 'routed') {
-      steps.push(['no switchport', [{ oid: CATEGORY, type: 'Integer', value: 2 }], true]);
-    } else {
-      if (cfg.wasRouted) steps.push(['switchport', [{ oid: CATEGORY, type: 'Integer', value: 1 }], true]);
-      if (cfg.mode === 'trunk') {
-        steps.push(['native', [{ oid: 'vlanTrunkPortModeNativeVlanId.' + if_, type: 'Gauge', value: cfg.native }]]);
-        const allowed = Array.from(new Set([cfg.native].concat(cfg.tagged || []))).sort((a, b) => a - b);
-        for (const [name, hex] of vlanListBlocks(allowed)) {
-          steps.push([name, [{ oid: name + '.' + if_, type: 'OctetString', valueHex: hex }]]);
-        }
-        steps.push(['mode=trunk', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 12 }]]);
-      } else {
-        steps.push(['access-vlan', [{ oid: 'vlanAccessPortModeVlanId.' + if_, type: 'Gauge', value: cfg.access }]]);
-        steps.push(['mode=access', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 11 }]]);
+    if (st.mode === 'trunk') {
+      steps.push(['native', [{ oid: 'vlanTrunkPortModeNativeVlanId.' + if_, type: 'Gauge', value: st.native }]]);
+      const allowed = Array.from(new Set([st.native].concat(st.tagged || []))).filter(Number.isFinite).sort((a, b) => a - b);
+      for (const [name, hex] of vlanListBlocks(allowed)) {
+        steps.push([name, [{ oid: name + '.' + if_, type: 'OctetString', valueHex: hex }]]);
+      }
+      steps.push(['mode=trunk', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 12 }]]);
+    } else if (st.mode === 'access') {
+      steps.push(['access-vlan', [{ oid: 'vlanAccessPortModeVlanId.' + if_, type: 'Gauge', value: st.access }]]);
+      steps.push(['mode=access', [{ oid: 'vlanPortModeState.' + if_, type: 'Integer', value: 11 }]]);
+    }
+    return steps;
+  }
+
+  // The SET steps that give a routed port back the addresses it had: a static
+  // row (address, ifIndex, mask, active) or the DHCP client (createAndGo).
+  function addressRestoreSteps(if_, addrs) {
+    const steps = [];
+    for (const a of (addrs || [])) {
+      if (a.owner === 2) steps.push(['DHCP client', [{ oid: DHCP_CL.status + '.' + if_, type: 'Integer', value: 4 }]]);
+      else if (a.owner === 1 && a.ip && a.mask) {
+        steps.push(['address ' + a.ip, [
+          { oid: SVI_IP.status + '.' + a.ip, type: 'Integer', value: 1 },
+          { oid: SVI_IP.ifIndex + '.' + a.ip, type: 'Integer', value: parseInt(if_, 10) },
+          { oid: SVI_IP.netmask + '.' + a.ip, type: 'IpAddress', value: a.mask }
+        ]]);
       }
     }
-    let ok = true;
-    if (cfg.wasRouted && cfg.mode !== 'routed') {
-      // teardownSvi is best-effort per row and never throws; if an address
-      // survives it, the category step below is the one that reports it.
-      await teardownSvi(s, if_);
-      log.push('remove IPv4 address: sent');
+    // One DHCP step is enough however many rows the lease shows.
+    return steps.filter((st, i) => st[0] !== 'DHCP client' || steps.findIndex((x) => x[0] === 'DHCP client') === i);
+  }
+
+  // The whole change as two lists of steps: the change itself, and the undo
+  // that puts the port back as it was (cfg.before), run when a step fails.
+  //   cfg: { ifIndex, mode: 'access'|'trunk'|'routed', access, native, tagged,
+  //          wasRouted, before: { mode, access, native, tagged, addrs } }
+  // Category changes go through vlanSwitchPortModeCategory: routed = 2 ("no
+  // switchport"); back to a switchport = the port's IPv4 address and DHCP
+  // client come off first (teardown, run by the caller), then 1
+  // ("switchport"), then the usual access/trunk steps.
+  function planSwitchportChange(cfg) {
+    const if_ = cfg.ifIndex;
+    const CATEGORY = 'vlanSwitchPortModeCategory.' + if_;
+    const before = cfg.before || {};
+    const forward = [];
+    const undo = [];
+    if (cfg.mode === 'routed') {
+      forward.push(['no switchport', [{ oid: CATEGORY, type: 'Integer', value: 2 }]]);
+      undo.push(['switchport', [{ oid: CATEGORY, type: 'Integer', value: 1 }]]);
+      undo.push(...switchportSteps(if_, before));
+    } else {
+      if (cfg.wasRouted) {
+        forward.push(['switchport', [{ oid: CATEGORY, type: 'Integer', value: 1 }]]);
+        undo.push(['no switchport', [{ oid: CATEGORY, type: 'Integer', value: 2 }]]);
+        undo.push(...addressRestoreSteps(if_, before.addrs));
+      } else {
+        undo.push(...switchportSteps(if_, before));
+      }
+      forward.push(...switchportSteps(if_, cfg));
     }
-    for (const [title, vbs, gate] of steps) {
+    // The undo can only put back a state it knows: an access port with its
+    // VLAN, or a trunk with its native VLAN. Anything else (a mode this
+    // editor doesn't offer) is reported as not restorable.
+    const knownBefore = cfg.wasRouted ||
+      (before.mode === 'access' && Number.isFinite(before.access)) ||
+      (before.mode === 'trunk' && Number.isFinite(before.native));
+    return { forward, undo, undoComplete: knownBefore, teardownFirst: !!cfg.wasRouted && cfg.mode !== 'routed' };
+  }
+
+  // Send steps in order through snmpSetResult. stopOnFail: the first failure
+  // ends the run. Returns { ok, sent, log }; `sent` counts the steps that
+  // reached the switch and succeeded.
+  async function runSetSteps(s, steps, log, prefix, stopOnFail) {
+    let ok = true, sent = 0;
+    for (const [title, vbs] of steps) {
       let stepOk = true;
       try {
         const { ok: rOk, status, body } = await snmpSetResult(s, vbs);
-        if (!rOk || (body && body.error)) { stepOk = false; log.push(title + ': ERROR ' + ((body && body.error) || ('HTTP ' + status))); }
+        if (!rOk || (body && body.error)) { stepOk = false; log.push(prefix + title + ': ERROR ' + ((body && body.error) || ('HTTP ' + status))); }
         else {
           const bad = (body.results || []).find((v) => v.error);
-          if (bad) { stepOk = false; log.push(title + ': ' + bad.oid + ' ' + bad.error); }
-          else log.push(title + ': ok');
+          if (bad) { stepOk = false; log.push(prefix + title + ': ' + bad.oid + ' ' + bad.error); }
+          else log.push(prefix + title + ': ok');
         }
-      } catch (e) { stepOk = false; log.push(title + ': ' + e.message); }
-      if (!stepOk) { ok = false; if (gate) break; }
+      } catch (e) { stepOk = false; log.push(prefix + title + ': ' + e.message); }
+      if (stepOk) sent++;
+      else { ok = false; if (stopOnFail) break; }
     }
+    return { ok, sent };
+  }
 
-    if (ownsBusy) s.writeBusy = false;
-    appLog(ok ? 'info' : 'error', 'Switchport config applied', { host: s.host, ifIndex: if_, mode: cfg.mode, ok });
-    return { ok, log };
+  // The production write. Returns { ok, restored, log:[] }. It stops at the
+  // first rejected step and then puts the port back the way it was (the undo
+  // of planSwitchportChange), so a change is either whole or undone, never
+  // left half-applied. `restored` is true when the undo went through, false
+  // when it failed (the port needs checking), undefined when nothing failed.
+  async function applySwitchportConfig(s, cfg) {
+    const log = [];
+    if (!s.target) return { ok: false, log: ['Not connected.'] };
+    // Hold the browser's own refreshes during the write: this firmware has
+    // crashed when a full multi-table walk lands on top of a config-touching
+    // SNMP write. (The server holds its collection too: write-hold.js.)
+    const ownsBusy = !s.writeBusy;
+    if (ownsBusy) s.writeBusy = true;
+    const plan = planSwitchportChange(cfg);
+    let res, restored;
+    try {
+      if (plan.teardownFirst) {
+        // teardownSvi is best-effort per row and never throws; if an address
+        // survives it, the category step below is the one that reports it.
+        await teardownSvi(s, cfg.ifIndex);
+        log.push('remove IPv4 address: sent');
+      }
+      res = await runSetSteps(s, plan.forward, log, '', true);
+      if (!res.ok && (res.sent > 0 || plan.teardownFirst)) {
+        log.push('Putting the port back as it was:');
+        const back = await runSetSteps(s, plan.undo, log, '  undo ', false);
+        restored = back.ok && plan.undoComplete;
+        if (!plan.undoComplete) log.push('  The port was in a mode this editor cannot put back.');
+        log.push(restored ? 'The port is back as it was.' : 'The undo failed too. Check this port on the switch.');
+      } else if (!res.ok) {
+        restored = true;   // the first step was refused: nothing changed
+      }
+    } finally {
+      if (ownsBusy) s.writeBusy = false;
+    }
+    appLog(res && res.ok ? 'info' : 'error', 'Switchport config applied', { host: s.host, ifIndex: cfg.ifIndex, mode: cfg.mode, ok: !!(res && res.ok), restored });
+    return { ok: !!(res && res.ok), restored, log };
   }
 
   // 802.1X per-port editor: shows current port-control, status, and host-mode,
