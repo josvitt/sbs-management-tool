@@ -24,7 +24,7 @@ async function withSession(target, fn) {
   finally { try { session.close(); } catch (e) {} }
 }
 
-const USER_ERROR = /must|cannot|already|is required|is in use|Nothing to change|Unknown|Choose|is 0 to|is 1 to|is 30 to|There is no|in milliwatts|The test is/;
+const USER_ERROR = /must|cannot|already|is required|is in use|Nothing to change|Unknown|Choose|is not in session|only port in the session|already in the session|is 0 to|is 1 to|is 30 to|There is no|in milliwatts|The test is/;
 
 function writeRoute(app, path, what, fn) {
   app.post(path, writeHold(), async (req, res) => {
@@ -76,6 +76,9 @@ module.exports = function register(app) {
   });
   // { session, dest, sources: [{ ifIndex, direction }] }
   writeRoute(app, '/api/ports/mirror/add', 'Mirroring session added', (s, b) => ports.addMirror(s, b.session, b.dest, b.sources));
+  // { session, ifIndex, direction } / { session, ifIndex }
+  writeRoute(app, '/api/ports/mirror/source/add', 'Port added to a mirroring session', (s, b) => ports.addMirrorSource(s, b.session, b.ifIndex, b.direction));
+  writeRoute(app, '/api/ports/mirror/source/remove', 'Port taken out of a mirroring session', (s, b) => ports.removeMirrorSource(s, b.session, b.ifIndex));
   // { session }
   writeRoute(app, '/api/ports/mirror/remove', 'Mirroring session removed', (s, b) => ports.removeMirror(s, b.session));
   // { ifIndex, kind: 'full' | 'length' }

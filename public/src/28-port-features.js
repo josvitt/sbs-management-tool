@@ -130,9 +130,8 @@
       for (const [k, label] of kinds) {
         const t = storm.traffic[k] || {};
         inputs[k] = textInput(t.rate == null ? '' : String(t.rate), '0'); inputs[k].size = 8;
-        sec.body.appendChild(field(label + ' rate (0 = off)', inputs[k]));
+        sec.body.appendChild(field(label + ' (kb/s, 0 = off)', inputs[k]));
       }
-      sec.body.appendChild(el('div', 'card-sub', 'The rate is in the unit the switch is set to for this port; see Security > Storm Control on the switch.'));
       const { actions, apply } = applyActions('Apply storm control');
       apply.addEventListener('click', (e) => {
         const changed = kinds.map(([k]) => k).filter((k) => String((storm.traffic[k] || {}).rate) !== inputs[k].value.trim());

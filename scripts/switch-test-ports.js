@@ -5,7 +5,7 @@
  * routes/port-features.js) on a test switch. Every change is put back, and
  * nothing is saved to startup.
  *
- *   SBS_COMM=<community> node scripts/switch-test-ports.js <address> [port ifIndex] [--look] [results folder]
+ *   SBS_COMM=<community> node scripts/switch-test-ports.js <address> [port ifIndex] [--look] [--touch-session] [results folder]
  *
  * The port (default 4) should have nothing plugged in: its PoE is turned off
  * and on, it is locked for a moment, and a full cable test takes its link
@@ -21,6 +21,8 @@
  *   7. CDP for the whole switch, changed and put back.
  *   8. Mirroring: copies the next port to this one in a free session, then
  *      removes it. Sessions already on the switch are left alone.
+ *      With --touch-session it also adds the next port to the switch's
+ *      first existing session (receive only) and takes it out again.
  *   9. A full cable test on the port.
  *
  * The app's own routes run on 127.0.0.1, so this tests what the panel sends.
@@ -39,9 +41,10 @@ const host = args[0];
 const ifx = /^\d+$/.test(args[1] || '') ? Number(args[1]) : 4;
 const outDir = /^\d+$/.test(args[1] || '') ? (args[2] || null) : (args[1] || null);
 const look = flags.includes('--look');
+const touchSession = flags.includes('--touch-session');
 const community = process.env.SBS_COMM;
 if (!host || !community) {
-  console.error('Usage: SBS_COMM=<community> node scripts/switch-test-ports.js <address> [port ifIndex] [--look] [results folder]');
+  console.error('Usage: SBS_COMM=<community> node scripts/switch-test-ports.js <address> [port ifIndex] [--look] [--touch-session] [results folder]');
   process.exit(2);
 }
 
@@ -214,6 +217,20 @@ async function main() {
       r = await post('/api/ports/mirror/remove', { session: id });
       m = (await status()).mirror;
       check('remove session ' + id, r.httpOk && !find(m.destinations, 'session', id) && !m.sources.some((x) => x.session === id), r.error || JSON.stringify(m));
+    }
+  }
+
+  if (touchSession) {
+    const dst = d0.mirror.destinations[0];
+    if (!dst || !src || dst.ifIndex === src || d0.mirror.sources.some((x) => x.session === dst.session && x.index === src)) say('SKIP adding to an existing session: none fits');
+    else {
+      let r = await post('/api/ports/mirror/source/add', { session: dst.session, ifIndex: src, direction: 'rx' });
+      let m = (await status()).mirror;
+      const x = m.sources.find((y) => y.session === dst.session && y.index === src);
+      check('add port ' + src + ' to session ' + dst.session + ' (receive only)', r.httpOk && x && x.direction === 'rx', r.error || JSON.stringify(x));
+      r = await post('/api/ports/mirror/source/remove', { session: dst.session, ifIndex: src });
+      m = (await status()).mirror;
+      check('take port ' + src + ' out of session ' + dst.session + ' again', r.httpOk && !m.sources.some((y) => y.session === dst.session && y.index === src), r.error || JSON.stringify(m.sources));
     }
   }
 

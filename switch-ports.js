@@ -324,9 +324,9 @@ async function setPortSecurity(session, ifIndex, p) {
 /**
  * Storm control on one port: the rate for one kind of traffic ('broadcast',
  * 'multicastAll' or 'unknownUnicast'); 0 turns it off. Only the rate column
- * is written. The unit (.3) and action (.4) stay as the switch has them: on
- * a C1300 on 4.1.9.92 every row reads rate 0, unit 1, action 1, and what
- * unit 1 means is checked by eye in the switch test (docs/SWITCH-NOTES.md).
+ * is written, in kb/s. The unit (.3) and action (.4) stay as the switch has
+ * them: on a C1300 on 4.1.9.92 every row reads unit 1, action 1, and the
+ * switch's web page shows a rate of 10000 there as "10000 kbits/sec".
  */
 async function setStorm(session, ifIndex, traffic, rate) {
   const ifx = checkIf(ifIndex);
@@ -406,25 +406,33 @@ async function addMirror(session, sessionId, dest, sources) {
   const now = await readMirror(session);
   if (now.destinations.some((x) => x.session === id)) throw new Error('Session ' + id + ' is in use.');
   if (now.destinations.some((x) => x.ifIndex === d)) throw new Error('That port is already a mirroring destination.');
-  // The destination as the switch makes it: span(1), monitor-only(1).
-  // createAndGo with its columns first; createAndWait, columns, then active
-  // if that is refused (MODULE-STANDARD rule 6: the forms tried are kept).
-  const cols = [I(SPAN_DEST + '.2.' + id, d), I(SPAN_DEST + '.3.' + id, 1), I(SPAN_DEST + '.4.' + id, 1)];
+  // The destination as the switch makes it: span(1), monitor-only(1),
+  // RSPAN VLAN 1. The forms are tried in turn, and every one tried is kept
+  // in the error (MODULE-STANDARD rule 6).
+  const at = (c) => SPAN_DEST + '.' + c + '.' + id;
+  const cols = [I(at(2), d), I(at(3), 1), I(at(4), 1)];
+  const forms = [
+    ['createAndGo with ifIndex, reflector, port type', [[I(at(6), ROW.createAndGo)].concat(cols)]],
+    ['createAndGo with every column, as the switch-made row', [[I(at(6), ROW.createAndGo)].concat(cols, [I(at(5), 1)])]],
+    ['createAndGo with the ifIndex alone', [[I(at(6), ROW.createAndGo), I(at(2), d)]]],
+    ['createAndWait, columns, then active', [[I(at(6), ROW.createAndWait)], cols, [I(at(6), ROW.active)]]],
+    ['the ifIndex alone, with no row status', [[I(at(2), d)]]]
+  ];
   const tried = [];
-  try {
-    await setVarbinds(session, [I(SPAN_DEST + '.6.' + id, ROW.createAndGo)].concat(cols));
-  } catch (e) {
-    tried.push('createAndGo: ' + e.message);
+  let ok = false;
+  for (const [name, steps] of forms) {
     try {
-      await setVarbinds(session, [I(SPAN_DEST + '.6.' + id, ROW.createAndWait)]);
-      await setVarbinds(session, cols);
-      await setVarbinds(session, [I(SPAN_DEST + '.6.' + id, ROW.active)]);
-    } catch (e2) {
-      tried.push('createAndWait then active: ' + e2.message);
-      await setVarbinds(session, [I(SPAN_DEST + '.6.' + id, ROW.destroy)]).catch(() => {});
-      throw new Error('The switch refused every form of the destination (' + tried.join('; ') + ').');
+      for (const step of steps) await setVarbinds(session, step);
+      const back = (await readMirror(session)).destinations.find((x) => x.session === id);
+      if (!back || back.ifIndex !== d) throw new Error('the row does not read back');
+      ok = true;
+      break;
+    } catch (e) {
+      tried.push(name + ': ' + e.message);
+      await setVarbinds(session, [I(at(6), ROW.destroy)]).catch(() => {});
     }
   }
+  if (!ok) throw new Error('The switch refused every form of the destination (' + tried.join('; ') + ').');
   const made = [];
   try {
     for (const x of src) {
@@ -438,6 +446,31 @@ async function addMirror(session, sessionId, dest, sources) {
     throw new Error('The switch refused a mirrored port, so the session was removed again (' + e.message + ').');
   }
   return { session: id, dest: d, sources: src.map((x) => ({ ifIndex: x.ifx, direction: DIRECTION[x.dir] })) };
+}
+
+/** Add one port to an existing session's sources. */
+async function addMirrorSource(session, sessionId, ifIndex, direction) {
+  const id = Number(sessionId), ifx = checkIf(ifIndex);
+  const dir = Number(Object.keys(DIRECTION).find((k) => DIRECTION[k] === (direction || 'both')));
+  if (!dir) throw new Error('direction must be rx, tx or both.');
+  const now = await readMirror(session);
+  const dst = now.destinations.find((x) => x.session === id);
+  if (!dst) throw new Error('There is no mirroring session ' + id + '.');
+  if (dst.ifIndex === ifx) throw new Error('A port cannot be copied to itself.');
+  if (now.sources.some((x) => x.session === id && x.type === 'port' && x.index === ifx)) throw new Error('That port is already in the session.');
+  const idx = id + '.1.' + ifx;
+  await setVarbinds(session, [I(SPAN_SRC + '.5.' + idx, ROW.createAndGo), I(SPAN_SRC + '.4.' + idx, dir)]);
+  return { session: id, ifIndex: ifx, direction: DIRECTION[dir] };
+}
+
+/** Take one port out of a session's sources. */
+async function removeMirrorSource(session, sessionId, ifIndex) {
+  const id = Number(sessionId), ifx = checkIf(ifIndex);
+  const now = await readMirror(session);
+  if (!now.sources.some((x) => x.session === id && x.type === 'port' && x.index === ifx)) throw new Error('That port is not in session ' + id + '.');
+  if (now.sources.filter((x) => x.session === id).length === 1) throw new Error('It is the only port in the session; remove the session instead.');
+  await setVarbinds(session, [I(SPAN_SRC + '.5.' + id + '.1.' + ifx, ROW.destroy)]);
+  return { session: id, removed: ifx };
 }
 
 /** Remove a mirroring session: its sources first, then its destination. */
@@ -519,7 +552,7 @@ async function readPorts(session) {
 
 module.exports = {
   readPorts, setPoe, setPortSecurity, setStorm, setErrdisableInterval, setErrdisableCause, setGlobal,
-  setLldpPort, setCdpPort, setEeePort, addMirror, removeMirror, cableTest, walkColumns, getRows, SCALARS, PRESENT_TYPE, TRAFFIC,
+  setLldpPort, setCdpPort, setEeePort, addMirror, removeMirror, addMirrorSource, removeMirrorSource, cableTest, walkColumns, getRows, SCALARS, PRESENT_TYPE, TRAFFIC,
   PETH, RL_PETH, SWIF, STORM, ERRDIS, LLDP_PORTS, CDP_IF, EEE_PORTS, SPAN_DEST, SPAN_SRC, PHY_GET,
   CAUSES, LOCK_MODE, LLDP_ADMIN, POE_PRIORITY
 };
