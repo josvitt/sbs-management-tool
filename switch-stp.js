@@ -122,7 +122,13 @@ async function readStp(session) {
     };
   });
   const pvstPorts = await walkColumns(session, PVST_PORT, [3, 4, 5]);
-  const vlans = (await walkColumns(session, PVST_VLAN, [2, 3, 4, 5, 6])).map((r) => ({
+  const vlanRows = await walkColumns(session, PVST_VLAN, [2, 3, 4, 5, 6]);
+  // A port can have its own settings in a VLAN that has none of its own.
+  for (const p of pvstPorts) {
+    if (!vlanRows.some((r) => r.index[0] === p.index[0])) vlanRows.push({ index: [p.index[0]], key: String(p.index[0]), cols: {} });
+  }
+  vlanRows.sort((x, y) => x.index[0] - y.index[0]);
+  const vlans = vlanRows.map((r) => ({
     vlan: r.index[0],
     priority: num(r.cols[5]),
     helloTime: num(r.cols[2]), forwardDelay: num(r.cols[3]), maxAge: num(r.cols[4]),
