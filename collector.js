@@ -20,9 +20,11 @@
  * walk once per interval — the same traffic the periodic walk always was, so
  * the per-switch ~100 pps budget is unchanged. Switches are polled
  * sequentially with a small gap so N switches do not burst from the server at
- * once; that paces the SERVER's fan-out, not any one switch's load. onDemand
- * modules (snmpcfg/flash/capture) are never collected here — they stay lazy
- * and browser-only, by the same budget rule.
+ * once; that paces the SERVER's fan-out, not any one switch's load. The
+ * server-side panels (deps.modules) ride along with the full collection.
+ *
+ * Writes: every write route calls holdForWrite first (write-hold.js), so no
+ * full collection of that switch runs while a change is being written.
  */
 
 const crypto = require('crypto');
@@ -49,6 +51,14 @@ const INITIAL_DELAY_MS = Number(process.env.COLLECT_INITIAL_DELAY_MS) || 3000;
 // between collections, and re-read after a config change, a reboot, an app
 // write, a manual Refresh, or at the latest this often.
 const SETTINGS_MAX_AGE_MS = Number(process.env.SETTINGS_MAX_AGE_MS) || 3600000;
+// Write hold. This firmware has crashed when a full multi-table read lands on
+// top of a config-touching SET, and a change from the dashboard is several
+// SETs in a row. So every write route holds that switch's full collection
+// (holdForWrite): no full collection starts until WRITE_QUIET_MS after the
+// last write, and a write waits (at most WRITE_WAIT_MAX_MS) for a poll that
+// is already running. The cheap probe still runs, so reachability holds.
+const WRITE_QUIET_MS = Number(process.env.WRITE_QUIET_MS) || 15000;
+const WRITE_WAIT_MAX_MS = Number(process.env.WRITE_WAIT_MAX_MS) || 30000;
 
 let deps = null;         // { probe, collect, loadSwitches, fetchConfig, history, events, log }
 let running = false;
@@ -62,6 +72,8 @@ const state = new Map();
 // hosts for which an external signal (config trap, app-driven write) asks the
 // next poll to re-check the running config even if the saved flag didn't move
 const pendingConfigHosts = new Set();
+// host -> time until which full collections of that switch are held (writes)
+const writeHolds = new Map();
 
 const keyOf = (target) => `${target.host}:${target.port || 161}`;
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
@@ -270,9 +282,10 @@ async function pollOnce(entry, opts) {
   if (Number.isFinite(p.poeW)) sample.poeW = p.poeW;
   if (Number.isFinite(p.cpuPps)) sample.cpuPps = p.cpuPps;
 
-  // --- full collection (only when due or forced) ---
+  // --- full collection (only when due or forced, and never during a write) ---
   const now = Date.now();
-  const due = !!(opts && opts.full) || (now - (st.lastFullAt || 0)) >= intervalMsFor(entry);
+  const due = !heldForWrite(host, now) &&
+    (!!(opts && opts.full) || (now - (st.lastFullAt || 0)) >= intervalMsFor(entry));
   if (due) {
     let data = null;
     // Carry the settings tables forward unless something may have changed
@@ -408,6 +421,10 @@ function reload() {
 async function nudge(target) {
   if (!running || !deps || !target || !target.host) return null;
   const key = keyOf(target);
+  // A Refresh pressed while a change is being written waits for the change
+  // to finish rather than reading the switch in the middle of it.
+  await waitForHold(target.host);
+  if (!running) return snapshots.get(key) || null;
   const fullBefore = st0(key);
   while (inflight.has(key)) {
     try { await inflight.get(key); } catch (e) { /* that poll's failure is logged by its owner */ }
@@ -442,6 +459,43 @@ function flagSettingsChange(host) {
   }
 }
 
+// ---- write hold ----------------------------------------------------------
+
+function heldForWrite(host, now) {
+  const until = writeHolds.get(host);
+  if (until == null) return false;
+  if (until > (now || Date.now())) return true;
+  writeHolds.delete(host);
+  return false;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Wait until no write hold stands on this host (bounded, so a stuck hold can
+// never stall a Refresh for good).
+async function waitForHold(host) {
+  const stopAt = Date.now() + WRITE_QUIET_MS + WRITE_WAIT_MAX_MS;
+  while (heldForWrite(host) && Date.now() < stopAt) {
+    await sleep(Math.min(500, Math.max(10, (writeHolds.get(host) || 0) - Date.now())));
+  }
+}
+
+// Called by every write route before it sends its SETs (write-hold.js). Holds
+// the switch's full collection until WRITE_QUIET_MS after this write, then
+// waits for a poll of that switch that is already running to finish.
+async function holdForWrite(host) {
+  if (!host) return;
+  const until = Date.now() + WRITE_QUIET_MS;
+  if ((writeHolds.get(host) || 0) < until) writeHolds.set(host, until);
+  const stopAt = Date.now() + WRITE_WAIT_MAX_MS;
+  for (;;) {
+    const busy = [];
+    for (const [key, p] of inflight) if (key.slice(0, key.lastIndexOf(':')) === host) busy.push(p);
+    if (!busy.length || Date.now() >= stopAt) return;
+    await Promise.race([Promise.allSettled(busy), sleep(Math.max(0, stopAt - Date.now()))]);
+  }
+}
+
 function snapshotByKey(key) { return snapshots.get(key) || null; }
 function snapshotFor(target) { return target ? (snapshots.get(keyOf(target)) || null) : null; }
 function snapshotByHost(host) {
@@ -460,7 +514,7 @@ function status() {
 }
 
 module.exports = {
-  start, stop, reload, nudge, flagConfigChange, flagSettingsChange,
+  start, stop, reload, nudge, flagConfigChange, flagSettingsChange, holdForWrite,
   snapshotFor, snapshotByKey, snapshotByHost, status,
-  _internals: { alertSig, fanStateCode, colDisp, keyOf, intervalMsFor, pollOnce }   // for offline tests
+  _internals: { alertSig, fanStateCode, colDisp, keyOf, intervalMsFor, pollOnce, heldForWrite, inflight, writeHolds }   // for offline tests
 };

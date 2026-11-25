@@ -4,6 +4,7 @@
  * Port actions: PoE power cycle and admin up/down.
  */
 
+const { writeHold } = require('../write-hold');
 const snmp = require('net-snmp');
 const log = require('../logger');
 const configFetch = require('../config-fetch');
@@ -52,7 +53,7 @@ module.exports = function register(app) {
     });
   }
 
-  app.post('/api/port/poe', async (req, res) => {
+  app.post('/api/port/poe', writeHold(), async (req, res) => {
     const { target, group, port, action } = req.body || {};
     if (!target || !target.host || port === undefined) {
       return res.status(400).json({ error: 'target.host and port are required.' });
@@ -119,7 +120,7 @@ module.exports = function register(app) {
     }
   });
 
-  app.post('/api/port/admin', async (req, res) => {
+  app.post('/api/port/admin', writeHold(), async (req, res) => {
     const { target, ifIndex, action } = req.body || {};
     if (!target || !target.host || ifIndex === undefined) {
       return res.status(400).json({ error: 'target.host and ifIndex are required.' });

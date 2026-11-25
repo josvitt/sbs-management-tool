@@ -48,6 +48,23 @@ How the server and the panels are built is in `SERVER-STANDARD.md` and
   defines. The reader tries the vendor columns first and falls back to the
   standard `ifXTable`/`ifTable` ones (`SERVER-STANDARD.md` §10).
 
+## Routed ports, addresses and routes (`07-ports.js`, `15-ipv4-addressing.js`)
+
+Proven on a C1300 (gi1/0/4, 25 Nov 2026, `scripts/switch-test.js`):
+
+- **"no switchport" is `vlanSwitchPortModeCategory` = 2** and switchport is 1.
+  The switch refuses an address on the port (InconsistentValue) for about
+  2 seconds after the category changes, so writes that follow it wait 2.5 s.
+- **An address is one `rsIpAddrTable` PDU:** status active(1), ifIndex and
+  mask. invalid(2) removes it. The DHCP client is `rlDhcpClActionStatus`:
+  createAndGo(4) on, destroy(6) off.
+- **A static route's type is `rlIpStaticRouteType` remote(3).** That MIB
+  numbers the types reject(1), local(2), remote(3), not like the standard
+  `ipCidrRouteType`. The switch refuses 4 with WrongValue. A route through a
+  next hop on a port with no link is accepted.
+- **Nameservers are added in `rlDnsResConfigSbeltInetTable` and deleted from
+  the DNS client v2 servers table,** whose row the switch makes for each one.
+
 ## Spanning tree (`health.js`)
 
 - **`dot1dStpVersion` can't be trusted on its own.** Firmware reports `rstp`

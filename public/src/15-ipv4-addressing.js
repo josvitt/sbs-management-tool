@@ -21,6 +21,15 @@
     status:   '1.3.6.1.4.1.9.6.1.101.76.3.1.2',  // rlDhcpClActionStatus (RowStatus to enable)
     hostName: '1.3.6.1.4.1.9.6.1.101.76.3.1.3'
   };
+  // The SET that gives an interface (SVI or routed port) a static address: the
+  // rsIpAddrTable row in one PDU, status active(1), its ifIndex, and the mask.
+  function ifAddressVarbinds(ip, mask, ifIndex) {
+    return [
+      { oid: SVI_IP.status + '.' + ip, type: 'Integer', value: 1 },
+      { oid: SVI_IP.ifIndex + '.' + ip, type: 'Integer', value: parseInt(ifIndex, 10) },
+      { oid: SVI_IP.netmask + '.' + ip, type: 'IpAddress', value: mask }
+    ];
+  }
   // A routable unicast IPv4: first octet 1-223, not loopback/link-local. Rules
   // out the 0.x / uninitialised placeholders a DHCP interface shows before it
   // has a lease.
@@ -145,11 +154,7 @@
               const ip = (ipIn.value || '').trim();
               const mask = prefToMask(parseInt(prefIn.value, 10));
               if (cur && cur.ip !== ip) { try { await snmpSet(s, { oid: SVI_IP.status + '.' + cur.ip, type: 'Integer', value: 2 }); } catch (e) { /* ignore */ } }
-              await snmpSet(s, [
-                { oid: SVI_IP.status + '.' + ip, type: 'Integer', value: 1 },
-                { oid: SVI_IP.ifIndex + '.' + ip, type: 'Integer', value: parseInt(sviIfIndex, 10) },
-                { oid: SVI_IP.netmask + '.' + ip, type: 'IpAddress', value: mask }
-              ]);
+              await snmpSet(s, ifAddressVarbinds(ip, mask, sviIfIndex));
             }
             return { ok: true };
           } catch (e) { return { ok: false, error: e.message }; }
@@ -364,7 +369,10 @@
     6: 'ggp', 7: 'hello', 8: 'rip', 9: 'isIs', 10: 'esIs', 11: 'ciscoIgrp',
     12: 'bbnSpfIgp', 13: 'ospf', 14: 'bgp' };
   const ROUTE_TYPE = { 1: 'other', 2: 'reject', 3: 'local', 4: 'remote' };
-  const STATIC_ROUTE_TYPE = { 1: 'other', 2: 'reject', 3: 'local', 4: 'remote' };
+  // CISCOSB-IPROUTER rlIpStaticRouteType: reject(1), local(2), remote(3). Not
+  // the RFC ipCidrRouteType numbers: the switch refuses remote = 4 (WrongValue,
+  // 2026-11-25 switch test) and its own rows read remote(3).
+  const STATIC_ROUTE_TYPE = { 1: 'reject', 2: 'local', 3: 'remote' };
   const DNS_ROUTE = {
     forwarding: '1.3.6.1.2.1.4.1',                       // ipForwarding scalar
     dnsEnable:  '1.3.6.1.4.1.9.6.1.101.93.2',            // rlDnsClEnable scalar
@@ -692,22 +700,49 @@
     return '';
   }
 
-  // DNS write diagnostic. Every DNS write path (domain add, host add, nameserver
-  // delete) is failing with a different SNMP error (NotWritable / NoCreation /
-  // CommitFailed) even though the OIDs match the MIB, so rather than keep
-  // inferring index structure we dump what the switch actually HAS: walk each DNS
-  // subtree and print every raw OID suffix and value. The report shows the exact
-  // index the switch uses for each existing row, which is what a create/delete
-  // must match. Reuses /api/snmp/walk and the download() helper (no new endpoint).
+  // The SET that adds a nameserver (rlDnsResConfigSbeltInetTable, 93.9). Its
+  // rc columns go in the same PDU as createAndGo, because a bare RowStatus set
+  // returns InconsistentValue. Preference 0, name = root ".". Null for a bad IP.
+  function nameserverVarbinds(addr) {
+    const nsIdx = nameserverIndex(addr);
+    if (!nsIdx) return null;
+    return [
+      { oid: DNS_ROUTE.nsInetName + '.' + nsIdx, type: 'OctetString', value: '.' },
+      { oid: DNS_ROUTE.nsInetPref + '.' + nsIdx, type: 'Integer', value: 0 },
+      { oid: DNS_ROUTE.nsInetStatus + '.' + nsIdx, type: 'Integer', value: 4 }   // createAndGo
+    ];
+  }
+  // The SET that adds a search domain (rlDnsClDomainNameTable, 93.3). Owner
+  // static(1) goes WITH createAndGo; a bare RowStatus set returns NotWritable.
+  function dnsDomainVarbinds(name) {
+    const suffix = dnsNameIndex(name);
+    return [
+      { oid: DNS_ROUTE.domOwner + '.' + suffix, type: 'Integer', value: 1 },
+      { oid: DNS_ROUTE.domRowStatus + '.' + suffix, type: 'Integer', value: 4 }
+    ];
+  }
+  // The SET that adds a static host mapping (rlDnsClNamesTable, 93.6). Index is
+  // DnsNameAsIndex . Owner . Index, as decoded from a switch-made row (<name>.1.0).
+  function dnsHostVarbinds(name, addr) {
+    const suffix = dnsHostIndex(name);
+    return [
+      { oid: DNS_ROUTE.hostAddr + '.' + suffix, type: 'IpAddress', value: addr },
+      { oid: DNS_ROUTE.hostRowStatus + '.' + suffix, type: 'Integer', value: 4 }
+    ];
+  }
+  function dnsHostIndex(name) { return dnsNameIndex(name) + '.1.0'; }
 
-  // Nameserver DELETE probe. The MIB says sbelt rows ARE deletable via SNMP
-  // (confirmed by reading CISCOSB-dnscl.mib and rfc1612.mib), and the host-map
-  // delete works on this firmware - yet destroy(6) on the sbelt row returns
-  // CommitFailed. Rather than guess the right teardown, this tries each documented
-  // variant in order, stops at the first that succeeds, and reports every result,
-  // so the next run tells us exactly which delete path the switch accepts. It
-  // targets ONE nameserver by address; if a variant succeeds the server is removed
-  // (the desired outcome), if all fail the row is left intact.
+  // The SET that adds a static route (rlIpStaticRouteTable, base 26.17).
+  // Index = dest.mask.tos(0).nextHop; type remote(3), the metric, and
+  // RowStatus createAndGo(4), in one PDU.
+  function staticRouteVarbinds(dest, mask, nh, metric) {
+    const suffix = ipToOidIndex(dest) + '.' + ipToOidIndex(mask) + '.0.' + ipToOidIndex(nh);
+    return [
+      { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.6.' + suffix, type: 'Integer', value: 3 },
+      { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.5.' + suffix, type: 'Integer', value: metric },
+      { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.9.' + suffix, type: 'Integer', value: 4 }
+    ];
+  }
 
   function openStaticRouteForm(s) {
     const tabs = [{ label: 'Add static route', fill: (pane, close) => {
@@ -730,15 +765,9 @@
         if (!/^\d+\.\d+\.\d+\.\d+$/.test(dest) || !/^\d+\.\d+\.\d+\.\d+$/.test(mask) || !/^\d+\.\d+\.\d+\.\d+$/.test(nh)) {
           clear(msg); msg.appendChild(el('div', 'sw-err', 'Destination, mask and next hop must all be valid IPv4 addresses.')); return;
         }
-        // Index = dest.mask.tos(0).nextHop; createAndGo(4) with type remote(4).
-        const suffix = ipToOidIndex(dest) + '.' + ipToOidIndex(mask) + '.0.' + ipToOidIndex(nh);
         runButtonAction(e.currentTarget, {
           failLabel: 'Add route',
-          run: () => snmpSetResult(s, [
-            { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.6.' + suffix, type: 'Integer', value: 4 },   // type=remote
-            { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.5.' + suffix, type: 'Integer', value: metric },
-            { oid: '1.3.6.1.4.1.9.6.1.101.26.17.1.1.9.' + suffix, type: 'Integer', value: 4 }    // RowStatus createAndGo
-          ]),
+          run: () => snmpSetResult(s, staticRouteVarbinds(dest, mask, nh, metric)),
           ok: (res) => res && res.ok && !(res.body && res.body.error),
           onApplied: () => markConfigDirty(s),
           settle: () => routingRefresh(s).then(() => close())
@@ -763,17 +792,9 @@
       apply.addEventListener('click', (e) => {
         const name = nameIn.value.trim();
         if (!name) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a domain name.')); return; }
-        const suffix = dnsNameIndex(name);
         runButtonAction(e.currentTarget, {
           failLabel: 'Add domain',
-          // Set the mandatory Owner column WITH createAndGo in one PDU - a bare
-          // RowStatus set returns NotWritable (the diagnostic showed the add of a
-          // nameserver only worked when its columns were set together). Owner
-          // static(1) marks it a user-defined entry.
-          run: () => snmpSetResult(s, [
-            { oid: DNS_ROUTE.domOwner + '.' + suffix, type: 'Integer', value: 1 },       // Owner = static
-            { oid: DNS_ROUTE.domRowStatus + '.' + suffix, type: 'Integer', value: 4 }     // createAndGo
-          ]),
+          run: () => snmpSetResult(s, dnsDomainVarbinds(name)),
           ok: (res) => res && res.ok && !(res.body && res.body.error),
           onApplied: () => markConfigDirty(s),
           settle: () => routingRefresh(s).then(() => close())
@@ -797,19 +818,11 @@
       const apply = el('button', 'btn btn-small btn-blue', 'Add nameserver'); apply.type = 'button';
       apply.addEventListener('click', (e) => {
         const addr = addrIn.value.trim();
-        const nsIdx = nameserverIndex(addr);
-        if (!nsIdx) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
-        // rlDnsResConfigSbeltInetTable: create the row with its rc columns set in
-        // the SAME PDU as createAndGo - a bare RowStatus set returns
-        // InconsistentValue because the mandatory columns are not yet populated.
-        // Pref 0 (default), Name = root ".".
+        const vbs = nameserverVarbinds(addr);
+        if (!vbs) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a valid IPv4 address.')); return; }
         runButtonAction(e.currentTarget, {
           failLabel: 'Add nameserver',
-          run: () => snmpSetResult(s, [
-            { oid: DNS_ROUTE.nsInetName + '.' + nsIdx, type: 'OctetString', value: '.' },
-            { oid: DNS_ROUTE.nsInetPref + '.' + nsIdx, type: 'Integer', value: 0 },
-            { oid: DNS_ROUTE.nsInetStatus + '.' + nsIdx, type: 'Integer', value: 4 }   // createAndGo
-          ]),
+          run: () => snmpSetResult(s, vbs),
           ok: (res) => res && res.ok && !(res.body && res.body.error),
           onApplied: () => markConfigDirty(s),
           settle: () => routingRefresh(s).then(() => close())
@@ -836,16 +849,9 @@
       apply.addEventListener('click', (e) => {
         const name = nameIn.value.trim(), addr = addrIn.value.trim();
         if (!name || !/^\d+\.\d+\.\d+\.\d+$/.test(addr)) { clear(msg); msg.appendChild(el('div', 'sw-err', 'Enter a host name and a valid IPv4 address.')); return; }
-        // rlDnsClNamesTable index = name . index(1). Set the address + createAndGo.
-        // Host index is DnsNameAsIndex . Owner . Index, exactly as the switch
-        // stores it (decoded from a switch-created row: <wire-name> . 1 . 0).
-        const suffix = dnsNameIndex(name) + '.1.0';
         runButtonAction(e.currentTarget, {
           failLabel: 'Add mapping',
-          run: () => snmpSetResult(s, [
-            { oid: '1.3.6.1.4.1.9.6.1.101.93.6.1.4.' + suffix, type: 'IpAddress', value: addr },
-            { oid: '1.3.6.1.4.1.9.6.1.101.93.6.1.5.' + suffix, type: 'Integer', value: 4 }   // createAndGo
-          ]),
+          run: () => snmpSetResult(s, dnsHostVarbinds(name, addr)),
           ok: (res) => res && res.ok && !(res.body && res.body.error),
           onApplied: () => markConfigDirty(s),
           settle: () => routingRefresh(s).then(() => close())

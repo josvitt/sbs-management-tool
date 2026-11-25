@@ -4,6 +4,7 @@
  * Configuration retrieval and sync over the embedded TFTP receiver.
  */
 
+const { writeHold } = require('../write-hold');
 const log = require('../logger');
 const tftp = require('../tftp');
 const configFetch = require('../config-fetch');
@@ -70,7 +71,7 @@ module.exports = function register(app) {
 
   // Writes to the switch: copies one config over another, which is how
   // "sync" saves the running configuration to startup.
-  app.post('/api/config/sync', async (req, res) => {
+  app.post('/api/config/sync', writeHold(), async (req, res) => {
     const { target, from, to } = req.body || {};
     if (!target || !target.host) return res.status(400).json({ error: 'target.host is required.' });
     try {
