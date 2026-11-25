@@ -284,7 +284,7 @@ Read-mostly; any writes follow §B6.
 
 **(b) Keyed write modules** — data from `health.js` tables (some `onDemand`), refresh
 via `refreshTables`, tables via `mountKeyedTable`, reconcile in place. Dedicated
-paint fn dispatched before the switch. **routing, vlans.** This is the preferred
+paint fn dispatched before the switch. **routing (the IPv4 Addressing panel), vlans.** This is the preferred
 pattern for any NEW interactive module, and §B2–§B6 describe it in full.
 
 **(c) Self-managed config modules** — **snmpcfg, capture, flash.** These own their
@@ -663,9 +663,10 @@ on the periodic timer is a cost decision, not just a correctness one.
 | Row action group / confirm button | `actGroup([...])`, `actBtnConfirm(...)` |
 | Status pill | `el('span','pill '+variant, label)` |
 | Modal form | `openTabbedPopout(s, title, tabs, [])`, `formSection`, `field` |
-| A popout tab that exists only in some states | tab `{ hidden: true }` + the popout's `setTabVisible(tab, visible)` (the routed port's IPv4 tab) |
 | Two-tap confirm only when the click is drastic | `withConfirm(btn, run, { when, confirmText })`: `when()` false runs on the first tap; `confirmText` may be a function naming what goes |
-| IPv4 address of an L3 interface (VLAN SVI or routed port) | `buildSviEditor(s, iface, ifIndex, pane)`, `iface` = `vlanIface(vlan)` or `{ name, noun: 'port' }`; one editor, one management lock |
+| IPv4 address of an L3 interface (VLAN SVI or routed port) | `buildSviEditor(s, iface, ifIndex, pane, done)` in `15-ipv4-addressing.js`, `iface` = `vlanIface(vlan)` or `l3Iface(s, ifIndex)`; one editor, one management lock. Every interface address is set in the IPv4 Addressing panel only (`openIpv4Editor`, `openIpv4AddForm`), never in a VLAN or port popout |
+| Remove one interface's address / DHCP client (reports failure) | `removeIfAddress(s, ifIndex, cur, dhcpOn)`; `teardownSvi(s, ifIndex)` is the best-effort teardown before a VLAN delete or a switch back to switchport |
+| The user IPv4 addresses (static/dhcp rows of rsIpAddrTable) | `ipv4Addresses(s)` |
 | IpAddress index ↔ | `ipToOidIndex` |
 | InetAddress index ↔ | `ipv4IndexV4` / `nameserverIndex` / `inetIndexToIp` |
 | DnsName/string index ↔ | `strToOidIndex` / `oidIndexToStr` |

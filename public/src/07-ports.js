@@ -461,10 +461,9 @@
   // "routed" is the port's L2/L3 category, not a switchport mode: CISCOSB-vlan
   // vlanSwitchPortModeCategory (read-write, 1 = l2 "switchport", 2 = l3 "no
   // switchport"). It is offered only where the switch reports that category
-  // for the port. A routed port has no VLANs; its IPv4 address is set on the
-  // popout's IPv4 tab, which opts.onL3Change reveals or hides.
-  function buildSwitchportEditor(s, detail, opts) {
-    opts = opts || {};
+  // for the port. A routed port has no VLANs; its IPv4 address is set in the
+  // IPv4 Addressing panel, like every other interface address.
+  function buildSwitchportEditor(s, detail) {
     const sw = detail.sw;
     const box = el('div', 'sw-editor');
     const knowsCategory = sw.l2l3 === 'L2' || sw.l2l3 === 'L3';
@@ -534,8 +533,8 @@
       natField.style.display = m === 'trunk' ? '' : 'none';
       tagField.style.display = m === 'trunk' ? '' : 'none';
       modeNote.textContent = m === 'routed'
-        ? (wasRouted ? 'Routed port: it has no VLANs. Set its address on the IPv4 tab.'
-          : 'Applying makes this a routed port (no switchport): it leaves its VLANs, and its address is then set on the IPv4 tab.')
+        ? (wasRouted ? 'Routed port: it has no VLANs. Set its address in IPv4 Addressing.'
+          : 'Applying makes this a routed port (no switchport): it leaves its VLANs, and its address is then set in IPv4 Addressing.')
         : (wasRouted ? 'Applying makes this a switchport again and removes the port’s IPv4 address.' : '');
       modeNote.style.display = modeNote.textContent ? '' : 'none';
     };
@@ -587,7 +586,6 @@
           const nowRouted = cfg.mode === 'routed';
           if (nowRouted !== cfg.wasRouted) {
             sw.l2l3 = nowRouted ? 'L3' : 'L2';
-            if (opts.onL3Change) opts.onL3Change(nowRouted);
             syncMode();
           }
           if (nowRouted) return;
