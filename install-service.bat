@@ -38,10 +38,17 @@ if errorlevel 1 ( echo Could not install node-windows - see above. & pause & exi
 echo.
 echo Installing and starting the "SBS Management Tool" Windows service...
 node service-install.js
+if errorlevel 1 (
+  echo.
+  echo Something went wrong - see the messages above.
+  echo.
+  pause
+  exit /b 1
+)
 
 echo.
 echo ------------------------------------------------------------------
-echo If the lines above say the service is running, you're done.
+echo The service is running.
 echo.
 echo   1. Open the dashboard:  http://localhost:3000  (or run open-ui.bat)
 echo   2. Add your switches and credentials in the browser.
