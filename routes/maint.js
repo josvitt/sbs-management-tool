@@ -1,7 +1,12 @@
 'use strict';
 
 /**
- * Reboot, firmware and configuration restore (switch-maint.js).
+ * Reboot and firmware (switch-maint.js).
+ *
+ * Restoring a stored configuration to startup is held back: on a C1300
+ * (4.1.9.92) a configuration copied into startup over TFTP loses an `aaa`
+ * line, so a restore would quietly drop settings. See SWITCH-NOTES.md and
+ * the commit "Reboot, firmware and config restore over SNMP" for the code.
  *
  * Every route that changes the switch passes writeHold(), so the collector
  * is not reading the switch while it copies a file or goes down.
@@ -12,8 +17,6 @@ const express = require('express');
 const { writeHold } = require('../write-hold');
 const log = require('../logger');
 const maint = require('../switch-maint');
-const configFetch = require('../config-fetch');
-const configHistory = require('../config-history');
 const { buildSnmpSession, copyFinishedWaiter, redactTarget } = require('../snmp-core');
 
 // Firmware for this family is 30 to 60 MB. The cap only guards memory.
@@ -90,38 +93,6 @@ module.exports = function register(app) {
       res.json(Object.assign({ ok: true }, r));
     } catch (e) {
       log.error('maint', 'Setting the next boot image failed', { target: redactTarget(target), message: e.message });
-      res.status(502).json({ error: e.message });
-    }
-  });
-
-  // Copy a stored configuration version into the startup configuration,
-  // then read startup back to check it. The running configuration is not
-  // touched: the switch uses the restored version after its next reboot.
-  // Body: { target, id }
-  app.post('/api/config/restore', writeHold(), async (req, res) => {
-    const target = needTarget(req, res); if (!target) return;
-    const version = configHistory.get(target.host, String(req.body.id || ''));
-    if (!version) return res.status(404).json({ error: 'No such stored version.' });
-    try {
-      const pushed = await maint.pushFile(() => buildSnmpSession(target), {
-        host: target.host, dest: 'startup', buffer: Buffer.from(version.text, 'utf8'),
-        tftpPort: tftpPort(), waitForFinish: copyFinishedWaiter(target.host), unit: req.body.unit
-      });
-      let check = { matches: null };
-      try {
-        const back = await configFetch.fetchConfig(() => buildSnmpSession(target), {
-          host: target.host, kind: 'startup', tftpPort: tftpPort()
-        });
-        check = { matches: maint.sameConfig(back.text, version.text), lines: back.lines };
-      } catch (e) {
-        check = { matches: null, error: 'Restored, but reading startup back failed: ' + e.message };
-      }
-      log.warn('maint', 'Configuration version restored to startup', {
-        host: target.host, id: version.id, shape: pushed.shape, matches: check.matches
-      });
-      res.json({ ok: true, id: version.id, shape: pushed.shape, check });
-    } catch (e) {
-      log.error('maint', 'Restore failed', { target: redactTarget(target), message: e.message });
       res.status(502).json({ error: e.message });
     }
   });

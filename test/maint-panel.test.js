@@ -88,9 +88,6 @@ test('the panel is registered: built in, keyed, painted, refreshed by its loader
   assert.match(read('26-maint.js'), /mountInto\(body, s, p, 'maint:images'/);
 });
 
-test('config history offers Restore, which compares against a fresh running config first', () => {
-  const src = read('13-config.js');
-  assert.match(src, /actBtn\('Restore', \(\) => showConfigVersion\(s, v, 'restore'\)/);
-  assert.match(src, /sidePost\('\/api\/config\/fetch', \{ target: s\.target, kind: 'running' \}\)/);
-  assert.match(src, /sidePost\('\/api\/config\/restore', \{ target: s\.target, id: shown\.version\.id \}\)/);
+test('config history offers no Restore while the switch drops lines from a copied config', () => {
+  assert.doesNotMatch(read('13-config.js'), /\/api\/config\/restore|'restore'/);
 });

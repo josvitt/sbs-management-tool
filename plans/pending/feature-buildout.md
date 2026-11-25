@@ -203,7 +203,7 @@ A new **QoS** panel.
 | --- | --- |
 | 1 Half-built | Done (v1.7.0): switch test 31/31 on .253, recordings of .253 and .254 |
 | 2 Design review | Done (v1.8.0): words not codes, warning color, button colors, focus ring, temperature fix |
-| 3 Restore, reboot, firmware | Built; waiting on the switch test (scripts/switch-test-maint.js) |
+| 3 Restore, reboot, firmware | Reboot, next boot image and image list proven on .253. Restore held back: the switch drops an `aaa` block from a config copied into startup. Firmware install waiting on a test with an image file. |
 | 4 System | Not started |
 | 5 Ports and PoE | Not started |
 | 6 Spanning tree | Not started |
