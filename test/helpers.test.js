@@ -113,3 +113,28 @@ test('vault: repeated loads do not re-read the file; a save is seen at once', ()
   const out = execFileSync(process.execPath, ['-e', script], { cwd: dir, env }).toString().trim().split('\n').pop();
   assert.deepEqual(JSON.parse(out), { reads: 2, b: [1], c: [2] });
 });
+
+test('rotate.adoptLegacy moves a misplaced store once and never overwrites', () => {
+  const { adoptLegacy } = require('../rotate');
+  const dir = tmpDir();
+  const oldFile = path.join(dir, 'routes', 'layouts.json');
+  const newFile = path.join(dir, 'layouts.json');
+  fs.mkdirSync(path.dirname(oldFile), { recursive: true });
+  fs.writeFileSync(oldFile, 'old');
+  assert.equal(adoptLegacy(oldFile, newFile), 1);
+  assert.equal(fs.readFileSync(newFile, 'utf8'), 'old');
+  assert.equal(fs.existsSync(oldFile), false);
+  // A second copy appearing later does not replace the adopted one.
+  fs.writeFileSync(oldFile, 'stale');
+  assert.equal(adoptLegacy(oldFile, newFile), 0);
+  assert.equal(fs.readFileSync(newFile, 'utf8'), 'old');
+  // Folders merge file by file.
+  fs.mkdirSync(path.join(dir, 'routes', 'logs', 'traps'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'routes', 'logs', 'traps', 'a.log'), 'a');
+  fs.mkdirSync(path.join(dir, 'logs', 'traps'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'logs', 'traps', 'b.log'), 'b');
+  assert.equal(adoptLegacy(path.join(dir, 'routes', 'logs', 'traps'), path.join(dir, 'logs', 'traps')), 1);
+  assert.deepEqual(fs.readdirSync(path.join(dir, 'logs', 'traps')).sort(), ['a.log', 'b.log']);
+  assert.equal(fs.existsSync(path.join(dir, 'routes', 'logs', 'traps')), false);
+  assert.equal(adoptLegacy(path.join(dir, 'missing'), path.join(dir, 'x')), 0);
+});

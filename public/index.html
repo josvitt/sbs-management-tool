@@ -15,6 +15,7 @@
   </div>
   <div id="tab-bar-actions">
     <button class="icon-btn" id="mib-toggle" type="button">MIB Explorer</button>
+    <button class="icon-btn" id="update-toggle" type="button">Updates <span class="badge badge-update">NEW</span></button>
     <button class="icon-btn" id="log-toggle" type="button">Log <span class="badge">!</span></button>
   </div>
 </div>
@@ -144,6 +145,16 @@
         <button type="button" class="btn btn-amber f-dlg-cancel">Cancel</button>
       </div>
       <div class="form-error f-dlg-error"></div>
+    </div>
+  </div>
+
+  <div id="update-dialog">
+    <div class="dialog-card">
+      <div class="eyebrow">Updates</div>
+      <div class="update-body"></div>
+      <div class="row-split update-actions">
+        <button type="button" class="btn btn-amber update-close">Close</button>
+      </div>
     </div>
   </div>
 

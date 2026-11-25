@@ -31,7 +31,7 @@ echo.
 echo Starting SBS Management Tool...
 echo.
 
-start "SBS Management Tool Server" cmd /k "npm start"
+start "SBS Management Tool Server" cmd /k "node scripts\run.js"
 
 timeout /t 2 /nobreak >nul
 start "" "http://localhost:3000"

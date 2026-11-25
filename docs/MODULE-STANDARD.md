@@ -655,6 +655,7 @@ on the periodic timer is a cost decision, not just a correctness one.
 | Button lifecycle (spinner→run→settle→done) | `runButtonAction(btn, spec)` |
 | Show a line diff (`diffLines` result) | `diffPre(diff)` → `<pre class="diff">` |
 | Read-only GET of an app API (throws on error) | `getJson(url)` |
+| App-level window (not per switch) | a `.dialog-card` in its own overlay, like `#panel-dialog` and `#update-dialog` (25-updates.js) |
 | Flash a changed value | `flashValue(node)` / `flashValues(nodes)` |
 | Mark running-config dirty | `markConfigDirty(s)` |
 | Section title + optional add-control | the module's `section()` (per §B2) |

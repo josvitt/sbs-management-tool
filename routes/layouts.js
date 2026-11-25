@@ -18,7 +18,11 @@ module.exports = function register(app) {
   // file next to the app. This is configuration, not captured device data --
   // no session output or query results are stored here.
 
-  const LAYOUT_FILE = path.join(__dirname, 'layouts.json');
+  // In the install folder beside state.enc. Versions before 1.2.0 wrote it under
+  // routes/ by mistake (a path left over from the route split); it is moved
+  // here once, so an update that replaces routes/ cannot take it along.
+  const LAYOUT_FILE = path.join(__dirname, '..', 'layouts.json');
+  rotate.adoptLegacy(path.join(__dirname, 'layouts.json'), LAYOUT_FILE);
   let layouts = null;
 
   function loadLayouts() {

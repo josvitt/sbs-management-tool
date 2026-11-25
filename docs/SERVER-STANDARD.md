@@ -436,8 +436,60 @@ its concern lives; a new route or caller uses it rather than re-implementing it.
 | Saved secrets | `credentials.js` (`publicState`, `mergeForSave`, `resolveTarget`, `resolveSsh`) | Community strings, v3 keys and SSH passwords of a saved switch never leave the server. `GET /api/state` returns them removed, with a `saved` flag and a switch `id`; `PUT /api/state` keeps a stored secret the browser sent back empty; a middleware in `web.js` fills a request's `target` from the saved switch (`target.ref` = id, else host:port) before any route sees it, and the terminal does the same for the SSH password. A secret the user types always wins. A new route that takes `req.body.target` inherits this; a new secret field is added here. |
 | SSH host keys | `known-hosts.js` (`check`, `trust`) | Trust on first use: the terminal's `hostVerifier` remembers a new switch's key (known-hosts.json), accepts it again, and refuses a different one; the page shows both fingerprints and the only way on is `POST /api/ssh/trust-key` behind a two-tap confirm. |
 | A snapshot leaving the server | `publicSnapshot(snap)` (routes/monitoring.js) | The collector keeps the full target to poll with; responses carry it through `redactTarget`. |
+| Unpacking a release archive | `extractTarGz(gz, dest, { strip })` (targz.js) | Node has gzip but no tar, and the app must not need a tar program. Plain files and folders only; links skipped; an absolute or `..` path stops it. |
+| Moving a misplaced store | `rotate.adoptLegacy(from, to)` | Moves a file (or a folder's files) to its corrected path once, never overwriting. Used for layouts.json and logs/traps, logs/syslog, which versions before 1.2.0 wrote under routes/. |
 
 Offline tests for these and the persistence helpers live in `test/` and run
 with `npm test` (node:test, no extra dependency). A new control gets a test
 that is red when the control is removed, paired with a test that the
 legitimate request still passes.
+
+## 12. Self-update from GitHub releases
+
+The app updates itself from the repository's releases (every merge to main
+publishes one, `.github/workflows/release.yml`). It is split in two because
+of one fact: while the app runs, the native add-ons under `node_modules` are
+loaded, and Windows will not rename a folder holding a loaded file.
+
+- **`updater.js` (while running)** checks `releases/latest` once a day
+  (`settings.json` `autoCheck`, never an install) and on a click prepares the
+  release under `updates/staging/<version>/`: download the source tarball
+  (the API redirects to a signed codeload link; the token goes only to
+  api.github.com), `extractTarGz`, check its `package.json` version, `npm ci
+  --omit=dev` (cache in `updates/npm-cache`, since the service account may have
+  no usable home and systemd allows writes only to the app folder), carry
+  `node-windows` over when installed (the Windows service runs its
+  `wrapper.js` from `node_modules`), then `node scripts/self-check.js`, which
+  loads every module without starting anything. Only then `pending.json` is
+  written and the server exits with **75**. Any failure removes the staging
+  folder and changes nothing.
+- **`update-boot.js` (first line of server.js)** finishes it before anything
+  else loads: the names the release ships, plus `node_modules` and whatever
+  the previous release shipped (`manifest.json`), move to
+  `updates/backup/<old>/`; the staged names move in. Each rename is journaled
+  first (`journal.json`), so a crash mid-swap is undone at the next start, and
+  any failed rename undoes the ones before it. Then it exits 75 again so the
+  new code starts clean. It depends on nothing but fs/path, so a broken
+  release cannot break the rollback.
+- **Rollback.** `applied.json` counts starts until `updater.confirmWhenHealthy`
+  marks the version good (listening for a minute). After
+  `MAX_UNCONFIRMED_BOOTS` (3) starts without that, it swaps the backup back.
+  The user can also go back by hand until the next update; only one backup
+  is kept.
+- **Never touched (`PROTECTED`)**: `state.enc`, `state.enc.*`, `.state-key`,
+  `logs/`, `history.json`, `layouts.json`, `known-hosts.json`,
+  `config-history/`, `daemon/` (node-windows' service wrapper), `updates/`.
+  A store must live at one of these names in the install folder, never
+  inside a code folder such as `routes/` (§6). A new store adds its name
+  here.
+- **Restart.** Exit code 75 is restarted by node-windows' wrapper (any exit)
+  and systemd (`Restart=on-failure`); `start.bat` runs `scripts/run.js`, which
+  restarts on 75 only.
+- **Token.** A fine-grained token, read-only Contents on this repository, in
+  `updates/token.enc`, encrypted with the vault's `encrypt`. It comes in
+  through `POST /api/update/token` and goes out nowhere: the status says
+  only whether one is set. `SBS_UPDATE_TOKEN` overrides it;
+  `SBS_UPDATE_REPO` names another repository.
+- **Routes** (`routes/update.js`): `GET /api/update/status`,
+  `POST /api/update/check | install | rollback | token | settings`, all behind
+  the request guard like every route.

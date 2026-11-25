@@ -57,9 +57,16 @@ module.exports = function register(app) {
   // durable record. The in-memory ring buffers / SSE are unchanged; this is an
   // additional always-on sink.
   const path_ = require('path');
+  // logs/ in the install folder. Versions before 1.2.0 wrote these under
+  // routes/logs/ by mistake (left over from the route split); moved once.
+  const STREAM_LOG_DIR = path_.join(__dirname, '..', 'logs');
+  for (const kind of ['traps', 'syslog']) {
+    rotate.adoptLegacy(path_.join(__dirname, 'logs', kind), path_.join(STREAM_LOG_DIR, kind));
+  }
+  try { require('fs').rmdirSync(path_.join(__dirname, 'logs')); } catch (e) { /* not there, or not empty */ }
   function persistStreamLine(kind, host, obj) {
     const safe = String(host || 'unknown').replace(/[^A-Za-z0-9._-]/g, '_');
-    const file = path_.join(__dirname, 'logs', kind, safe + '.log');
+    const file = path_.join(STREAM_LOG_DIR, kind, safe + '.log');
     rotate.appendLine(file, JSON.stringify(obj), { maxBytes: 5 * 1024 * 1024, keep: 10 });
   }
 
