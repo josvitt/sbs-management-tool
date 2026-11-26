@@ -2,7 +2,7 @@
 
 /**
  * Supervised write test for the Access lists panel (public/src/14-acl.js) on
- * a test switch. It makes two lists of its own, sbs-test-ip and sbs-test-v6,
+ * a test switch. It makes three lists of its own, sbs-test-ip, sbs-test-v6 and sbs-test-mac,
  * fills them with every kind of rule the panel offers, binds them to one port
  * and unbinds them, and deletes them again. Nothing is saved to startup.
  *
@@ -14,7 +14,7 @@
  *   --keep     leave the two lists on the switch (unbound) at the end, so
  *              "show access-lists" on the switch can be compared with what
  *              the panel shows. Run again with --cleanup to remove them.
- *   --cleanup  only remove sbs-test-ip and sbs-test-v6.
+ *   --cleanup  only remove sbs-test-ip, sbs-test-v6 and sbs-test-mac.
  *
  * Every write goes through the panel's own code, over the app's own routes on
  * 127.0.0.1. No community is written to the results file.
@@ -38,7 +38,7 @@ if (!host || !community) {
   console.error('Usage: SBS_COMM=<community> node scripts/switch-test-acl.js <address> [port ifIndex] [--keep | --cleanup] [results folder]');
   process.exit(2);
 }
-const LISTS = ['sbs-test-ip', 'sbs-test-v6'];
+const LISTS = ['sbs-test-ip', 'sbs-test-v6', 'sbs-test-mac'];
 
 const lines = [];
 function say(msg) {
@@ -126,7 +126,7 @@ async function main() {
   await add('IPv4: UDP to ports 5000-5010', ip({ proto: 'udp', dstPort: { from: 5000, to: 5010 } }), 'permit udp from any to any destination ports 5000-5010');
   await add('IPv4: TCP to port 22 with SYN set and ACK unset', ip({ action: 4, proto: 'tcp', dstPort: { from: 22, to: 22 }, tcpFlags: { val: 0x02, dc: 0x2d } }),
     'deny-log tcp from any to any destination port 22 flags -ack +syn');
-  await add('IPv4: TCP from source ports 1000-2000 (probe)', ip({ proto: 'tcp', srcPort: { from: 1000, to: 2000 } }), 'permit tcp from any to any source ports 1000-2000', { probe: true });
+  await add('IPv4: TCP from source ports 1000-2000', ip({ proto: 'tcp', srcPort: { from: 1000, to: 2000 } }), 'permit tcp from any to any source ports 1000-2000');
 
   // An edit keeps the rule's number and replaces its match.
   if (ranged) {
@@ -145,7 +145,13 @@ async function main() {
   await add('IPv6: UDP to 2001:db8:1::/48 port 53', v6({ proto: 'udp', dst: { any: false, ip: '2001:db8:1::', pref: 48 }, dstPort: { from: 53, to: 53 } }),
     'permit udp from any to 2001:db8:1::/48 destination port 53');
   await add('IPv6: plain rule to a /64', v6({ action: 2, dst: { any: false, ip: '2001:db8:2::', pref: 64 } }), 'deny ipv6 from any to 2001:db8:2::/64');
-  await add('IPv6: deny protocol 47 (probe)', v6({ action: 2, proto: 'num', protoNum: 47 }), 'deny protocol 47 from any to any', { probe: true });
+  await add('IPv6: deny protocol 47', v6({ action: 2, proto: 'num', protoNum: 47 }), 'deny protocol 47 from any to any');
+
+  const mac = (o) => Object.assign({ aclName: 'sbs-test-mac', family: 'mac', action: 1, proto: 'any', src: { any: true }, dst: { any: true } }, o);
+  await add('MAC: a new list from one device', mac({ src: { any: false, ip: '02:00:5e:10:00:01', pref: 48 } }), 'permit any from 02:00:5e:10:00:01/48 to any');
+  await add('MAC: deny to every IPv4 multicast address', mac({ action: 2, dst: { any: false, ip: '01:00:5e:00:00:00', pref: 24 } }), 'deny any from any to 01:00:5e:00:00:00/24');
+  await add('MAC: one maker to one device on VLAN 1', mac({ src: { any: false, ip: '02:00:5e:00:00:00', pref: 24 }, dst: { any: false, ip: '02:00:5e:10:00:02', pref: 48 }, vlan: 1 }),
+    'permit any from 02:00:5e:00:00:00/24 to 02:00:5e:10:00:02/48 vlan 1');
 
   // ---- 2. binding to the port and back -----------------------------------
   {
@@ -166,6 +172,12 @@ async function main() {
       check('the panel shows them as bound', listOf(m, 'sbs-test-ip').bound && (b0.v6In == null || listOf(m, 'sbs-test-v6').bound), '');
       const refused = await w.deleteQosAcl(s, ipList.idx);
       check('a bound list cannot be deleted from the panel', !refused.ok && /bound/.test(refused.error || ''), refused.error || 'it was deleted');
+      const macList = listOf(m, 'sbs-test-mac');
+      if (macList) {
+        err = await setBinding(Number(macList.idx), 0);
+        b = await w.readIfAclBinding(s, ifx, w.IFTYPE_PORT);
+        check('the MAC list bound to port ' + ifx + ' in its place', !err && b.inAcl === Number(macList.idx), err || JSON.stringify(b));
+      }
       err = await setBinding(0, 0);
       b = await w.readIfAclBinding(s, ifx, w.IFTYPE_PORT);
       check('port ' + ifx + ' unbound again', !err && JSON.stringify(b) === JSON.stringify(b0), err || JSON.stringify(b));
@@ -175,7 +187,7 @@ async function main() {
   // ---- 3. delete, or keep for a look on the switch ---------------------------
   m = await read();
   if (keep) {
-    say('KEPT sbs-test-ip and sbs-test-v6 on the switch, unbound. Compare with "show access-lists" on the switch,');
+    say('KEPT sbs-test-ip, sbs-test-v6 and sbs-test-mac on the switch, unbound. Compare with "show access-lists" on the switch,');
     say('then run this again with --cleanup to remove them.');
     return finish(server);
   }

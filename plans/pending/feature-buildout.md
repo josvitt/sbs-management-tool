@@ -207,8 +207,7 @@ A new **QoS** panel.
 | 4 System | Shipped in v1.10.0: clock, time zone, SNTP on/off, management services, user privilege and delete, proven on .253. Held back (no SNMP form taken, see SWITCH-NOTES): adding SNTP servers, adding users, setting passwords. Summer time and the management access list read-only. SNMPv3 users (4.4) moved to fog. |
 | 5 Ports and PoE | Shipped in v1.11.0: PoE admin, priority and limit; port security; storm control (kb/s); errdisable recovery; LLDP, CDP and EEE per port; CDP for the switch; port mirroring sessions; cable test. Switch test 27/27 on .253. One Port features panel holds the switch-wide settings and mirroring (rather than a separate Port mirroring panel), plus a Features tab on each port. LLDP and EEE for the whole switch are offered but were not switched in the test, since they touch every link. |
 | 6 Spanning tree | Shipped in v1.12.0: spanning tree on or off, mode, bridge priority for the switch; per port cost, priority, PortFast, automatic PortFast, BPDU guard and on or off. Proven on .253 (mode RSTP and back to Rapid PVST+ included). Held back: per-VLAN bridge priority and per-VLAN port cost and priority. The C1300 answers NotWritable to every form on rlBrgPvstVlanTable and rlBrgPvstPortTable; see SWITCH-NOTES. MSTP instance priority is not offered: .253 runs PVST, so no switch-made MSTP row was available to encode from. |
-| 6 Spanning tree | Not started |
-| 7 Access lists | Not started |
+| 7 Access lists | Shipped in v1.13.0: ICMP type and code, any protocol number, source and destination ports and ranges, IPv6 lists and MAC lists (source, destination, VLAN), and IPv6 lists on a port's ACL tab. Each match is written to the slot the switch uses. Not offered: Ethernet type on MAC rules (no switch-made row). |
 | 8 Switching security | Not started |
 | 9 Alerts | Dropped (D7) |
 | 10 IPv6 | Not started |

@@ -104,7 +104,7 @@ function load(sw) {
   };
   vm.createContext(ctx);
   const api = vm.runInContext(helpers + '\n' + read('14-acl.js') + `
-    ;({ aclModel, aclRuleView, decodeTuple, buildTupleMap, ipTupleHex, ipv6TupleHex, ipv6ToHex, hexToIpv6, protoTupleHex, ACE_TUPLE_COLS,
+    ;({ aclModel, aclRuleView, decodeTuple, buildTupleMap, ipTupleHex, ipv6TupleHex, macTupleHex, ipv6ToHex, hexToIpv6, protoTupleHex, ACE_TUPLE_COLS,
         createQosAce, editQosAce, deleteQosAce, deleteQosAcl, aclDeleteLock, aclRefresh })`, ctx);
   const s = { target: { host: '10.0.0.2' }, host: '10.0.0.2', health: Object.assign({ scalars: {} }, sw.health()) };
   return { api, s };
@@ -280,13 +280,22 @@ test('ACL tables come back from a health read with index and column', async () =
 // sbs-ref-v6 and ISE-PREAUTH), tuple for tuple: { type, slots: { slot: tuple } }
 // and each tuple's { type, n1 (Value1), hex (Value2) }.
 const switchMade = () => ({
-  acls: { 1: { name: 'sbs-ref-ip' }, 2: { name: 'sbs-ref-v6', type: 3 } },
+  acls: { 1: { name: 'sbs-ref-ip' }, 2: { name: 'sbs-ref-v6', type: 3 }, 3: { name: 'sbs-ref-mac', type: 1 } },
   aces: {
     '1.20': { action: 1, type: 7, slots: { 1: '12', 4: '13', 5: '14' } },          // permit icmp any any 8 0
     '1.40': { action: 2, type: 1, slots: { 1: '15' } },                            // deny 47 any any
     '1.60': { action: 1, type: 2, slots: { 1: '16', 5: '17', 7: '18' } },          // permit tcp any any any 8000-8080
     '1.80': { action: 1, type: 3, slots: { 1: '19', 3: '20' } },                   // permit udp any 53 any any
     '1.90': { action: 1, type: 7, slots: { 1: '30', 3: '31' } },                   // permit icmp any host 192.168.10.69
+    '1.100': { action: 1, type: 1, slots: { 4: '32' } },                           // permit ip any 10.1.2.0 0.0.0.255
+    '1.120': { action: 1, type: 2, slots: { 1: '33', 3: '34', 6: '35' } },         // permit tcp any 1000-2000 any any
+    '1.140': { action: 1, type: 3, slots: { 1: '36', 3: '37', 6: '38' } },         // permit udp any 5000-5010 any any
+    '2.60': { action: 1, type: 9, slots: { 4: '39' } },                            // permit ipv6 any 2001:db8:1::/48
+    '2.80': { action: 1, type: 11, slots: { 1: '40', 5: '41' } },                  // permit udp any any any 53
+    '2.100': { action: 2, type: 9, slots: { 1: '42' } },                           // deny 47 any any
+    '3.20': { action: 1, type: 5, slots: { 1: '43' } },                            // permit 00:11:22:33:44:55 00:00:00:ff:ff:ff any
+    '3.40': { action: 2, type: 5, slots: { 2: '44' } },                            // deny any 01:00:5e:00:00:00 00:00:00:ff:ff:ff
+    '3.60': { action: 1, type: 5, slots: { 3: '45' } },                            // permit any any vlan 1
     '2.20': { action: 1, type: 10, slots: { 1: '21', 2: '22', 5: '23' } },         // permit tcp 2001:db8::/32 any any 443
     '2.40': { action: 1, type: 13, slots: { 1: '24', 4: '25' } }                   // permit icmp any any 135 any
   },
@@ -297,7 +306,15 @@ const switchMade = () => ({
     19: { type: 1, n1: 0, hex: '11ff' }, 20: { type: 6, n1: 53, hex: '0000' },
     30: { type: 1, n1: 0, hex: '01ff' }, 31: { type: 3, n1: 0, hex: 'c0a80a4500000000' },
     21: { type: 1, n1: 0, hex: '06ff' }, 22: { type: 23, n1: 0, hex: '20010db800000000000000000000000000000000ffffffffffffffffffffffff' }, 23: { type: 9, n1: 443, hex: '0000' },
-    24: { type: 1, n1: 0, hex: '3aff' }, 25: { type: 19, n1: 135, hex: '' }
+    24: { type: 1, n1: 0, hex: '3aff' }, 25: { type: 19, n1: 135, hex: '' },
+    32: { type: 3, n1: 0, hex: '0a010200000000ff' },
+    33: { type: 1, n1: 0, hex: '06ff' }, 34: { type: 29, n1: 1000, hex: '' }, 35: { type: 30, n1: 2000, hex: '' },
+    36: { type: 1, n1: 0, hex: '11ff' }, 37: { type: 25, n1: 5000, hex: '' }, 38: { type: 26, n1: 5010, hex: '' },
+    39: { type: 24, n1: 0, hex: '20010db8000100000000000000000000000000000000ffffffffffffffffffff' },
+    40: { type: 1, n1: 0, hex: '11ff' }, 41: { type: 7, n1: 53, hex: '0000' },
+    42: { type: 1, n1: 0, hex: '2fff' },
+    43: { type: 10, n1: 0, hex: '001122334455000000ffffff' }, 44: { type: 11, n1: 0, hex: '01005e000000000000ffffff' },
+    45: { type: 12, n1: 1, hex: '' }
   }
 });
 
@@ -315,7 +332,15 @@ test('switch-made ICMP, protocol number, port, range and IPv6 rules read back in
   assert.deepEqual(pick(view('1.90')), { proto: 'icmp', src: 'any', dst: '192.168.10.69/32', extra: [], unsupported: [] });
   assert.deepEqual(pick(view('2.20')), { proto: 'tcp', src: '2001:db8::/32', dst: 'any', extra: ['destination port 443'], unsupported: [] });
   assert.deepEqual(pick(view('2.40')), { proto: 'icmp', src: 'any', dst: 'any', extra: ['icmp type 135'], unsupported: [] });
+  assert.deepEqual(pick(view('1.100')), { proto: 'ip', src: 'any', dst: '10.1.2.0/24', extra: [], unsupported: [] });
+  assert.deepEqual(pick(view('1.120')), { proto: 'tcp', src: 'any', dst: 'any', extra: ['source ports 1000-2000'], unsupported: [] });
+  assert.deepEqual(pick(view('2.60')), { proto: 'ipv6', src: 'any', dst: '2001:db8:1::/48', extra: [], unsupported: [] });
+  assert.deepEqual(pick(view('2.100')), { proto: 'protocol 47', src: 'any', dst: 'any', extra: [], unsupported: [] });
+  assert.deepEqual(pick(view('3.20')), { proto: 'any', src: '00:11:22:33:44:55/24', dst: 'any', extra: [], unsupported: [] });
+  assert.deepEqual(pick(view('3.40')), { proto: 'any', src: 'any', dst: '01:00:5e:00:00:00/24', extra: [], unsupported: [] });
+  assert.deepEqual(pick(view('3.60')), { proto: 'any', src: 'any', dst: 'any', extra: ['vlan 1'], unsupported: [] });
   assert.equal(m.byIdx.get('2').family, 'ipv6');
+  assert.equal(m.byIdx.get('3').family, 'mac');
   assert.deepEqual(view('1.60').init.dstPort, { from: 8000, to: 8080 });
   assert.deepEqual([view('1.40').init.proto, view('1.40').init.protoNum], ['num', 47]);
 });
@@ -339,7 +364,7 @@ test('saving a switch-made rule from its editor values writes what the switch wr
     const { api, s } = load(sw);
     await api.createQosAce(s, Object.assign({ aclName: acl.name }, init));
     const got = sw.aces.get('1.1');
-    assert.equal(sw.acls.get('1').type, acl.type || 2, key + ' list type');
+    assert.equal(sw.acls.get('1').type, acl.type, key + ' list type');
     assert.equal(got.type, want.type, key + ' rule type');
     assert.equal(got.action, want.action, key + ' action');
     assert.deepEqual(shape(sw, got), shape(ref, want), key + ' tuples');
@@ -356,4 +381,14 @@ test('IPv6 addresses encode with a wildcard mask and read back short', () => {
   assert.equal(api.hexToIpv6('0'.repeat(32)), '::');
   assert.equal(api.hexToIpv6('20010db8000000010000000000000001'), '2001:db8:0:1::1');
   assert.equal(api.decodeTuple({ type: 24, v2: '20010db8000100000000000000000001' + '0'.repeat(32) }).text, '2001:db8:1::1/128');
+});
+
+test('MAC addresses encode with a wildcard, and an odd wildcard is not edited', () => {
+  const { api } = load(fakeSwitch({}));
+  assert.equal(api.macTupleHex('00-11-22-33-44-55', 24), '001122334455000000ffffff');
+  assert.equal(api.macTupleHex('0011.2233.4455', 48), '001122334455000000000000');
+  assert.equal(api.macTupleHex('00:11:22', 48), null);
+  const odd = api.decodeTuple({ type: 10, v2: '001122334455ff00ff00ff00' });
+  assert.equal(odd.text, '00:11:22:33:44:55 ignoring ff:00:ff:00:ff:00');
+  assert.equal(odd.oddMask, true);
 });

@@ -330,6 +330,41 @@ Proven on a C1300-24MGP-4X (4.1.9.92) running Rapid PVST+, with
 - **MSTP instances:** not tried (.253 runs PVST, so there was no switch-made
   `rldot1sMstpInstanceTable` row to encode from).
 
+## Access lists (`14-acl.js`)
+
+Encoded from rules the switch made itself from the CLI on .253 (sbs-ref-ip,
+sbs-ref-v6, sbs-ref-mac) and .254 (DMZ, ISE-PREAUTH), read from the
+recordings, and written back by `scripts/switch-test-acl.js`.
+
+- **Three tables.** rlQosAclTable (88.7: name, type mac 1 / ip 2 / ipv6 3),
+  rlQosAceTidxTable (88.31: action, type, eleven Tuple pointers in columns
+  5 to 12 and 17 to 19) and rlQosTupleTable (88.5: type, Value1 INTEGER,
+  Value2 octets). A rule is its tuples plus an ACE row pointing at them.
+- **Each match has its own Tuple slot, and it depends on the rule type.**
+  TCP and UDP: 1 protocol, 2 source, 3 source port or range start, 4
+  destination, 5 destination port or range start, 6 source range end, 7
+  destination range end, 8 TCP flags. ICMP has no ports, so its destination
+  moves up: 3 destination, 4 type, 5 code. A plain IP or IPv6 rule: 1
+  protocol number, 2 source, 4 destination. MAC: 1 source, 2 destination, 3
+  VLAN. The app writes the same slots, and a failed edit puts a rule back in
+  the slots it was read from.
+- **Value encodings.** Protocol: one byte and ff (`2fff` is 47; ICMP for
+  IPv6 is `3aff`). Addresses: value then wildcard, 1 bits ignored, for IPv4
+  (4 + 4 bytes), IPv6 (16 + 16) and MAC (6 + 6). One port: Value1 is the
+  port and Value2 `0000`. Ranges, ICMP type and code, and VLAN: Value1 is
+  the number and Value2 is empty. TCP flags: value byte, then a don't-care
+  byte.
+- **Rule types.** ip 1, tcp 2, udp 3, icmp 7; ipv6 9, ipv6 tcp 10, ipv6 udp
+  11, ipv6 icmp 13; mac 5. A rule naming a protocol number is a plain rule
+  (type 1 or 9) with a protocol tuple.
+- **Value1 reads with a thousands separator** in the display ("8,000"), so
+  the app reads the raw number.
+- **Binding.** rlQosIfPolicyTable: `rlQosIfAclIn`/`Out` hold an IPv4 or MAC
+  list, `rlQosIfIpv6AclIn`/`Out` an IPv6 list.
+- **Not offered:** an Ethernet type on a MAC rule (the sample line was not
+  taken by the switch, so there is no switch-made row to encode from), DSCP,
+  IP precedence, CoS, and offset rules.
+
 ## Port actions (`routes/ports.js`)
 
 - **A PoE bounce makes the config "unsaved".** The bounce is two writes to

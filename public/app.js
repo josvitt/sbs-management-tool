@@ -1364,7 +1364,7 @@
     { key: 'snmpcfg', title: 'SNMP configuration', span: 12, h: 0, needs: () => true },
     // IP access lists (the QoS ACL tables): a keyed write panel whose tables
     // are loaded on demand once per visit (14-acl.js).
-    { key: 'acl', title: 'IP access lists', span: 12, h: 0, needs: () => true },
+    { key: 'acl', title: 'Access lists', span: 12, h: 0, needs: () => true },
     // IPv4 Addressing: every interface address (VLAN SVIs and routed ports,
     // static or DHCP), global L3 status, the forwarding table, static routes,
     // DNS client status, nameservers and static host mappings. Interactive
@@ -9143,7 +9143,7 @@
     return null;
   }
   // Reverse maps for building writes.
-  const TUPLE_TYPE_VAL = { protocol: 1, 'ip-src': 2, 'ip-dest': 3, 'tcp-flags': 18, 'icmp-type': 19, 'icmp-code': 20, 'ipv6-src': 23, 'ipv6-dest': 24 };
+  const TUPLE_TYPE_VAL = { protocol: 1, 'ip-src': 2, 'ip-dest': 3, 'mac-src': 10, 'mac-dest': 11, vlan: 12, 'tcp-flags': 18, 'icmp-type': 19, 'icmp-code': 20, 'ipv6-src': 23, 'ipv6-dest': 24 };
   // Port tuple types: one port, and the start of a range (its end is start + 1).
   const PORT_TUPLE = { udp: { src: { one: 6, start: 25 }, dst: { one: 7, start: 27 } },
     tcp: { src: { one: 8, start: 29 }, dst: { one: 9, start: 31 } } };
@@ -9152,7 +9152,9 @@
   // 3 source port or range start, 4 destination, 5 destination port or range
   // start, 6 source range end, 7 destination range end, 8 TCP flags. ICMP has
   // no ports, so its destination moves up: 3 destination, 4 type, 5 code.
+  // A MAC rule: 1 source, 2 destination, 3 VLAN.
   const ACE_SLOT = {
+    mac: { src: 1, dst: 2, vlan: 3 },
     l4: { proto: 1, src: 2, srcPort: 3, dst: 4, dstPort: 5, srcEnd: 6, dstEnd: 7, flags: 8 },
     icmp: { proto: 1, src: 2, dst: 3, icmpType: 4, icmpCode: 5 },
     ip: { proto: 1, src: 2, dst: 4 }
@@ -9204,6 +9206,17 @@
     for (let i = 0; i < hex.length; i += 2) { let b = (~parseInt(hex.substr(i, 2), 16)) & 0xff; while (b) { n += b & 1; b >>= 1; } }
     return n;
   }
+  // The 6-byte wildcard (hex) that ignores all but the first pref bits.
+  function macWildcard(pref) {
+    let out = '';
+    for (let byte = 0; byte < 6; byte++) out += ((0xff >> Math.max(0, Math.min(8, pref - byte * 8))) & 0xff).toString(16).padStart(2, '0');
+    return out;
+  }
+  // "00:11:22:33:44:55" (or with - or no separators) -> 12 hex digits, or null.
+  function macToHex(text) {
+    const h = String(text || '').trim().toLowerCase().replace(/[:.\-]/g, '');
+    return /^[0-9a-f]{12}$/.test(h) ? h : null;
+  }
   // "2001:db8::1" -> 32 hex digits, or null.
   function ipv6ToHex(text) {
     const s = String(text || '').trim().toLowerCase();
@@ -9250,6 +9263,19 @@
       const pref = hex.length >= 64 ? wildcardPrefix(hex.substr(32, 32)) : 128;
       return { field: t.type === 23 ? 'src' : 'dst', text: hexToIpv6(hex.substr(0, 32)) + '/' + pref };
     }
+    // mac-src/mac-dest: 12 bytes = 6 value + 6 wildcard-mask. A wildcard that
+    // ignores only the last bits reads as a prefix (00:11:22:00:00:00/24 is
+    // one maker); any other wildcard is shown as it is.
+    if ((t.type === 10 || t.type === 11) && hex.length >= 12) {
+      const mac = hex.substr(0, 12).match(/../g).join(':');
+      const wild = hex.length >= 24 ? hex.substr(12, 12) : '000000000000';
+      const pref = wildcardPrefix(wild);
+      const field = t.type === 10 ? 'src' : 'dst';
+      if (macWildcard(pref) === wild) return { field, text: mac + '/' + pref };
+      return { field, text: mac + ' ignoring ' + wild.match(/../g).join(':'), oddMask: true };
+    }
+    // vlan: the VLAN number in Value1.
+    if (t.type === 12 && Number.isFinite(t.n1)) return { field: 'vlan', text: 'vlan ' + t.n1, n: t.n1 };
     // protocol: 1 byte value + 1 byte mask.
     if (t.type === 1 && hex.length >= 2) {
       const p = parseInt(hex.substr(0, 2), 16);
@@ -9375,15 +9401,16 @@
     if ([1, 2, 4, 5].indexOf(ace.action) === -1) unsupported.push(action);
     const init = { family, action: ace.action, proto: p, src: { any: true }, dst: { any: true } };
     let proto = !kind ? (ACE_TYPE[ace.type] || ('type ' + ace.type)) : (p === 'any' ? (family === 'ipv6' ? 'ipv6' : (family === 'mac' ? 'any' : 'ip')) : p);
-    let src = 'any', dst = 'any', flagsText = null;
+    let src = 'any', dst = 'any', flagsText = null, vlanText = null;
     const ports = { src: {}, dst: {} }, other = [];
     const l4 = p === 'tcp' || p === 'udp';
     for (const tp of ace.tuples) {
       const t = tupleMap.get(tp);
       const dec = decodeTuple(t);
       if (!dec) { unsupported.push('tuple ' + tp); continue; }
-      if (dec.field === 'src') { src = dec.text; init.src = parseCidr(dec.text); }
-      else if (dec.field === 'dst') { dst = dec.text; init.dst = parseCidr(dec.text); }
+      if (dec.field === 'src') { src = dec.text; init.src = parseCidr(dec.text); if (dec.oddMask) unsupported.push('a source mask that is not a prefix'); }
+      else if (dec.field === 'dst') { dst = dec.text; init.dst = parseCidr(dec.text); if (dec.oddMask) unsupported.push('a destination mask that is not a prefix'); }
+      else if (dec.field === 'vlan') { init.vlan = dec.n; vlanText = dec.text; if (family !== 'mac') unsupported.push(dec.text); }
       else if (dec.field === 'proto') {
         // A TCP, UDP or ICMP rule carries its own protocol; a plain rule may
         // name any protocol number.
@@ -9415,6 +9442,7 @@
     if (init.icmpType != null) extra.push('icmp type ' + init.icmpType + (init.icmpCode != null ? ' code ' + init.icmpCode : ''));
     else if (init.icmpCode != null) { extra.push('icmp code ' + init.icmpCode); unsupported.push('an ICMP code with no type'); }
     if (flagsText) extra.push(flagsText);
+    if (vlanText) extra.push(vlanText);
     extra.push(...other);
     return { action, isPermit: /permit/.test(action), proto, src, dst, extra, init, unsupported };
   }
@@ -9752,6 +9780,14 @@
     }
     return v + wild;
   }
+  // The same for a mac-src/mac-dest tuple: 6 value bytes + 6 wildcard bytes,
+  // as the switch made 00:11:22:33:44:55 00:00:00:ff:ff:ff.
+  function macTupleHex(mac, pref) {
+    const v = macToHex(mac);
+    if (!v) return null;
+    const n = parseInt(pref, 10);
+    return v + macWildcard(Number.isFinite(n) ? Math.max(0, Math.min(48, n)) : 48);
+  }
   // protocol tuple value||mask: 1 value byte + 1 exact mask (ff).
   function protoTupleHex(proto) { return proto.toString(16).padStart(2, '0') + 'ff'; }
 
@@ -9778,7 +9814,7 @@
     const aceType = ACE_TYPE_FOR[family] && ACE_TYPE_FOR[family][p];
     if (!aceType) throw new Error('a ' + ACL_FAMILY_WORD[family] + ' list cannot hold a ' + p + ' rule');
     const l4 = p === 'tcp' || p === 'udp';
-    const slots = l4 ? ACE_SLOT.l4 : (p === 'icmp' ? ACE_SLOT.icmp : ACE_SLOT.ip);
+    const slots = family === 'mac' ? ACE_SLOT.mac : (l4 ? ACE_SLOT.l4 : (p === 'icmp' ? ACE_SLOT.icmp : ACE_SLOT.ip));
 
     // 1. Resolve or create the ACL by name.
     let aclIdx = cfg.aclIdx != null ? String(cfg.aclIdx) : null;
@@ -9820,13 +9856,22 @@
       const a = cfg[side];
       if (!a || a.any) continue;
       const word = side === 'src' ? 'source' : 'destination';
-      if (family === 'ipv6') {
+      if (family === 'mac') {
+        const hx = macTupleHex(a.ip, a.pref); if (!hx) throw new Error('bad ' + word + ' MAC address');
+        await addTuple(slots[side], TUPLE_TYPE_VAL[side === 'src' ? 'mac-src' : 'mac-dest'], hx);
+      } else if (family === 'ipv6') {
         const hx = ipv6TupleHex(a.ip, a.pref); if (!hx) throw new Error('bad ' + word + ' address');
         await addTuple(slots[side], TUPLE_TYPE_VAL[side === 'src' ? 'ipv6-src' : 'ipv6-dest'], hx);
       } else {
         const hx = ipTupleHex(a.ip, a.pref); if (!hx) throw new Error('bad ' + word + ' address');
         await addTuple(slots[side], TUPLE_TYPE_VAL[side === 'src' ? 'ip-src' : 'ip-dest'], hx);
       }
+    }
+    // VLAN, MAC rules only: the VLAN number in Value1, Value2 empty.
+    if (cfg.vlan != null) {
+      if (family !== 'mac') throw new Error('a VLAN match needs a MAC list');
+      if (!(Number.isInteger(cfg.vlan) && cfg.vlan >= 1 && cfg.vlan <= 4094)) throw new Error('the VLAN must be 1 to 4094');
+      await addTuple(slots.vlan, TUPLE_TYPE_VAL.vlan, '', cfg.vlan);
     }
     // Ports, TCP or UDP only. One port: a port tuple, the port in Value1 and
     // 0000 in Value2. A range: a start tuple and an end tuple, Value2 empty.
@@ -9933,11 +9978,15 @@
     wrap.appendChild(detail);
     const sync = () => { const off = any.checked; ip.disabled = off; pref.disabled = off; detail.classList.toggle('is-off', off); };
     any.addEventListener('change', sync); sync();
+    // Placeholder, prefix limit and default prefix for each list type. The
+    // first call keeps a prefix the rule already has; a change of type resets it.
+    let current = null;
     const setFamily = (f) => {
-      const v6 = f === 'ipv6';
-      ip.placeholder = v6 ? '2001:db8::' : '192.168.1.0';
-      pref.max = v6 ? '128' : '32';
-      if (!pref.value || parseInt(pref.value, 10) > parseInt(pref.max, 10)) pref.value = v6 ? '64' : '24';
+      const shape = { ip: ['192.168.1.0', 32, 24], ipv6: ['2001:db8::', 128, 64], mac: ['00:11:22:33:44:55', 48, 48] }[f] || ['192.168.1.0', 32, 24];
+      ip.placeholder = shape[0];
+      pref.max = String(shape[1]);
+      if (current === null ? init.pref == null : f !== current) pref.value = String(shape[2]);
+      current = f;
     };
     setFamily(family || 'ip');
     return { wrap, any, ip, pref, setFamily };
@@ -9982,7 +10031,7 @@
     const ace = acl && acl.aces.get(String(aceIdx));
     if (!acl || !ace) return;
     const view = aclRuleView(ace, model.tupleMap);
-    if (view.unsupported.length || view.init.family !== acl.family || acl.family === 'mac') {
+    if (view.unsupported.length || view.init.family !== acl.family) {
       const what = view.unsupported.length ? view.unsupported.join(', ') : 'a match this editor does not handle';
       openTabbedPopout(s, 'ACL · ' + acl.name + ' · rule ' + ace.idx, [{ label: 'Rule', fill: (pane) => {
         pane.appendChild(el('div', 'card-sub', view.action + ' ' + view.proto + ' from ' + view.src + ' to ' + view.dst + (view.extra.length ? ', ' + view.extra.join(', ') : '')));
@@ -10006,7 +10055,7 @@
     if (opts.newAcl) {
       nameIn = el('input'); nameIn.type = 'text'; nameIn.maxLength = 32; nameIn.placeholder = 'list name';
       basics.body.appendChild(field('ACL name', nameIn));
-      familySel = selectInput([{ label: 'IPv4', value: 'ip' }, { label: 'IPv6', value: 'ipv6' }], family);
+      familySel = selectInput([{ label: 'IPv4', value: 'ip' }, { label: 'IPv6', value: 'ipv6' }, { label: 'MAC', value: 'mac' }], family);
       basics.body.appendChild(field('List type', familySel));
     }
     const actionSel = selectInput([
@@ -10018,7 +10067,8 @@
       { label: 'any', value: 'any' }, { label: 'TCP', value: 'tcp' }, { label: 'UDP', value: 'udp' },
       { label: 'ICMP', value: 'icmp' }, { label: 'other protocol number', value: 'num' }
     ], init.proto || 'any');
-    basics.body.appendChild(field('Protocol', protoSel));
+    const protoField = field('Protocol', protoSel);
+    basics.body.appendChild(protoField);
     const protoNumIn = el('input'); protoNumIn.type = 'number'; protoNumIn.min = '0'; protoNumIn.max = '255'; protoNumIn.placeholder = '47';
     if (init.protoNum != null) protoNumIn.value = String(init.protoNum);
     const protoNumField = field('Protocol number', protoNumIn);
@@ -10033,6 +10083,13 @@
     const dst = addressGroup('destination', init.dst || { any: true }, family);
     match.body.appendChild(field('Source', src.wrap));
     match.body.appendChild(field('Destination', dst.wrap));
+    // MAC lists: a prefix of 48 is one device, 24 is every device of one maker.
+    const macHint = el('div', 'card-sub', 'The number after / is how many bits must match: 48 is one device, 24 is every device from one maker.');
+    match.body.appendChild(macHint);
+    const vlanIn = el('input'); vlanIn.type = 'number'; vlanIn.min = '1'; vlanIn.max = '4094'; vlanIn.placeholder = 'any';
+    if (init.vlan != null) vlanIn.value = String(init.vlan);
+    const vlanField = field('VLAN', vlanIn);
+    match.body.appendChild(vlanField);
     form.appendChild(match.sec);
 
     // --- Section: ports (TCP and UDP). Blank is any port; a "to" makes a range. ---
@@ -10085,6 +10142,11 @@
 
     // Show only the sections the chosen protocol uses.
     const syncVisible = () => {
+      const mac = family === 'mac';
+      if (mac) protoSel.value = 'any';
+      protoField.style.display = mac ? 'none' : '';
+      macHint.style.display = mac ? '' : 'none';
+      vlanField.style.display = mac ? '' : 'none';
       const pv = protoSel.value;
       protoNumField.style.display = pv === 'num' ? '' : 'none';
       portsSec.sec.style.display = (pv === 'tcp' || pv === 'udp') ? '' : 'none';
@@ -10105,9 +10167,8 @@
       const fail = (text) => { msg.appendChild(el('div', 'sw-err', text)); };
       if (!name) return fail('Enter an ACL name.');
       if (opts.newAcl && aclModel(s.health).acls.some((a) => a.name === name)) return fail('An ACL named “' + name + '” already exists. Use its Add rule instead.');
-      const v6 = family === 'ipv6';
-      const addrOk = v6 ? ipv6ToHex : ipv4ToHex;
-      const maxPref = v6 ? 128 : 32;
+      const addrOk = { ip: ipv4ToHex, ipv6: ipv6ToHex, mac: macToHex }[family];
+      const maxPref = { ip: 32, ipv6: 128, mac: 48 }[family];
       const addr = (g, word) => {
         if (g.any.checked) return { any: true };
         if (!addrOk(g.ip.value)) return 'Enter a valid ' + word + ' ' + ACL_FAMILY_WORD[family] + ' address.';
@@ -10120,6 +10181,11 @@
       if (typeof dstA === 'string') return fail(dstA);
       const pv = protoSel.value;
       const cfg = { aclName: name, family, action: parseInt(actionSel.value, 10), proto: pv, src: srcA, dst: dstA };
+      if (family === 'mac') {
+        const v = numIn(vlanIn);
+        if (v != null && !(v >= 1 && v <= 4094)) return fail('The VLAN must be 1 to 4094.');
+        if (v != null) cfg.vlan = v;
+      }
       if (pv === 'num') {
         const n = numIn(protoNumIn);
         if (n == null || !(n <= 255)) return fail('Enter a protocol number from 0 to 255.');
