@@ -471,6 +471,51 @@ name-server 2001:db8:999::53`, read from the recording.
   route added and removed, a DNS server added and removed, IPv6 off and on
   for VLAN 999, and everything put back.
 
+## QoS (`switch-qos.js`, `32-qos.js`)
+
+Encoded from the settings made from the CLI on .253 for gi1/0/4 (ifIndex 4):
+`rate-limit 64000`, `traffic-shape 64000`, `traffic-shape queue 3 64000`,
+`wrr-queue cos-map 7 5` and `qos map dscp-queue 10 to 6`, read from the
+recording.
+
+- **The mode and trust are rlQosModeGlobalCfgTable (V.88.46.1)**, one row,
+  index 1: GlobalQoSMode (.2, disable 1 / basic 2 / advance 3),
+  BasicGlobalTrustMode (.3) and AdvcGlobalTrustMode (.4) (cos 1 / dscp 2 /
+  cos-dscp 3). The older scalars rlQosCliQosMode (V.88.1) and
+  rlQosCliBasicModeCfg (V.88.2) do not answer on .253. .253 runs basic mode,
+  trusting DSCP.
+- **Per port is rlQosIfPolicyTable (V.88.13.1)**, index ifIndex.2, a row
+  for every possible ifIndex (424 on .253), so the app GETs the present
+  ports. TrustActive (.5) and PortShaperStatus (.6) are disable 1 /
+  enable 2. `traffic-shape 64000` set .6 = 2, CirPortShaper (.7) = 64000
+  and CbsPortShaper (.8) = 128000.
+- **`rate-limit` is not in the QoS table.** rlQosPortRateLimitStatus (.17)
+  stayed disable on gi1/0/4. The rate went to rlStormCtrlRateLimCfgTable
+  (V.77.12.1) with traffic type 6, `all`: Rate (.2) = 64000. The app reads
+  and writes the port rate limit there, and the Port features storm control
+  summary leaves that row out.
+- **Queue shapers are a profile the port points to.** `traffic-shape queue
+  3 64000` made rlQosQueueShapeProfileTable (V.88.23.1) row 1 with CIR
+  (.2, .4 … .16) and CBS (.3, .5 … .17) for queues 1 to 8: CIR 0 for the
+  queues not shaped, CBS 128000 for all, RowStatus .18 = 1. The port's
+  rlQosQueueShapeProfilePointer (.11) became 1. A port with no queue shaper
+  points to 0. The app makes a new row the same way for such a port, and
+  sets the pointer back to 0 and removes the row when its last queue is
+  turned off.
+- **The maps are rlQosCosQueueTable (V.88.17.1) and rlQosDscpQueueTable
+  (V.88.18.1)**: .2 is the queue (1 to 8) for each CoS (0 to 7) or DSCP (0
+  to 63). The defaults are read from V.88.29.1 and V.88.33.1. `qos map
+  dscp-queue 10 to 6` set DSCP 10 to queue 6 (default 2). `wrr-queue
+  cos-map 7 5` left CoS 5 on queue 7, which is already its default.
+- **Scheduling** is rlQosQueueProfileTable (V.88.22.1), one profile named
+  "default": every queue is type ef (strict priority) on .253. The app shows
+  it and does not change it.
+- **Forms tried:** the mode, trust and port shaper each try a second form
+  (with the row made active, or the rate before the status); a new queue
+  shaper tries createAndGo with every queue, createAndGo with the shaped
+  queue only, then createAndWait.
+- **Proven** by `scripts/switch-test-qos.js` on .253: PENDING.
+
 ## Port actions (`routes/ports.js`)
 
 - **A PoE bounce makes the config "unsaved".** The bounce is two writes to
