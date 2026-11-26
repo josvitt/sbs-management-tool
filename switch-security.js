@@ -354,7 +354,7 @@ async function setArp(session, p) {
 /**
  * ARP inspection on one VLAN. on: true makes the row (with the list, when
  * one is given), false destroys it. With the row already there, a list name
- * alone changes the assigned list ('' clears it).
+ * alone changes the assigned list; '' clears it by making the row again.
  */
 async function setArpVlan(session, vlan, p) {
   const v = checkVlan(vlan);
@@ -367,6 +367,14 @@ async function setArpVlan(session, vlan, p) {
     return { vlan: v, on: true, list };
   }
   if (list == null) throw new Error('Nothing to change.');
+  if (list === '') {
+    // The switch refuses an empty name (WrongLength on .253), so the list is
+    // cleared by making the row again without one: destroy, then createAndGo.
+    // ARP inspection is off on the VLAN for that moment.
+    await setRow(session, ARP_VLAN + '.3.' + v, false);
+    await setVarbinds(session, [I(ARP_VLAN + '.3.' + v, ROW.createAndGo)]);
+    return { vlan: v, list: '' };
+  }
   await setVarbinds(session, [OCT(ARP_VLAN + '.2.' + v, list)]);
   return { vlan: v, list };
 }
