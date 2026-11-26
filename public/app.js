@@ -1383,7 +1383,10 @@
     { key: 'system', title: 'System', span: 12, h: 0, needs: () => true },
     // Port features: switch-wide LLDP/CDP/EEE, errdisable recovery, port
     // mirroring and a per-port overview (28-port-features.js).
-    { key: 'portfeatures', title: 'Port features', span: 12, h: 0, needs: () => true }
+    { key: 'portfeatures', title: 'Port features', span: 12, h: 0, needs: () => true },
+    // Spanning tree settings: on or off, mode, bridge priority and the
+    // per-port settings (29-stp-settings.js). Always offered.
+    { key: 'stpsettings', title: 'Spanning tree settings', span: 12, h: 0, needs: () => true }
   ];
 
   const builtinDef = (key) => BUILTIN.find((b) => b.key === key);
@@ -2494,7 +2497,8 @@
     system: [],
     // Port features has its own loader (28-port-features.js); its port names
     // come from the interfaces table.
-    portfeatures: ['interfaces']
+    portfeatures: ['interfaces'],
+    stpsettings: ['interfaces']
   };
   function panelDependsOn(key, changedTables) {
     const deps = PANEL_TABLE_DEPS[key];
@@ -2671,6 +2675,7 @@
     take('_maint', body.maint && !body.maint.error ? body.maint : (body.maint ? { error: body.maint.error } : undefined));
     take('_system', body.system && !body.system.error ? body.system : (body.system ? { error: body.system.error } : undefined));
     take('_ports', body.ports && !body.ports.error ? body.ports : (body.ports ? { error: body.ports.error } : undefined));
+    take('_stpSet', body.stp && !body.stp.error ? body.stp : (body.stp ? { error: body.stp.error } : undefined));
   }
 
   // Viewer sync: show the server's latest snapshot WITHOUT the browser walking
@@ -2791,7 +2796,7 @@
     if (p.key === 'auth') { loadSessions(s); }
     // SNMP configuration, Flash files and Packet capture re-run their own
     // loaders (server endpoints, not health tables) and reconcile in place.
-    const ownLoader = { snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad, maint: maintLoad, system: systemLoad, portfeatures: portsLoad }[p.key];
+    const ownLoader = { snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad, maint: maintLoad, system: systemLoad, portfeatures: portsLoad, stpsettings: stpSetLoad }[p.key];
     if (ownLoader) {
       if (btn) { btn.disabled = true; btn.classList.add('spin'); }
       ownLoader(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });
@@ -3225,7 +3230,7 @@
   // has no mounted keyed tables yet (caller should fall back to a full repaint).
   // panelIsConverted lists the keys that use keyed tables for every table they
   // render; a converted panel is safe to reconcile without a full repaint.
-  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg', 'stp', 'flash', 'capture', 'maint', 'system', 'portfeatures']);
+  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg', 'stp', 'flash', 'capture', 'maint', 'system', 'portfeatures', 'stpsettings']);
   // A converted panel may still have sections built on a full paint only (auth's
   // 802.1X editor). When a refresh changes a table those read, full-repaint
   // instead of reconciling.
@@ -3831,6 +3836,8 @@
     // ---- Features tab: PoE, port security, storm control, discovery, cable
     // test (28-port-features.js). Front-panel ports only. ----
     if (hasIf && Number(detail.ifIndex) < 1000) tabs.push(portFeaturesTab(s, Number(detail.ifIndex)));
+    // ---- Spanning tree tab: cost, priority, PortFast, BPDU guard (29-stp-settings.js). ----
+    if (hasIf) tabs.push(stpPortTab(s, Number(detail.ifIndex)));
 
     // ---- ACL tab: ACLs bound to this interface (input/output + default) ----
     if (hasIf) {
@@ -6476,6 +6483,7 @@
     if (key === 'maint') { paintMaintPanel(s, body, p); return; }
     if (key === 'system') { paintSystemPanel(s, body, p); return; }
     if (key === 'portfeatures') { paintPortFeaturesPanel(s, body, p); return; }
+    if (key === 'stpsettings') { paintStpSettingsPanel(s, body, p); return; }
     const h = s.health;
     if (!h) { body.appendChild(el('div', 'card-sub', 'No SNMP data yet.')); return; }
     const sc = (k) => (h.scalars[k] ? h.scalars[k].display : null);
@@ -15151,6 +15159,185 @@
           lldp ? { v: LLDP_WORDS[lldp.admin] || lldp.admin || '' } : { v: '' },
           eee ? { v: eee.admin ? (eee.oper ? 'running' : 'on') : 'off' } : { v: '' },
           { cellNode: actGroup([actBtn('Change', () => openTabbedPopout(s, portNameOf(s, ifx) + ' · features', [portFeaturesTab(s, ifx)], []))]), sig: 'chg' }]
+      };
+    }));
+  }
+
+  // =================================================================
+  // 29-stp-settings.js: The Spanning tree settings panel and the port
+  // popout's Spanning tree tab: on or off, the mode, the bridge priority
+  // (switch, VLAN or MSTP instance) and per port the cost, priority,
+  // PortFast and BPDU guard. The Spanning tree panel (11-panel-bodies.js)
+  // shows the running tree; this one changes it.
+  // =================================================================
+
+  // A keyed panel with a server-side reader (standard B1 family b2), like
+  // Port features. The data rides the server collection as `stp`
+  // (module-collection.js, switch-stp.js).
+  //
+  // s._stpSet = { data, fetchedAt, loading, liveAt, collected }
+
+  function stpSetLoad(s) {
+    s._stpSet = s._stpSet || {};
+    const st = s._stpSet;
+    if (st.loading) return st.loading;
+    st.fetchedAt = Date.now();
+    st.liveAt = Date.now();
+    st.loading = sidePost('/api/stp/status', { target: s.target })
+      .then((b) => { st.data = (b && !b.error) ? b : { error: (b && b.error) || 'no answer' }; })
+      .finally(() => { st.loading = null; sideRepaint(s, 'stpsettings'); });
+    return st.loading;
+  }
+
+  function stpWrite(btn, s, url, payload, failLabel, onApplied) {
+    return runButtonAction(btn, {
+      failLabel,
+      run: async () => {
+        s.writeBusy = true;
+        try { return await sidePost(url, Object.assign({ target: s.target }, payload)); }
+        finally { s.writeBusy = false; }
+      },
+      ok: (r) => r && r.ok,
+      error: (r) => (r && r.error) || 'unknown error',
+      onApplied: (r) => { markConfigDirty(s); if (onApplied) onApplied(r); },
+      settle: () => stpSetLoad(s)
+    });
+  }
+
+  const STP_MODE_WORDS = { stp: 'STP (802.1D)', rstp: 'RSTP (802.1w)', mstp: 'MSTP (802.1s)', pvst: 'PVST+', 'rapid-pvst': 'Rapid PVST+' };
+  const STP_ROLE_WORDS = { root: 'root', designated: 'designated', alternate: 'alternate', backup: 'backup', disabled: 'disabled', master: 'master' };
+  const bridgePriorityOptions = () => Array.from({ length: 16 }, (_, k) => ({ label: String(k * 4096), value: String(k * 4096) }));
+  const portPriorityOptions = () => Array.from({ length: 16 }, (_, k) => ({ label: String(k * 16), value: String(k * 16) }));
+  const stpPerVlan = (mode) => mode === 'pvst' || mode === 'rapid-pvst';
+  const stpOnOff = (v) => (v == null ? 'not reported' : (v ? 'on' : 'off'));
+  const edgeWord = (r) => (r.edge ? 'on' : (r.autoEdge ? 'auto' : 'off'));
+
+  // ---- the port popout's Spanning tree tab ----
+
+  function buildStpPort(s, ifx, pane) {
+    const d = (s._stpSet && s._stpSet.data) || {};
+    const r = (d.ports || []).find((x) => x.ifIndex === ifx);
+    if (!r) { pane.appendChild(el('div', 'card-sub', 'The switch reports no spanning tree settings for this port.')); return; }
+    const done = () => { const pop = pane.closest && pane.closest('.port-detail-back'); if (pop) pop.remove(); };
+
+    const sec = formSection('This port');
+    sec.body.appendChild(el('div', 'card-sub', 'Role ' + (STP_ROLE_WORDS[r.role] || r.role || 'not reported') +
+      ', cost in use ' + (r.cost == null ? 'not reported' : r.cost) + (r.operEdge ? ', running as an edge port' : '') + '.'));
+    const on = selectInput([{ label: 'on', value: '1' }, { label: 'off', value: '0' }], r.enabled === false ? '0' : '1');
+    const pri = selectInput(portPriorityOptions(), String(r.priority == null ? 128 : r.priority));
+    const cost = textInput(r.adminCost == null ? '0' : String(r.adminCost), '0'); cost.size = 10;
+    const edge = selectInput([{ label: 'on', value: 'on' }, { label: 'automatic', value: 'auto' }, { label: 'off', value: 'off' }], edgeWord(r));
+    const guard = selectInput([{ label: 'on', value: '1' }, { label: 'off', value: '0' }], r.bpduGuard ? '1' : '0');
+    sec.body.appendChild(field('Spanning tree', on));
+    sec.body.appendChild(field('Port priority', pri));
+    sec.body.appendChild(field('Cost (0 = automatic)', cost));
+    sec.body.appendChild(field('PortFast (edge port)', edge));
+    sec.body.appendChild(field('BPDU guard', guard));
+    sec.body.appendChild(el('div', 'card-sub', 'PortFast is for ports with a computer, phone or printer on them. ' +
+      'BPDU guard shuts the port down if a switch is plugged into it.'));
+    const { actions, apply } = applyActions('Apply');
+    apply.addEventListener('click', (e) => {
+      const c = Number(cost.value);
+      if (!Number.isInteger(c) || c < 0) { toast('The cost is a whole number; 0 means automatic.', 'error'); return; }
+      const body = { port: r.port };
+      if ((on.value === '1') !== (r.enabled !== false)) body.enabled = on.value === '1';
+      if (Number(pri.value) !== r.priority) body.priority = Number(pri.value);
+      if (c !== (r.adminCost == null ? 0 : r.adminCost)) body.cost = c;
+      if (edge.value !== edgeWord(r)) { body.edge = edge.value === 'on'; body.autoEdge = edge.value === 'auto'; }
+      if ((guard.value === '1') !== !!r.bpduGuard) body.bpduGuard = guard.value === '1';
+      if (Object.keys(body).length === 1) { toast('Nothing changed.', 'ok'); return; }
+      stpWrite(e.currentTarget, s, '/api/stp/port', body, 'Apply', done);
+    });
+    sec.body.appendChild(actions);
+    pane.appendChild(sec.sec);
+
+    if (stpPerVlan(d.mode) || d.mode === 'mstp') pane.appendChild(el('div', 'card-sub', 'These settings apply in every ' +
+      (d.mode === 'mstp' ? 'instance' : 'VLAN') + '. A cost or priority for one ' + (d.mode === 'mstp' ? 'instance' : 'VLAN') +
+      ' is set on the switch\'s own web page: the switch does not take it over SNMP.'));
+  }
+
+  function stpPortTab(s, ifx) {
+    return { label: 'Spanning tree', fill: (pane) => {
+      const st = s._stpSet || {};
+      if (st.data && !st.data.error) { buildStpPort(s, ifx, pane); return; }
+      pane.appendChild(el('div', 'card-sub', 'Loading spanning tree settings…'));
+      stpSetLoad(s).then(() => {
+        clear(pane);
+        if (s._stpSet.data && !s._stpSet.data.error) buildStpPort(s, ifx, pane);
+        else pane.appendChild(el('div', 'sw-err', 'Could not read spanning tree settings: ' + ((s._stpSet.data && s._stpSet.data.error) || 'no answer')));
+      });
+    } };
+  }
+
+  // ---- the panel ----
+
+  function paintStpSettingsPanel(s, body, p) {
+    if (!s._ktReconcile) clear(body);
+    if (!s.target) { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Connect with SNMP to see the spanning tree settings.')); return; }
+    s._stpSet = s._stpSet || {};
+    const st = s._stpSet;
+    if (!s._ktReconcile) sideEnsure(s, st, stpSetLoad);
+    const d = st.data;
+    const per = d && !d.error ? (stpPerVlan(d.mode) ? 'vlan' : (d.mode === 'mstp' ? 'instance' : 'none')) : '';
+    const shape = !d ? 'wait' : (d.error ? 'error' : 'ready:' + per);
+    if (s._ktReconcile && p._stpSetShape !== shape) { s._ktStructural = true; return; }
+    p._stpSetShape = shape;
+    if (shape === 'wait') { if (!s._ktReconcile) body.appendChild(el('div', 'card-sub', 'Waiting for data…')); return; }
+    if (shape === 'error') { if (!s._ktReconcile) body.appendChild(el('div', 'panel-err', 'Could not read the spanning tree settings: ' + d.error)); return; }
+
+    // ---- switch-wide ----
+    if (!s._ktReconcile) body.appendChild(el('div', 'section-title', 'Switch-wide'));
+    const onBtn = d.enabled == null ? { v: '' } : {
+      cellNode: actGroup([d.enabled
+        ? actBtnConfirm('Turn off', (e) => stpWrite(e.currentTarget, s, '/api/stp/enabled', { on: false }, 'Turn off spanning tree'), 'danger')
+        : actBtn('Turn on', (e) => stpWrite(e.currentTarget, s, '/api/stp/enabled', { on: true }, 'Turn on spanning tree'))]),
+      sig: d.enabled ? 'off' : 'on'
+    };
+    mountInto(body, s, p, 'stp:global', ['Setting', 'Now', ''], [
+      { key: 'g:on', cells: [{ v: 'Spanning tree' }, { pill: d.enabled ? 'good' : 'warn', v: stpOnOff(d.enabled) }, onBtn] },
+      { key: 'g:mode', cells: [{ v: 'Mode' }, { v: STP_MODE_WORDS[d.mode] || d.mode || 'not reported' }, { v: '' }] },
+      { key: 'g:pri', cells: [{ v: per === 'none' ? 'Bridge priority' : 'Bridge priority (common)' }, { v: d.priority == null ? '' : String(d.priority) }, { v: '' }] }
+    ]);
+    if (!s._ktReconcile) {
+      const row = el('div', 'maint-row');
+      p._stpMode = selectInput(Object.keys(STP_MODE_WORDS).map((k) => ({ label: STP_MODE_WORDS[k], value: k })), d.mode || 'rstp');
+      const setMode = el('button', 'btn', 'Set mode'); setMode.type = 'button';
+      withConfirm(setMode, (e) => stpWrite(e.currentTarget, s, '/api/stp/mode', { mode: p._stpMode.value }, 'Set mode'),
+        { label: 'Set mode', danger: true });
+      row.appendChild(field('Mode', p._stpMode));
+      row.appendChild(setMode);
+      p._stpPri = selectInput(bridgePriorityOptions(), String(d.priority == null ? 32768 : d.priority));
+      const setPri = el('button', 'btn', 'Set priority'); setPri.type = 'button';
+      setPri.addEventListener('click', (e) => stpWrite(e.currentTarget, s, '/api/stp/priority', { priority: Number(p._stpPri.value) }, 'Set priority'));
+      row.appendChild(field('Bridge priority', p._stpPri));
+      row.appendChild(setPri);
+      body.appendChild(row);
+      body.appendChild(el('div', 'card-sub', 'The lowest priority becomes the root bridge. Changing the mode makes every switch ' +
+        'rebuild its tree, which stops traffic for a few seconds.'));
+    }
+
+    // ---- per VLAN or per instance ----
+    // Not written: a C1300 answers NotWritable to every form of the PVST
+    // tables (switch-stp.js, setBridgePriority). Their running values are on
+    // the Spanning tree panel.
+    if (per !== 'none' && !s._ktReconcile) {
+      body.appendChild(el('div', 'card-sub', 'Under ' + (STP_MODE_WORDS[d.mode] || d.mode) + ' each ' + (per === 'vlan' ? 'VLAN' : 'instance') +
+        ' can have its own bridge priority. The switch does not take that over SNMP, so set it on the switch\'s own web page; ' +
+        'the Spanning tree panel shows what each one is running with.'));
+    }
+
+    // ---- per port ----
+    if (!s._ktReconcile) body.appendChild(el('div', 'section-title', 'Ports'));
+    const ports = d.ports || [];
+    mountInto(body, s, p, 'stp:ports', ['Port', 'Spanning tree', 'Priority', 'Cost', 'PortFast', 'BPDU guard', ''], ports.map((r) => {
+      const name = r.ifIndex == null ? 'port ' + r.port : portNameOf(s, r.ifIndex);
+      return {
+        key: 'p:' + r.port,
+        cells: [{ v: name }, { v: stpOnOff(r.enabled) }, { v: r.priority == null ? '' : String(r.priority) },
+          { v: r.adminCost ? String(r.adminCost) : (r.cost == null ? 'automatic' : 'automatic: ' + r.cost) },
+          { pill: r.edge || r.autoEdge ? 'good' : true, v: edgeWord(r) },
+          { pill: r.bpduGuard ? 'good' : true, v: stpOnOff(r.bpduGuard) },
+          r.ifIndex == null ? { v: '' } : { cellNode: actGroup([actBtn('Change', () => openTabbedPopout(s, name + ' · spanning tree', [stpPortTab(s, r.ifIndex)], []))]), sig: 'chg' }]
       };
     }));
   }
