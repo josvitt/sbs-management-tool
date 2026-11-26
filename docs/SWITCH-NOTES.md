@@ -458,11 +458,18 @@ name-server 2001:db8:999::53`, read from the recording.
 - **A second address in the same /64 is refused** by every form (WrongValue
   on createAndGo, InconsistentValue on createAndWait). An address in another
   prefix goes in.
-- **IPv6 off:** ipv6InterfaceEnableStatus down and destroying the link-local
-  row were both refused (WrongValue) with autoconfig on. The app now turns
-  autoconfig off first; the switch test result for that form is pending.
+- **IPv6 off needs autoconfig off first.** With autoconfig on, the switch
+  refuses ipv6InterfaceEnableStatus down and destroying the link-local row
+  (both WrongValue), as "ipv6 address autoconfig" keeps IPv6 on. With
+  autoconfig off, ipv6InterfaceEnableStatus down takes, and the link-local
+  address goes. Up then brings it back. The app tries the forms in that
+  order and puts autoconfig back if IPv6 stays on.
 - **Removing an interface's last global address drops the static routes
   through it**; the switch test puts them back.
+- **Proven** by `scripts/switch-test-ipv6.js` on .253, 19 of 19: autoconfig
+  off and on, an address added and removed, a static route and a default
+  route added and removed, a DNS server added and removed, IPv6 off and on
+  for VLAN 999, and everything put back.
 
 ## Port actions (`routes/ports.js`)
 

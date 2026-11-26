@@ -210,6 +210,6 @@ A new **QoS** panel.
 | 7 Access lists | Shipped in v1.13.0: ICMP type and code, any protocol number, source and destination ports and ranges, IPv6 lists and MAC lists (source, destination, VLAN), and IPv6 lists on a port's ACL tab. Each match is written to the slot the switch uses. Switch test 32/32 on .253. Not offered: Ethernet type on MAC rules (no switch-made row). |
 | 8 Switching security | Shipped in v1.14.0: IGMP and MLD snooping for the switch and per VLAN, immediate leave, the IGMP snooping querier (on, address, version, election), DHCP snooping (switch, VLANs, MAC check, bindings file, trusted ports), ARP inspection (switch, VLANs with their list, packet check, log interval, trusted ports, ARP lists). Switch test 43/43 on .253. Not offered: a static DHCP snooping binding (the switch took no CLI form, so there is no switch-made row). |
 | 9 Alerts | Dropped (D7) |
-| 10 IPv6 | Not started |
+| 10 IPv6 | Shipped in v1.15.0: IPv6 Addressing panel with IPv6 and autoconfig per interface, global addresses, static and default routes, IPv6 DNS servers, management address and default route locked. Switch test 19/19 on .253. The switch refuses a second address in the same /64; IPv6 off turns autoconfig off first. The recording scrubber now also maps the switch MAC in LACP system ids, link-local addresses and interface identifiers. |
 | 11 QoS | Not started |
 | 12 Many switches | Dropped (D8) |
