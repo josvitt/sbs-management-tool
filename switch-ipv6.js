@@ -218,7 +218,30 @@ const OT = snmp.ObjectType;
 const I = (oid, value) => ({ oid, type: OT.Integer, value });
 const G = (oid, value) => ({ oid, type: OT.Gauge, value });
 const OCT = (oid, value) => ({ oid, type: OT.OctetString, value });
-const ROW = { createAndGo: 4, destroy: 6 };
+const ROW = { active: 1, createAndGo: 4, createAndWait: 5, destroy: 6 };
+
+// Try the ways of making a row in turn until one reads back (MODULE-STANDARD
+// rule 6): forms is [[name, [pdu, ...]], ...]. A form that fails is undone
+// with destroy before the next. Resolves { via, refused }; when every form
+// fails, the error names each one and what the switch said.
+async function tryForms(session, forms, readsBack, destroy) {
+  const refused = [];
+  for (const [name, steps] of forms) {
+    try {
+      for (const step of steps) await setVarbinds(session, step);
+      if (!(await readsBack())) throw new Error('the row does not read back');
+      return { via: name, refused };
+    } catch (e) {
+      refused.push(name + ': ' + e.message);
+      await setVarbinds(session, destroy).catch(() => {});
+    }
+  }
+  throw new Error('The switch refused every form (' + refused.join('; ') + ').');
+}
+async function rowStatusIs(session, oid, want) {
+  const vbs = await new Promise((resolve, reject) => session.get([oid], (e, v) => (e ? reject(e) : resolve(v))));
+  return !!vbs[0] && !snmp.isVarbindError(vbs[0]) && Number(vbs[0].value) === want;
+}
 
 /** Parse IPv6 text into 16 bytes, or null. Takes '::' and an IPv4 tail. */
 function v6Bytes(text) {
@@ -278,13 +301,14 @@ async function addAddress(session, ifIndex, address, prefixLength) {
   const len = checkLen(prefixLength == null ? 64 : prefixLength, 'address');
   if (len < 1) throw new Error('The address prefix length must be 1 to 128.');
   const k = addrIndex(b);
-  await setVarbinds(session, [
-    I(T.rlAddr + '.11.' + k, ROW.createAndGo),
-    I(T.rlAddr + '.5.' + k, ifx),
-    G(T.rlAddr + '.13.' + k, len),
-    I(T.rlAddr + '.6.' + k, 1)
-  ]);
-  return { ifIndex: ifx, address: v6Text(b), prefixLength: len };
+  const st = T.rlAddr + '.11.' + k;
+  const cols = [I(T.rlAddr + '.5.' + k, ifx), G(T.rlAddr + '.13.' + k, len)];
+  const r = await tryForms(session, [
+    ['createAndGo with ifIndex, prefix length and unicast', [[I(st, ROW.createAndGo)].concat(cols, [I(T.rlAddr + '.6.' + k, 1)])]],
+    ['createAndGo with ifIndex and prefix length', [[I(st, ROW.createAndGo)].concat(cols)]],
+    ['createAndWait, columns, then active', [[I(st, ROW.createAndWait)], cols, [I(st, ROW.active)]]]
+  ], () => rowStatusIs(session, st, ROW.active), [I(st, ROW.destroy)]);
+  return Object.assign({ ifIndex: ifx, address: v6Text(b), prefixLength: len }, r);
 }
 
 /** Remove a global IPv6 address the user added. */
@@ -294,11 +318,18 @@ async function removeAddress(session, address) {
   return { address: v6Text(b) };
 }
 
-/** IPv6 on or off for an interface (ipv6InterfaceEnableStatus up 1 / down 2). */
+/**
+ * IPv6 on or off for an interface. ipv6InterfaceEnableStatus reads down(2)
+ * on .253 even where "ipv6 enable" is set, so a change is checked by the
+ * link-local address coming or going, and the vendor row is the second form.
+ */
 async function setEnabled(session, ifIndex, on) {
   const ifx = checkIf(ifIndex);
-  await setVarbinds(session, [I(T.iface + '.5.' + ifx, on ? 1 : 2)]);
-  return { ifIndex: ifx, on: !!on };
+  const hasLinkLocal = async () => (await walkColumns(session, T.rlAddr, [5])).some((r) => r.index[0] === 4 && num(r.cols[5]) === ifx);
+  const forms = [['ipv6InterfaceEnableStatus ' + (on ? 'up' : 'down'), [[I(T.iface + '.5.' + ifx, on ? 1 : 2)]]]];
+  if (on) forms.push(['the vendor interface row (rlipv6InterfaceNdDadAttemps 1)', [[I(T.rlIface + '.1.' + ifx, 1)]]]);
+  const r = await tryForms(session, forms, async () => (await hasLinkLocal()) === !!on, [I(T.iface + '.5.' + ifx, on ? 2 : 1)]);
+  return Object.assign({ ifIndex: ifx, on: !!on }, r);
 }
 
 /** Stateless autoconfig on or off for an interface (rlipv6InterfaceAutoconfigEnable 1 / 2). */
@@ -327,12 +358,14 @@ async function addRoute(session, dest, prefixLength, nextHop, ifIndex, cost) {
   const c = cost == null || cost === '' ? 1 : Number(cost);
   if (!Number.isInteger(c) || c < 1 || c > 255) throw new Error('The metric is 1 to 255.');
   const k = routeIndex(d, len, nh, ifx);
-  await setVarbinds(session, [
-    I(T.rlStatic + '.10.' + k, ROW.createAndGo),
-    I(T.rlStatic + '.8.' + k, 4),            // remote
-    G(T.rlStatic + '.7.' + k, c)
-  ]);
-  return { dest: v6Text(d) + '/' + len, nextHop: v6Text(nh), ifIndex: ifx, cost: c };
+  const st = T.rlStatic + '.10.' + k;
+  const cols = [I(T.rlStatic + '.8.' + k, 4), G(T.rlStatic + '.7.' + k, c)];   // remote, the metric
+  const r = await tryForms(session, [
+    ['createAndGo with type remote and the metric', [[I(st, ROW.createAndGo)].concat(cols)]],
+    ['createAndGo alone', [[I(st, ROW.createAndGo)]]],
+    ['createAndWait, columns, then active', [[I(st, ROW.createAndWait)], cols, [I(st, ROW.active)]]]
+  ], () => rowStatusIs(session, st, ROW.active), [I(st, ROW.destroy)]);
+  return Object.assign({ dest: v6Text(d) + '/' + len, nextHop: v6Text(nh), ifIndex: ifx, cost: c }, r);
 }
 
 /** Remove a static route by its row index, as the reader gives it. */
@@ -349,8 +382,14 @@ async function addDnsServer(session, address) {
   const b = checkV6(address, 'DNS server');
   if (isMulticast(b)) throw new Error('The DNS server must be a unicast address.');
   const k = inetIdx(b) + '.0.1';
-  await setVarbinds(session, [OCT(SBELT + '.3.' + k, '.'), I(SBELT + '.5.' + k, 0), I(SBELT + '.8.' + k, ROW.createAndGo)]);
-  return { address: v6Text(b) };
+  const want = v6Text(b);
+  const listed = async () => (await walkColumns(session, T.dns, [8])).some((x) => x.index[3] === 2 && inetAt(x.index, 4).addr === want);
+  const r = await tryForms(session, [
+    ['name, preference and createAndGo, as the IPv4 panel adds one', [[OCT(SBELT + '.3.' + k, '.'), I(SBELT + '.5.' + k, 0), I(SBELT + '.8.' + k, ROW.createAndGo)]]],
+    ['createAndGo first, then name and preference', [[I(SBELT + '.8.' + k, ROW.createAndGo), OCT(SBELT + '.3.' + k, '.'), I(SBELT + '.5.' + k, 0)]]],
+    ['createAndGo alone', [[I(SBELT + '.8.' + k, ROW.createAndGo)]]]
+  ], listed, [I(SBELT + '.8.' + k, ROW.destroy)]);
+  return Object.assign({ address: want }, r);
 }
 async function removeDnsServer(session, index) {
   if (!/^(\d+\.){3}2\.16(\.\d+)+$/.test(String(index || ''))) throw new Error('index must be an IPv6 DNS server index.');

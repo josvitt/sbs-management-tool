@@ -55,8 +55,32 @@ test('readIpv6 gives one line per interface, and the IPv6 routes and DNS servers
   assert.deepEqual(r.dnsServers.map((x) => [x.address, x.source]), [['2001:db8:999::53', 'static']]);
 });
 
+// A fake that acts like the switch on a row status: createAndGo makes the
+// row active, destroy removes it, and a server added through the sbelt table
+// shows in the DNS servers table.
+function switchLike(values) {
+  const s = fakeSession(values);
+  const set = s.set;
+  const STATUS = [v6.T.rlAddr + '.11.', v6.T.rlStatic + '.10.', v6.T.dns + '.8.', v6.SBELT + '.8.'];
+  s.set = (vbs, cb) => set(vbs, (e, r) => {
+    for (const vb of vbs) {
+      if (!e && vb.oid === v6.T.iface + '.5.100998' && vb.value === 2) {
+        for (const o of Object.keys(values)) if (o.startsWith(v6.T.rlAddr + '.') && /\.4\.20\./.test(o) && o.endsWith('.0.1.138.134.5.0')) delete values[o];
+      }
+      const at = STATUS.find((p) => vb.oid.startsWith(p));
+      if (!at || e) continue;
+      const k = vb.oid.slice(at.length);
+      if (vb.value === 6) { for (const o of Object.keys(values)) if (o.endsWith('.' + k) && o.startsWith(at.replace(/\.\d+\.$/, '.'))) delete values[o]; continue; }
+      values[vb.oid] = [T.Integer, 1];
+      if (at === v6.SBELT + '.8.') values[v6.T.dns + '.8.1.1.2.' + k] = [T.Integer, 1];
+    }
+    cb(e, r);
+  });
+  return s;
+}
+
 test('the writes send the rows the switch made', async () => {
-  const s = fakeSession(sample());
+  const s = switchLike(sample());
   await v6.addAddress(s, 100998, '2001:db8:999::2', 64);
   await v6.removeAddress(s, '2001:db8:999::2');
   await v6.setEnabled(s, 100998, false);
@@ -92,4 +116,16 @@ test('the writes refuse values the switch would not take', async () => {
   await assert.rejects(v6.addDnsServer(s, 'ff02::1'), /unicast/);
   await assert.rejects(v6.removeDnsServer(s, 'x'), /IPv6 DNS server index/);
   assert.equal(s.sets.length, 0);
+});
+
+test('a refused form is undone and the next one tried, and the error names every form', async () => {
+  const s = switchLike(sample());
+  const set = s.set;
+  s.set = (vbs, cb) => (vbs.some((v) => v.oid.startsWith(v6.T.rlAddr + '.6.')) ? setImmediate(() => cb(new Error('NotWritable'))) : set(vbs, cb));
+  const r = await v6.addAddress(s, 100998, '2001:db8:999::3', 64);
+  assert.equal(r.via, 'createAndGo with ifIndex and prefix length');
+  assert.deepEqual(r.refused, ['createAndGo with ifIndex, prefix length and unicast: NotWritable']);
+  s.set = (vbs, cb) => setImmediate(() => cb(new Error('NoCreation')));
+  await assert.rejects(v6.addRoute(s, '2001:db8:997::', 48, '2001:db8:999::fe', 100998),
+    /refused every form \(createAndGo with type remote and the metric: NoCreation; createAndGo alone: NoCreation; createAndWait, columns, then active: NoCreation\)/);
 });
