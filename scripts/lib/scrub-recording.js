@@ -11,8 +11,9 @@
  *    Masks (255.x, 0.x) are left alone.
  *  - MAC addresses (MAC, PhysAddress, chassis, bridge-id and LACP system-id
  *    columns, the MAC in the index of the forwarding and 802.1X host tables,
- *    and the EUI-64 interface identifiers and link-local addresses made
- *    from a MAC) become
+ *    the EUI-64 interface identifiers and link-local addresses made from a
+ *    MAC, and a known MAC inside other bytes such as an SNMP engine ID)
+ *    become
  *    00:00:5E:00:53:xx (RFC 7042 documentation range).
  *  - Names and secrets (system name, location and contact, communities,
  *    security and user names, keys, descriptions and aliases, neighbour and
@@ -248,6 +249,10 @@ function scrub(varbinds, secrets) {
         let hex = buf.toString('hex');
         for (const [from, to] of macs) hex = hex.split('fe80000000000000' + eui64(from)).join('fe80000000000000' + eui64(to));
         if (buf.length === 8) for (const [from, to] of macs) if (hex === eui64(from)) hex = eui64(to);
+        // A MAC inside other bytes, such as an SNMP engine ID (80 00 00 09 03 + MAC).
+        for (const [from, to] of macs) {
+          for (let i = hex.indexOf(from); i >= 0; i = hex.indexOf(from, i + 1)) if (i % 2 === 0) hex = hex.slice(0, i) + to + hex.slice(i + to.length);
+        }
         buf = Buffer.from(hex, 'hex');
       }
       v = { $buf: buf.toString('hex') };
