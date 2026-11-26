@@ -66,4 +66,34 @@ function loadBrowserWrites(opts) {
        planSwitchportChange, applySwitchportConfig })`, ctx);
 }
 
-module.exports = { loadBrowserWrites };
+// One top-level function's source, by name (brace-matched).
+function pickFunction(src, name, file) {
+  const start = src.search(new RegExp('(async )?function ' + name + '\\('));
+  if (start < 0) throw new Error(file + ': no function ' + name);
+  let i = src.indexOf('{', start), depth = 0;
+  for (; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}' && --depth === 0) return src.slice(start, i + 1);
+  }
+  throw new Error(file + ': unbalanced ' + name);
+}
+
+/**
+ * The access-list writes (public/src/14-acl.js, loaded whole: its drawing code
+ * is only ever called, never run at load). refreshTables(s, tables) must put
+ * fresh aclNames/aclAces/aclTuples rows in s.health, as the page does.
+ */
+function loadAclWrites(opts) {
+  const ctx = { console, setTimeout, appLog: () => {}, fetch: opts.fetch, refreshTables: opts.refreshTables };
+  vm.createContext(ctx);
+  const core = read('01-core.js');
+  const code = [
+    between(core, '  // One place that knows how to POST JSON', '  // Interpret a snmpSetResult', '01-core.js'),
+    ...['interpretSet', 'snmpGet', 'ipv4ToHex', 'dvc'].map((n) => pickFunction(core, n, '01-core.js')),
+    read('14-acl.js')
+  ].join('\n');
+  return vm.runInContext(code + `\n;({ snmpSet, snmpGet, aclModel, aclRuleView, createQosAce, editQosAce, deleteQosAce,
+    deleteQosAcl, readIfAclBinding, QOS_IFPOL, IFTYPE_PORT })`, ctx);
+}
+
+module.exports = { loadBrowserWrites, loadAclWrites };

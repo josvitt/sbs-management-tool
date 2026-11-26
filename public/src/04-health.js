@@ -46,7 +46,7 @@
     { key: 'snmpcfg', title: 'SNMP configuration', span: 12, h: 0, needs: () => true },
     // IP access lists (the QoS ACL tables): a keyed write panel whose tables
     // are loaded on demand once per visit (14-acl.js).
-    { key: 'acl', title: 'IP access lists', span: 12, h: 0, needs: () => true },
+    { key: 'acl', title: 'Access lists', span: 12, h: 0, needs: () => true },
     // IPv4 Addressing: every interface address (VLAN SVIs and routed ports,
     // static or DHCP), global L3 status, the forwarding table, static routes,
     // DNS client status, nameservers and static host mappings. Interactive

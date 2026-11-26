@@ -1401,6 +1401,8 @@ input.value-changed, select.value-changed, textarea.value-changed {
 /* Match section stacked: source then destination, each full width. */
 .acl-fsec-body.acl-stack { grid-template-columns: 1fr; gap: 14px; }
 .acl-stack .acl-addr-detail .acl-ip-in { max-width: 240px; }
+/* A port or port range: two short number boxes. */
+.acl-port-range .acl-port-in { width: 96px !important; flex: 0 0 auto; }
 /* TCP flags: each flag is a small cell with Set / Unset / Don't-care radios. */
 .acl-flags-row { display: flex; flex-wrap: wrap; gap: 10px; grid-column: 1 / -1; }
 .acl-flag-cell {

@@ -50,20 +50,51 @@
   // columns 5..12 and Tuple9..11 are 17..19 (13 is Accounting, 14 the RowStatus,
   // 15 the time range, so the pointers are not one contiguous run).
   const ACE_TUPLE_COLS = [5, 6, 7, 8, 9, 10, 11, 12, 17, 18, 19];
+  // The list types (AclObjectType: mac 1, ip 2, ipv6 3) and their words.
+  const ACL_FAMILY = { 1: 'mac', 2: 'ip', 3: 'ipv6' };
+  const ACL_FAMILY_VAL = { mac: 1, ip: 2, ipv6: 3 };
+  const ACL_FAMILY_WORD = { mac: 'MAC', ip: 'IPv4', ipv6: 'IPv6' };
+  // The ACE type (AceObjectType) for each list type and protocol choice, and
+  // back. "num" is a plain rule that names a protocol number (the switch makes
+  // "deny 47 any any" a type 1 rule with a protocol tuple).
+  const ACE_TYPE_FOR = { ip: { any: 1, num: 1, tcp: 2, udp: 3, icmp: 7 }, ipv6: { any: 9, num: 9, tcp: 10, udp: 11, icmp: 13 }, mac: { any: 5 } };
+  const ACE_KIND = { 1: ['ip', 'any'], 2: ['ip', 'tcp'], 3: ['ip', 'udp'], 7: ['ip', 'icmp'], 5: ['mac', 'any'],
+    9: ['ipv6', 'any'], 10: ['ipv6', 'tcp'], 11: ['ipv6', 'udp'], 13: ['ipv6', 'icmp'] };
+  // The protocol number a TCP, UDP or ICMP rule carries in its protocol tuple
+  // (ICMP for IPv6 is 58, "3aff" on the switch).
+  function protoNumber(family, proto) {
+    if (proto === 'tcp') return 6;
+    if (proto === 'udp') return 17;
+    if (proto === 'icmp') return family === 'ipv6' ? 58 : 1;
+    return null;
+  }
   // Reverse maps for building writes.
-  const TUPLE_TYPE_VAL = { protocol: 1, 'ip-src': 2, 'ip-dest': 3, 'tcp-src': 8, 'tcp-dst': 9, 'udp-src': 6, 'udp-dst': 7, 'tcp-flags': 18 };
-  const ACE_TYPE_VAL = { ip: 1, 'ip-tcp': 2, 'ip-udp': 3 };
+  const TUPLE_TYPE_VAL = { protocol: 1, 'ip-src': 2, 'ip-dest': 3, 'tcp-flags': 18, 'icmp-type': 19, 'icmp-code': 20, 'ipv6-src': 23, 'ipv6-dest': 24 };
+  // Port tuple types: one port, and the start of a range (its end is start + 1).
+  const PORT_TUPLE = { udp: { src: { one: 6, start: 25 }, dst: { one: 7, start: 27 } },
+    tcp: { src: { one: 8, start: 29 }, dst: { one: 9, start: 31 } } };
+  // The ACE Tuple slot (1 to 11) the switch itself puts each match in, read
+  // from switch-made rows on .253 and .254. TCP and UDP: 1 protocol, 2 source,
+  // 3 source port or range start, 4 destination, 5 destination port or range
+  // start, 6 source range end, 7 destination range end, 8 TCP flags. ICMP has
+  // no ports, so its destination moves up: 3 destination, 4 type, 5 code.
+  const ACE_SLOT = {
+    l4: { proto: 1, src: 2, srcPort: 3, dst: 4, dstPort: 5, srcEnd: 6, dstEnd: 7, flags: 8 },
+    icmp: { proto: 1, src: 2, dst: 3, icmpType: 4, icmpCode: 5 },
+    ip: { proto: 1, src: 2, dst: 4 }
+  };
   // ACE action enum (rlQosAceTidxAction / AceActionType), verified from the MIB.
   const ACE_ACTION = { 1: 'permit', 2: 'deny', 3: 'deny-shutdown', 4: 'deny-log', 5: 'permit-log' };
   // ACE type enum (AceObjectType).
-  const ACE_TYPE = { 1: 'ip', 2: 'ip-tcp', 3: 'ip-udp', 4: 'ip-offset', 5: 'mac', 6: 'mac-offset', 7: 'ip-icmp', 8: 'ip-igmp', 9: 'ipv6' };
+  const ACE_TYPE = { 1: 'ip', 2: 'ip-tcp', 3: 'ip-udp', 4: 'ip-offset', 5: 'mac', 6: 'mac-offset', 7: 'ip-icmp', 8: 'ip-igmp',
+    9: 'ipv6', 10: 'ipv6-tcp', 11: 'ipv6-udp', 12: 'ipv6-offset', 13: 'ipv6-icmp' };
   // ClassTupleType -> field name.
   const TUPLE_TYPE = { 1: 'protocol', 2: 'ip-src', 3: 'ip-dest', 4: 'dscp', 5: 'ip-prec',
     6: 'udp-src', 7: 'udp-dst', 8: 'tcp-src', 9: 'tcp-dst', 10: 'mac-src', 11: 'mac-dest',
     12: 'vlan', 13: 'in-port', 14: 'out-port', 17: 'ethertype', 18: 'tcp-flags',
-    19: 'icmp-type', 20: 'icmp-code', 23: 'ipv6-src', 24: 'ipv6-dest' };
+    19: 'icmp-type', 20: 'icmp-code', 21: 'igmp-type', 22: 'inner-vlan', 23: 'ipv6-src', 24: 'ipv6-dest', 33: 'ipv6-flow-label' };
 
-  // Build a lookup of tuple index -> { type, value1Hex, value2Hex }.
+  // Build a lookup of tuple index -> { type, v1 (hex), n1 (Value1 as a number), v2 (hex) }.
   function buildTupleMap(tupleRows) {
     const m = new Map();
     for (const r of tupleRows) {
@@ -72,20 +103,63 @@
       const t = m.get(ix);
       const col = r.column || '';
       if (/TupleType$/.test(col)) t.type = parseInt(aclNum(r), 10);
-      else if (/TupleValue1$/.test(col)) t.v1 = aclHex(r);
+      else if (/TupleValue1$/.test(col)) { t.v1 = aclHex(r); t.n1 = parseInt(aclNum(r), 10); }
       else if (/TupleValue2$/.test(col)) t.v2 = aclHex(r);
     }
     return m;
   }
   // Numeric value from a cell (strip "(n)" display formatting).
-  function aclNum(cell) { const s = String(dvc(cell)); const m = s.match(/\((\d+)\)/) || s.match(/^(\d+)/); return m ? m[1] : s; }
+  // The raw number wins: the display of a big INTEGER can carry a thousands
+  // separator ("8,000"), which once read as port 8.
+  function aclNum(cell) {
+    if (cell && typeof cell.value === 'number') return String(cell.value);
+    const s = String(dvc(cell)).replace(/(\d),(?=\d{3}\b)/g, '$1');
+    const m = s.match(/\((\d+)\)/) || s.match(/^(\d+)/);
+    return m ? m[1] : s;
+  }
   // Raw hex bytes from a cell's value/display.
   function aclHex(cell) {
     const s = String(cell && (cell.display !== undefined ? cell.display : cell.value) || '');
     const hex = s.replace(/0x|\s|\(hex\)|:/gi, '');
     return /^[0-9a-f]*$/i.test(hex) ? hex.toLowerCase() : '';
   }
-  // Decode a tuple (type + value2 which holds value||mask) to a human string.
+  // How many mask bits a wildcard (hex, 1 = don't care) leaves cared about:
+  // the prefix length of a value||wildcard address tuple.
+  function wildcardPrefix(hex) {
+    let n = 0;
+    for (let i = 0; i < hex.length; i += 2) { let b = (~parseInt(hex.substr(i, 2), 16)) & 0xff; while (b) { n += b & 1; b >>= 1; } }
+    return n;
+  }
+  // "2001:db8::1" -> 32 hex digits, or null.
+  function ipv6ToHex(text) {
+    const s = String(text || '').trim().toLowerCase();
+    if (!/^[0-9a-f:]+$/.test(s) || s.indexOf(':') < 0) return null;
+    const halves = s.split('::');
+    if (halves.length > 2) return null;
+    const part = (x) => (x ? x.split(':') : []);
+    const head = part(halves[0]), tail = halves.length === 2 ? part(halves[1]) : [];
+    const fill = 8 - head.length - tail.length;
+    if (halves.length === 2 ? fill < 1 : fill !== 0) return null;
+    const groups = head.concat(new Array(halves.length === 2 ? fill : 0).fill('0'), tail);
+    if (groups.some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+    return groups.map((g) => g.padStart(4, '0')).join('');
+  }
+  // 32 hex digits -> the short form ("2001:db8::"), longest zero run folded.
+  function hexToIpv6(hex) {
+    const g = [];
+    for (let i = 0; i < 32; i += 4) g.push(parseInt(hex.substr(i, 4), 16).toString(16));
+    let best = -1, len = 1;
+    for (let i = 0; i < 8;) {
+      if (g[i] !== '0') { i++; continue; }
+      let j = i; while (j < 8 && g[j] === '0') j++;
+      if (j - i > len) { best = i; len = j - i; }
+      i = j;
+    }
+    if (best < 0) return g.join(':');
+    return g.slice(0, best).join(':') + '::' + g.slice(best + len).join(':');
+  }
+  // Decode a tuple to { field, text, ... }: the rule field it fills and how
+  // the table shows it.
   function decodeTuple(t) {
     if (!t || t.type === undefined) return null;
     const field = TUPLE_TYPE[t.type] || ('type' + t.type);
@@ -93,24 +167,34 @@
     // ip-src/ip-dest: 8 bytes = 4 value + 4 wildcard-mask.
     if ((t.type === 2 || t.type === 3) && hex.length >= 8) {
       const ip = [0, 2, 4, 6].map((i) => parseInt(hex.substr(i, 2), 16)).join('.');
-      let pref = 32;
-      if (hex.length >= 16) {
-        const wild = parseInt(hex.substr(8, 8), 16) >>> 0;
-        const net = (~wild) >>> 0;
-        pref = (net.toString(2).match(/1/g) || []).length;
-      }
+      const pref = hex.length >= 16 ? wildcardPrefix(hex.substr(8, 8)) : 32;
       return { field: t.type === 2 ? 'src' : 'dst', text: ip + '/' + pref };
+    }
+    // ipv6-src/ipv6-dest: 32 bytes = 16 value + 16 wildcard-mask (2001:db8::/32
+    // reads 20010db8 0000... then 00000000 ffff...).
+    if ((t.type === 23 || t.type === 24) && hex.length >= 32) {
+      const pref = hex.length >= 64 ? wildcardPrefix(hex.substr(32, 32)) : 128;
+      return { field: t.type === 23 ? 'src' : 'dst', text: hexToIpv6(hex.substr(0, 32)) + '/' + pref };
     }
     // protocol: 1 byte value + 1 byte mask.
     if (t.type === 1 && hex.length >= 2) {
       const p = parseInt(hex.substr(0, 2), 16);
-      const names = { 1: 'icmp', 6: 'tcp', 17: 'udp' };
-      return { field: 'proto', text: names[p] || ('proto ' + p) };
+      const names = { 1: 'icmp', 6: 'tcp', 17: 'udp', 58: 'icmp' };
+      return { field: 'proto', text: names[p] || ('protocol ' + p), num: p };
     }
-    // L4 ports.
-    if ((t.type >= 6 && t.type <= 9) && hex.length >= 2) {
-      const port = parseInt(hex.substr(0, 4) || hex.substr(0, 2), 16);
-      return { field: field, text: field + ' ' + port };
+    // L4 ports: the port is rlQosTupleValue1 (an INTEGER); Value2 reads 0000
+    // on every switch-made row. A range is a start tuple and an end tuple
+    // (types 25 to 32), each with its port in Value1.
+    if (t.type >= 6 && t.type <= 9 && Number.isFinite(t.n1)) {
+      return { field: PORT_FIELD[t.type], text: PORT_WORD[t.type] + ' ' + t.n1, port: t.n1 };
+    }
+    if (t.type >= 25 && t.type <= 32 && Number.isFinite(t.n1)) {
+      const r = PORT_RANGE[t.type];
+      return { field: r.field, text: r.word + ' ' + t.n1, port: t.n1, end: r.end };
+    }
+    // ICMP type and code: the number is Value1, Value2 is empty.
+    if ((t.type === 19 || t.type === 20) && Number.isFinite(t.n1)) {
+      return { field: t.type === 19 ? 'icmpType' : 'icmpCode', text: (t.type === 19 ? 'icmp type ' : 'icmp code ') + t.n1, n: t.n1 };
     }
     // tcp-flags: byte1 = value (1=Set, 0=Unset), byte2 = don't-care mask
     // (1=don't care, 0=care). Verified against the switch UI: pnp "11 00" =
@@ -126,12 +210,21 @@
     // Fallback: show the field name and raw hex.
     return { field: field, text: field + '=' + hex };
   }
+  // Port tuple types -> the rule field they fill and how the table names them.
+  const PORT_FIELD = { 6: 'srcPort', 7: 'dstPort', 8: 'srcPort', 9: 'dstPort' };
+  const PORT_WORD = { 6: 'source port', 7: 'destination port', 8: 'source port', 9: 'destination port' };
+  const PORT_RANGE = {
+    25: { field: 'srcPort', end: false, word: 'source ports from' }, 26: { field: 'srcPort', end: true, word: 'source ports to' },
+    27: { field: 'dstPort', end: false, word: 'destination ports from' }, 28: { field: 'dstPort', end: true, word: 'destination ports to' },
+    29: { field: 'srcPort', end: false, word: 'source ports from' }, 30: { field: 'srcPort', end: true, word: 'source ports to' },
+    31: { field: 'dstPort', end: false, word: 'destination ports from' }, 32: { field: 'dstPort', end: true, word: 'destination ports to' }
+  };
   // TCP flag bit layout and helpers.
   const TCP_FLAGS = [['urg', 0x20], ['ack', 0x10], ['psh', 0x08], ['rst', 0x04], ['syn', 0x02], ['fin', 0x01]];
 
-  // "192.168.1.0/24" -> { any:false, ip:'192.168.1.0', pref:24 } for pre-filling.
+  // "192.168.1.0/24" or "2001:db8::/32" -> { any:false, ip, pref } for pre-filling.
   function parseCidr(text) {
-    const m = String(text).match(/^(\d+\.\d+\.\d+\.\d+)\/(\d+)$/);
+    const m = String(text).match(/^([0-9a-f.:]+)\/(\d+)$/i);
     if (!m) return { any: true };
     return { any: false, ip: m[1], pref: parseInt(m[2], 10) };
   }
@@ -152,20 +245,22 @@
   // ---- The joined model ----
   // Join the three raw tables into ACLs -> rules, the one place the panel, the
   // write paths and the binding editor read them from. Only ACLs with a name
-  // row are listed (as before); an ACE whose ACL is unknown is ignored.
+  // row are listed (as before); an ACE whose ACL is unknown is ignored. Each
+  // rule keeps its tuples in slot order (tuples) and by slot (bySlot), so an
+  // edit that fails can put the rule back exactly as the switch had it.
   function aclModel(h) {
     h = h || {};
     const byIdx = new Map();
     for (const r of (h.aclNames || [])) {
       if (!/QosAclName$/.test(r.column || '')) continue;
       const idx = String(r.index);
-      byIdx.set(idx, { idx, name: String(dvc(r)), type: null, bound: false, origin: null, aces: new Map() });
+      byIdx.set(idx, { idx, name: String(dvc(r)), type: null, family: 'ip', bound: false, origin: null, aces: new Map() });
     }
     for (const r of (h.aclNames || [])) {
       const acl = byIdx.get(String(r.index));
       if (!acl) continue;
       const col = r.column || '';
-      if (/QosAclType$/.test(col)) acl.type = parseInt(aclNum(r), 10);
+      if (/QosAclType$/.test(col)) { acl.type = parseInt(aclNum(r), 10); acl.family = ACL_FAMILY[acl.type] || 'ip'; }
       else if (/QosAclIsBoundToInterface$/.test(col)) acl.bound = parseInt(aclNum(r), 10) === 1;   // TruthValue true(1)
       else if (/QosAclOriginType$/.test(col)) acl.origin = parseInt(aclNum(r), 10);              // static 1 / dynamic 2 / system 3
     }
@@ -175,12 +270,16 @@
       const acl = byIdx.get(parts[0]);
       if (!acl) continue;
       const aceIdx = parts.slice(1).join('.');
-      if (!acl.aces.has(aceIdx)) acl.aces.set(aceIdx, { idx: aceIdx, tuples: [] });
+      if (!acl.aces.has(aceIdx)) acl.aces.set(aceIdx, { idx: aceIdx, tuples: [], bySlot: {} });
       const ace = acl.aces.get(aceIdx);
       const col = r.column || '';
+      const slot = col.match(/TidxTuple(\d+)$/);
       if (/TidxAction$/.test(col)) ace.action = parseInt(aclNum(r), 10);
       else if (/TidxType$/.test(col)) ace.type = parseInt(aclNum(r), 10);
-      else if (/TidxTuple\d+$/.test(col)) { const ptr = parseInt(dvc(r), 10); if (ptr > 0) ace.tuples.push(String(ptr)); }
+      else if (slot) {
+        const ptr = parseInt(dvc(r), 10);
+        if (ptr > 0) { ace.tuples.push(String(ptr)); ace.bySlot[slot[1]] = String(ptr); }
+      }
     }
     const acls = Array.from(byIdx.values());
     for (const a of acls) a.aceList = Array.from(a.aces.values()).sort((x, y) => parseInt(x.idx, 10) - parseInt(y.idx, 10));
@@ -188,19 +287,23 @@
   }
 
   // One rule as the table shows it, plus the values that pre-fill its editor.
+  // init: { family, action, proto ('any' 'num' 'tcp' 'udp' 'icmp'), protoNum,
+  // src, dst ({ any, ip, pref }), srcPort, dstPort ({ from, to }), icmpType,
+  // icmpCode, flags }. Anything the form cannot make again goes in
+  // unsupported, so the editor shows the rule instead of dropping that part.
   function aclRuleView(ace, tupleMap) {
     const action = ACE_ACTION[ace.action] || (ace.action ? ('action ' + ace.action) : '?');
-    let proto = ACE_TYPE[ace.type] || 'ip', src = 'any', dst = 'any';
-    const extra = [];
-    const init = { action: ace.action, proto: 'ip', src: { any: true }, dst: { any: true } };
-    if (ace.type === 2) init.proto = 'tcp'; else if (ace.type === 3) init.proto = 'udp';
-    // The rule form handles: action permit/deny (+log), IP/TCP/UDP, source and
-    // destination prefixes, and TCP flags. A rule that matches anything else
-    // (ports, ICMP, IPv6, a protocol on a plain-IP rule...) would lose that
-    // match if re-saved from the form, so it is shown but not edited here.
+    const kind = ACE_KIND[ace.type];
+    const family = kind ? kind[0] : 'ip';
+    const p = kind ? kind[1] : 'any';
     const unsupported = [];
-    if (!(ace.type === 1 || ace.type === 2 || ace.type === 3)) unsupported.push(ACE_TYPE[ace.type] || ('type ' + ace.type));
+    if (!kind) unsupported.push(ACE_TYPE[ace.type] || ('type ' + ace.type));
     if ([1, 2, 4, 5].indexOf(ace.action) === -1) unsupported.push(action);
+    const init = { family, action: ace.action, proto: p, src: { any: true }, dst: { any: true } };
+    let proto = !kind ? (ACE_TYPE[ace.type] || ('type ' + ace.type)) : (p === 'any' ? (family === 'ipv6' ? 'ipv6' : (family === 'mac' ? 'any' : 'ip')) : p);
+    let src = 'any', dst = 'any', flagsText = null;
+    const ports = { src: {}, dst: {} }, other = [];
+    const l4 = p === 'tcp' || p === 'udp';
     for (const tp of ace.tuples) {
       const t = tupleMap.get(tp);
       const dec = decodeTuple(t);
@@ -208,12 +311,37 @@
       if (dec.field === 'src') { src = dec.text; init.src = parseCidr(dec.text); }
       else if (dec.field === 'dst') { dst = dec.text; init.dst = parseCidr(dec.text); }
       else if (dec.field === 'proto') {
-        proto = dec.text;
-        if (!((ace.type === 2 && proto === 'tcp') || (ace.type === 3 && proto === 'udp'))) unsupported.push(dec.text);
+        // A TCP, UDP or ICMP rule carries its own protocol; a plain rule may
+        // name any protocol number.
+        if (kind && p === 'any' && family !== 'mac') { init.proto = 'num'; init.protoNum = dec.num; proto = 'protocol ' + dec.num; }
+        else if (!kind || dec.num !== protoNumber(family, p)) { other.push(dec.text); unsupported.push(dec.text); }
       }
-      else if (dec.field === 'flags') { extra.push(dec.text); init.flags = parseFlagsTuple(t); if (ace.type !== 2) unsupported.push(dec.text); }
-      else { extra.push(dec.text); unsupported.push(dec.text); }
+      else if (dec.field === 'srcPort' || dec.field === 'dstPort') {
+        const side = ports[dec.field === 'srcPort' ? 'src' : 'dst'];
+        side[dec.end ? 'to' : 'from'] = dec.port;
+        if (!l4) unsupported.push(dec.text);
+      }
+      else if (dec.field === 'icmpType' || dec.field === 'icmpCode') {
+        init[dec.field] = dec.n;
+        if (p !== 'icmp') unsupported.push(dec.text);
+      }
+      else if (dec.field === 'flags') { flagsText = dec.text; init.flags = parseFlagsTuple(t); if (p !== 'tcp') unsupported.push(dec.text); }
+      else { other.push(dec.text); unsupported.push(dec.text); }
     }
+    const extra = [];
+    for (const side of ['src', 'dst']) {
+      const r = ports[side];
+      if (r.from == null && r.to == null) continue;
+      const word = side === 'src' ? 'source port' : 'destination port';
+      if (r.from == null) { extra.push(word + ' range end ' + r.to); unsupported.push(word + ' range with no start'); continue; }
+      const to = r.to != null ? r.to : r.from;
+      init[side + 'Port'] = { from: r.from, to };
+      extra.push(to !== r.from ? word + 's ' + r.from + '-' + to : word + ' ' + r.from);
+    }
+    if (init.icmpType != null) extra.push('icmp type ' + init.icmpType + (init.icmpCode != null ? ' code ' + init.icmpCode : ''));
+    else if (init.icmpCode != null) { extra.push('icmp code ' + init.icmpCode); unsupported.push('an ICMP code with no type'); }
+    if (flagsText) extra.push(flagsText);
+    extra.push(...other);
     return { action, isPermit: /permit/.test(action), proto, src, dst, extra, init, unsupported };
   }
 
@@ -251,7 +379,7 @@
     if (!s._ktReconcile) { p._aclNotes = {}; p._aclDel = {}; }
     const cols = ['#', 'Action', 'Protocol', 'Source', 'Destination', 'Extra', ''];
     for (const acl of model.acls) {
-      const noteEl = section('ACL \u00b7 ' + acl.name, '', 'Add rule', () => openAclRuleForm(s, { aclIdx: acl.idx, aclName: acl.name }));
+      const noteEl = section(ACL_FAMILY_WORD[acl.family] + ' ACL \u00b7 ' + acl.name, '', 'Add rule', () => openAclRuleForm(s, { aclIdx: acl.idx, aclName: acl.name, family: acl.family }));
       if (noteEl) {
         p._aclNotes[acl.idx] = noteEl;
         // The list's own Delete sits beside its "+ Add rule": a stable slot,
@@ -293,20 +421,24 @@
     aclIn:   '1.3.6.1.4.1.9.6.1.101.88.13.1.14',   // rlQosIfAclIn  (ACL index, 0=none)
     aclOut:  '1.3.6.1.4.1.9.6.1.101.88.13.1.15',   // rlQosIfAclOut
     defIn:   '1.3.6.1.4.1.9.6.1.101.88.13.1.12',   // rlQosAclDefaultAction (ingress)
-    defOut:  '1.3.6.1.4.1.9.6.1.101.88.13.1.22'    // rlQosAclDefaultActionOut
+    defOut:  '1.3.6.1.4.1.9.6.1.101.88.13.1.22',   // rlQosAclDefaultActionOut
+    v6In:    '1.3.6.1.4.1.9.6.1.101.88.13.1.20',   // rlQosIfIpv6AclIn  (IPv6 ACL index, 0=none)
+    v6Out:   '1.3.6.1.4.1.9.6.1.101.88.13.1.21'    // rlQosIfIpv6AclOut
   };
   const IFTYPE_PORT = 2, IFTYPE_VLAN = 1;
 
   // Read the current binding for an interface (ifIndex + ifType). Returns
-  // { inAcl, outAcl, defIn, defOut } as numbers (ACL index / action enum).
+  // { inAcl, outAcl, defIn, defOut, v6In, v6Out } as numbers (ACL index /
+  // action enum); v6In and v6Out are null where the switch has no such column.
   async function readIfAclBinding(s, ifIndex, ifType) {
     const suffix = ifIndex + '.' + ifType;
-    const oids = [QOS_IFPOL.aclIn + '.' + suffix, QOS_IFPOL.aclOut + '.' + suffix, QOS_IFPOL.defIn + '.' + suffix, QOS_IFPOL.defOut + '.' + suffix];
+    const oids = [QOS_IFPOL.aclIn, QOS_IFPOL.aclOut, QOS_IFPOL.defIn, QOS_IFPOL.defOut, QOS_IFPOL.v6In, QOS_IFPOL.v6Out].map((o) => o + '.' + suffix);
     const results = await snmpGet(s, oids);
     const byOid = {};
     for (const r of results) { if (!r.error) byOid[String(r.oid).replace(/^\./, '')] = r.value; }
-    const pick = (base) => { const k = Object.keys(byOid).find((o) => o.indexOf(base) !== -1); return k ? parseInt(byOid[k], 10) : null; };
-    return { inAcl: pick(QOS_IFPOL.aclIn), outAcl: pick(QOS_IFPOL.aclOut), defIn: pick(QOS_IFPOL.defIn), defOut: pick(QOS_IFPOL.defOut) };
+    const pick = (base) => { const k = Object.keys(byOid).find((o) => o.indexOf(base + '.') === 0); const n = k ? parseInt(byOid[k], 10) : NaN; return Number.isFinite(n) ? n : null; };
+    return { inAcl: pick(QOS_IFPOL.aclIn), outAcl: pick(QOS_IFPOL.aclOut), defIn: pick(QOS_IFPOL.defIn), defOut: pick(QOS_IFPOL.defOut),
+      v6In: pick(QOS_IFPOL.v6In), v6Out: pick(QOS_IFPOL.v6Out) };
   }
 
   // Build the ACL-binding editor for an interface. ifType port(2) or vlan(1).
@@ -327,33 +459,45 @@
   }
 
   function renderIfAclBinding(s, pane, ifIndex, ifType, acls, bind, opts) {
-    // The in/out columns hold an IPv4 ACL (IPv6 ACLs have their own columns),
-    // so offer the IP lists, plus whatever is bound now if it is something else.
-    const aclOptions = [{ label: '(none)', value: '0' }];
-    for (const a of acls) {
-      const current = String(a.idx) === String(bind.inAcl) || String(a.idx) === String(bind.outAcl);
-      if (a.type === 2 || a.type == null || current) aclOptions.push({ label: a.name, value: String(a.idx) });
-    }
+    // The in/out columns hold an IPv4 or MAC list, and IPv6 lists have their
+    // own columns, so each select offers its own kind of list, plus whatever
+    // is bound now if it is something else.
+    const optionsFor = (families, current) => {
+      const out = [{ label: '(none)', value: '0' }];
+      for (const a of acls) {
+        const now = current.some((c) => String(a.idx) === String(c));
+        if (families.indexOf(a.family) !== -1 || now) out.push({ label: a.name + (a.family === 'mac' ? ' (MAC)' : ''), value: String(a.idx) });
+      }
+      return out;
+    };
+    const aclOptions = optionsFor(['ip', 'mac'], [bind.inAcl, bind.outAcl]);
+    const v6Options = optionsFor(['ipv6'], [bind.v6In, bind.v6Out]);
     const defOptions = [{ label: 'Deny Any', value: '1' }, { label: 'Permit Any (forward)', value: '2' }];
 
     const form = el('div', 'snmp-form acl-form');
-    const mkDir = (titleWord, aclOid, defOid, curAcl, curDef) => {
+    const mkDir = (titleWord, aclOid, defOid, curAcl, curDef, v6Oid, curV6) => {
       const sec = formSection(titleWord);
       const aclSel = selectInput(aclOptions, curAcl != null ? String(curAcl) : '0');
-      sec.body.appendChild(field(opts.noDirection ? 'IPv4-based ACL' : (titleWord + ' ACL'), aclSel));
+      sec.body.appendChild(field(opts.noDirection ? 'IPv4 or MAC ACL' : (titleWord + ' IPv4 or MAC ACL'), aclSel));
+      // The IPv6 select only where the switch answered for that column.
+      let v6Sel = null;
+      if (curV6 != null) {
+        v6Sel = selectInput(v6Options, String(curV6));
+        sec.body.appendChild(field(opts.noDirection ? 'IPv6 ACL' : (titleWord + ' IPv6 ACL'), v6Sel));
+      }
       const defSel = selectInput(defOptions, curDef === 2 ? '2' : '1');
       sec.body.appendChild(field('Default action', defSel));
       form.appendChild(sec.sec);
-      return { aclSel, defSel, aclOid, defOid };
+      return { aclSel, defSel, aclOid, defOid, v6Sel, v6Oid };
     };
 
     const controls = [];
     if (opts.noDirection) {
       // VLAN: a single binding (no in/out direction), default action only.
-      controls.push(mkDir('Access list', QOS_IFPOL.aclIn, QOS_IFPOL.defIn, bind.inAcl, bind.defIn));
+      controls.push(mkDir('Access list', QOS_IFPOL.aclIn, QOS_IFPOL.defIn, bind.inAcl, bind.defIn, QOS_IFPOL.v6In, bind.v6In));
     } else {
-      controls.push(mkDir('Input', QOS_IFPOL.aclIn, QOS_IFPOL.defIn, bind.inAcl, bind.defIn));
-      controls.push(mkDir('Output', QOS_IFPOL.aclOut, QOS_IFPOL.defOut, bind.outAcl, bind.defOut));
+      controls.push(mkDir('Input', QOS_IFPOL.aclIn, QOS_IFPOL.defIn, bind.inAcl, bind.defIn, QOS_IFPOL.v6In, bind.v6In));
+      controls.push(mkDir('Output', QOS_IFPOL.aclOut, QOS_IFPOL.defOut, bind.outAcl, bind.defOut, QOS_IFPOL.v6Out, bind.v6Out));
     }
 
     // Binding an ACL can stop traffic on the interface, so this keeps its
@@ -367,6 +511,7 @@
         vbs.push({ oid: c.aclOid + '.' + suffix, type: 'Integer', value: parseInt(c.aclSel.value, 10) });
         vbs.push({ oid: c.defOid + '.' + suffix, type: 'Integer', value: parseInt(c.defSel.value, 10) });
         changedCtls.push(c.aclSel, c.defSel);
+        if (c.v6Sel) { vbs.push({ oid: c.v6Oid + '.' + suffix, type: 'Integer', value: parseInt(c.v6Sel.value, 10) }); changedCtls.push(c.v6Sel); }
       }
       clear(msg);
       runButtonAction(ev.currentTarget, {
@@ -379,8 +524,13 @@
         // what the switch now holds before the spinner turns to Done.
         settle: () => Promise.all([
           readIfAclBinding(s, ifIndex, ifType).then((b) => {
-            const vals = opts.noDirection ? [[b.inAcl, b.defIn]] : [[b.inAcl, b.defIn], [b.outAcl, b.defOut]];
-            vals.forEach(([a, d], i) => { if (controls[i]) { controls[i].aclSel.value = String(a || 0); controls[i].defSel.value = d === 2 ? '2' : '1'; } });
+            const vals = opts.noDirection ? [[b.inAcl, b.defIn, b.v6In]] : [[b.inAcl, b.defIn, b.v6In], [b.outAcl, b.defOut, b.v6Out]];
+            vals.forEach(([a, d, v6], i) => {
+              const c = controls[i];
+              if (!c) return;
+              c.aclSel.value = String(a || 0); c.defSel.value = d === 2 ? '2' : '1';
+              if (c.v6Sel) c.v6Sel.value = String(v6 || 0);
+            });
           }).catch(() => {}),
           aclRefresh(s)
         ])
@@ -514,12 +664,27 @@
     const wildHex = wild.toString(16).padStart(8, '0');
     return v + wildHex;
   }
+  // The same for an ipv6-src/ipv6-dest tuple: 16 value bytes + 16 wildcard
+  // bytes (1 bits are don't care), as the switch made 2001:db8::/32.
+  function ipv6TupleHex(ip, pref) {
+    const v = ipv6ToHex(ip);
+    if (!v) return null;
+    const n = parseInt(pref, 10);
+    const p = Number.isFinite(n) ? Math.max(0, Math.min(128, n)) : 128;
+    let wild = '';
+    for (let byte = 0; byte < 16; byte++) {
+      const cared = Math.max(0, Math.min(8, p - byte * 8));
+      wild += ((0xff >> cared) & 0xff).toString(16).padStart(2, '0');
+    }
+    return v + wild;
+  }
   // protocol tuple value||mask: 1 value byte + 1 exact mask (ff).
   function protoTupleHex(proto) { return proto.toString(16).padStart(2, '0') + 'ff'; }
 
-  // Create a rule. cfg: { aclName, aclType(2 ip), action, aceType, srcAny, srcIp,
-  // srcPref, dstAny, dstIp, dstPref, proto, tcpFlags }. Throws with the failing
-  // step on error.
+  // Create a rule. cfg: { aclName, family ('ip' 'ipv6'), action, proto ('any'
+  // 'num' 'tcp' 'udp' 'icmp'), protoNum, src, dst ({ any, ip, pref }), srcPort,
+  // dstPort ({ from, to }), icmpType, icmpCode, tcpFlags ({ val, dc }) }.
+  // Throws with the failing step on error.
   // cfg.aclIdx (optional) names the ACL directly; `at` (optional) places the
   // ACE at that index instead of the next free one (a rule edit keeps its place
   // in the list). Whatever this call created is removed again if a later step
@@ -534,6 +699,13 @@
     }
   }
   async function createQosAceSteps(s, h, cfg, at, made) {
+    const family = cfg.family || 'ip';
+    const p = cfg.proto || 'any';
+    const aceType = ACE_TYPE_FOR[family] && ACE_TYPE_FOR[family][p];
+    if (!aceType) throw new Error('a ' + ACL_FAMILY_WORD[family] + ' list cannot hold a ' + p + ' rule');
+    const l4 = p === 'tcp' || p === 'udp';
+    const slots = l4 ? ACE_SLOT.l4 : (p === 'icmp' ? ACE_SLOT.icmp : ACE_SLOT.ip);
+
     // 1. Resolve or create the ACL by name.
     let aclIdx = cfg.aclIdx != null ? String(cfg.aclIdx) : null;
     if (aclIdx === null) for (const a of aclModel(h).acls) { if (a.name === cfg.aclName) aclIdx = a.idx; }
@@ -543,35 +715,71 @@
         await snmpSet(s, [
           { oid: QOS_ACL.aclStatus + '.' + aclIdx, type: 'Integer', value: 4 },         // createAndGo
           { oid: QOS_ACL.name + '.' + aclIdx, type: 'OctetString', value: cfg.aclName },
-          { oid: QOS_ACL.type + '.' + aclIdx, type: 'Integer', value: cfg.aclType || 2 } // ip
+          { oid: QOS_ACL.type + '.' + aclIdx, type: 'Integer', value: ACL_FAMILY_VAL[family] }
         ]);
       } catch (e) { throw new Error('creating ACL "' + cfg.aclName + '": ' + e.message); }
       made.acl = aclIdx;
     }
 
-    // 2. Create the tuple rows for each requested match field.
+    // 2. Create the tuple rows for each requested match field, each in the
+    //    ACE pointer slot the switch itself uses for it (ACE_SLOT).
     let nextTuple = maxIndex(h.aclTuples) + 1;
-    const pointers = [];   // tuple indices this ACE will reference
-    const addTuple = async (typeVal, valueHex) => {
+    const pointers = [];   // tuple indices this ACE will reference, by slot
+    const addTuple = async (slot, typeVal, valueHex, value1) => {
       const tIdx = String(nextTuple++);
-      try {
-        await snmpSet(s, [
-          { oid: QOS_ACL.tupStatus + '.' + tIdx, type: 'Integer', value: 4 },     // createAndGo
-          { oid: QOS_ACL.tupType + '.' + tIdx, type: 'Integer', value: typeVal },
-          { oid: QOS_ACL.tupVal2 + '.' + tIdx, type: 'OctetString', valueHex }
-        ]);
-      } catch (e) { throw new Error('creating tuple (type ' + typeVal + '): ' + e.message); }
+      const vbs = [
+        { oid: QOS_ACL.tupStatus + '.' + tIdx, type: 'Integer', value: 4 },     // createAndGo
+        { oid: QOS_ACL.tupType + '.' + tIdx, type: 'Integer', value: typeVal }
+      ];
+      if (value1 != null) vbs.push({ oid: QOS_ACL.tupVal1 + '.' + tIdx, type: 'Integer', value: value1 });
+      vbs.push({ oid: QOS_ACL.tupVal2 + '.' + tIdx, type: 'OctetString', valueHex });
+      try { await snmpSet(s, vbs); } catch (e) { throw new Error('creating tuple (type ' + typeVal + '): ' + e.message); }
       made.tuples.push(tIdx);
-      pointers.push(tIdx);
+      pointers[slot - 1] = tIdx;
     };
-    if (cfg.proto) await addTuple(TUPLE_TYPE_VAL.protocol, protoTupleHex(cfg.proto));
-    if (!cfg.srcAny) { const hx = ipTupleHex(cfg.srcIp, cfg.srcPref); if (!hx) throw new Error('bad source address'); await addTuple(TUPLE_TYPE_VAL['ip-src'], hx); }
-    if (!cfg.dstAny) { const hx = ipTupleHex(cfg.dstIp, cfg.dstPref); if (!hx) throw new Error('bad destination address'); await addTuple(TUPLE_TYPE_VAL['ip-dest'], hx); }
+    const protoNum = p === 'num' ? cfg.protoNum : protoNumber(family, p);
+    if (protoNum != null) {
+      if (!(Number.isInteger(protoNum) && protoNum >= 0 && protoNum <= 255)) throw new Error('the protocol number must be 0 to 255');
+      await addTuple(slots.proto, TUPLE_TYPE_VAL.protocol, protoTupleHex(protoNum));
+    }
+    for (const side of ['src', 'dst']) {
+      const a = cfg[side];
+      if (!a || a.any) continue;
+      const word = side === 'src' ? 'source' : 'destination';
+      if (family === 'ipv6') {
+        const hx = ipv6TupleHex(a.ip, a.pref); if (!hx) throw new Error('bad ' + word + ' address');
+        await addTuple(slots[side], TUPLE_TYPE_VAL[side === 'src' ? 'ipv6-src' : 'ipv6-dest'], hx);
+      } else {
+        const hx = ipTupleHex(a.ip, a.pref); if (!hx) throw new Error('bad ' + word + ' address');
+        await addTuple(slots[side], TUPLE_TYPE_VAL[side === 'src' ? 'ip-src' : 'ip-dest'], hx);
+      }
+    }
+    // Ports, TCP or UDP only. One port: a port tuple, the port in Value1 and
+    // 0000 in Value2. A range: a start tuple and an end tuple, Value2 empty.
+    for (const side of ['src', 'dst']) {
+      const pr = cfg[side + 'Port'];
+      if (!pr) continue;
+      if (!l4) throw new Error('ports need TCP or UDP');
+      const base = PORT_TUPLE[p][side];
+      if (pr.to == null || pr.to === pr.from) await addTuple(slots[side + 'Port'], base.one, '0000', pr.from);
+      else {
+        await addTuple(slots[side + 'Port'], base.start, '', pr.from);
+        await addTuple(slots[side + 'End'], base.start + 1, '', pr.to);
+      }
+    }
+    // ICMP type and code: the number in Value1, Value2 empty.
+    if (cfg.icmpType != null || cfg.icmpCode != null) {
+      if (p !== 'icmp') throw new Error('an ICMP type needs an ICMP rule');
+      if (cfg.icmpType == null) throw new Error('an ICMP code needs an ICMP type');
+      await addTuple(slots.icmpType, TUPLE_TYPE_VAL['icmp-type'], '', cfg.icmpType);
+      if (cfg.icmpCode != null) await addTuple(slots.icmpCode, TUPLE_TYPE_VAL['icmp-code'], '', cfg.icmpCode);
+    }
     // TCP flags tuple: byte1 = value (Set bits), byte2 = don't-care mask.
     // e.g. ACK+FIN Set, rest Unset-and-cared -> "11 00" (matches the switch).
     if (cfg.tcpFlags) {
+      if (p !== 'tcp') throw new Error('TCP flags need a TCP rule');
       const fh = cfg.tcpFlags.val.toString(16).padStart(2, '0') + cfg.tcpFlags.dc.toString(16).padStart(2, '0');
-      await addTuple(TUPLE_TYPE_VAL['tcp-flags'], fh);
+      await addTuple(slots.flags, TUPLE_TYPE_VAL['tcp-flags'], fh);
     }
 
     // 3. Create the ACE under the ACL, pointing at the tuples.
@@ -582,10 +790,10 @@
     const vbs = [
       { oid: QOS_ACL.aceStatus + '.' + suffix, type: 'Integer', value: 4 },  // createAndGo
       { oid: QOS_ACL.aceAction + '.' + suffix, type: 'Integer', value: cfg.action },
-      { oid: QOS_ACL.aceType + '.' + suffix, type: 'Integer', value: cfg.aceType }
+      { oid: QOS_ACL.aceType + '.' + suffix, type: 'Integer', value: aceType }
     ];
     pointers.forEach((tIdx, i) => {
-      if (i < ACE_TUPLE_COLS.length) vbs.push({ oid: QOS_ACL.aceTupleBase + ACE_TUPLE_COLS[i] + '.' + suffix, type: 'Integer', value: parseInt(tIdx, 10) });
+      if (tIdx && i < ACE_TUPLE_COLS.length) vbs.push({ oid: QOS_ACL.aceTupleBase + ACE_TUPLE_COLS[i] + '.' + suffix, type: 'Integer', value: parseInt(tIdx, 10) });
     });
     try { await snmpSet(s, vbs); } catch (e) { throw new Error('creating ACE: ' + e.message); }
   }
@@ -617,7 +825,11 @@
         { oid: QOS_ACL.aceAction + '.' + suffix, type: 'Integer', value: old.action },
         { oid: QOS_ACL.aceType + '.' + suffix, type: 'Integer', value: old.type }
       ];
-      old.tuples.forEach((t, i) => { if (i < ACE_TUPLE_COLS.length) vbs.push({ oid: QOS_ACL.aceTupleBase + ACE_TUPLE_COLS[i] + '.' + suffix, type: 'Integer', value: parseInt(t, 10) }); });
+      // Each tuple goes back in the slot it was read from.
+      for (const [slot, t] of Object.entries(old.bySlot || {})) {
+        const col = ACE_TUPLE_COLS[parseInt(slot, 10) - 1];
+        if (col) vbs.push({ oid: QOS_ACL.aceTupleBase + col + '.' + suffix, type: 'Integer', value: parseInt(t, 10) });
+      }
       let back;
       try { await snmpSet(s, vbs); back = ' The original rule was put back.'; }
       catch (x) { back = ' The original rule could not be put back (' + x.message + '); add it again.'; }
@@ -626,8 +838,9 @@
     await dropTuples(s, unusedTuples(model, old.tuples, new Set([suffix])));
   }
   // An address group: "Any" toggle + IP + prefix, wired so the inputs enable
-  // only when "Any" is off. init: { any, ip, pref }.
-  function addressGroup(labelWord, init) {
+  // only when "Any" is off. init: { any, ip, pref }. setFamily switches the
+  // placeholder and the prefix limit between IPv4 (32) and IPv6 (128).
+  function addressGroup(labelWord, init, family) {
     init = init || {};
     const wrap = el('div', 'acl-addr');
     const anyLab = el('label', 'acl-any');
@@ -635,28 +848,54 @@
     anyLab.appendChild(any); anyLab.appendChild(el('span', '', 'Any ' + labelWord));
     wrap.appendChild(anyLab);
     const detail = el('div', 'acl-addr-detail');
-    const ip = el('input'); ip.type = 'text'; ip.placeholder = '192.168.1.0'; ip.className = 'acl-ip-in';
+    const ip = el('input'); ip.type = 'text'; ip.className = 'acl-ip-in';
+    ip.setAttribute('aria-label', labelWord + ' address');
     if (init.ip) ip.value = init.ip;
-    const pref = el('input'); pref.type = 'number'; pref.min = '0'; pref.max = '32'; pref.value = init.pref != null ? String(init.pref) : '24'; pref.className = 'acl-pref-in';
+    const pref = el('input'); pref.type = 'number'; pref.min = '0'; pref.className = 'acl-pref-in';
+    pref.setAttribute('aria-label', labelWord + ' prefix length');
+    if (init.pref != null) pref.value = String(init.pref);
     const slash = el('span', 'acl-slash', '/');
     detail.appendChild(ip); detail.appendChild(slash); detail.appendChild(pref);
     wrap.appendChild(detail);
     const sync = () => { const off = any.checked; ip.disabled = off; pref.disabled = off; detail.classList.toggle('is-off', off); };
     any.addEventListener('change', sync); sync();
-    return { wrap, any, ip, pref };
+    const setFamily = (f) => {
+      const v6 = f === 'ipv6';
+      ip.placeholder = v6 ? '2001:db8::' : '192.168.1.0';
+      pref.max = v6 ? '128' : '32';
+      if (!pref.value || parseInt(pref.value, 10) > parseInt(pref.max, 10)) pref.value = v6 ? '64' : '24';
+    };
+    setFamily(family || 'ip');
+    return { wrap, any, ip, pref, setFamily };
+  }
+  // A port or port range: two number boxes, "from" and an optional "to".
+  // Both blank means any port. init: { from, to }.
+  function portRange(labelWord, init) {
+    init = init || {};
+    const wrap = el('div', 'acl-addr-detail acl-port-range');
+    const mk = (v, word) => {
+      const i = el('input'); i.type = 'number'; i.min = '0'; i.max = '65535'; i.className = 'acl-port-in';
+      i.placeholder = word; i.setAttribute('aria-label', labelWord + ' ' + word);
+      if (v != null) i.value = String(v);
+      return i;
+    };
+    const from = mk(init.from, 'port'), to = mk(init.to != null && init.to !== init.from ? init.to : null, 'to');
+    wrap.appendChild(from); wrap.appendChild(el('span', 'acl-slash', '–')); wrap.appendChild(to);
+    return { wrap, from, to };
+  }
+  // A number box's value: null when blank, NaN when not a whole number.
+  function numIn(input) {
+    const t = String(input.value || '').trim();
+    if (t === '') return null;
+    return /^\d+$/.test(t) ? parseInt(t, 10) : NaN;
   }
 
-  // The create/edit-rule form (QoS tuple model). opts:
-  //   { fixedAcl: name }          -> add a rule to that existing ACL
-  //   { newAcl: true }            -> create a new ACL by name
-  //   { edit: {aclIdx, aceIdx, aclName, init} } -> edit an existing ACE
-
   // Open the rule form in the standard popout (Esc or x closes it). opts:
-  //   { newAcl: true }              -> create a new ACL by name with its first rule
-  //   { aclIdx, aclName }           -> add a rule to that existing ACL
+  //   { newAcl: true }                     -> create a new ACL by name with its first rule
+  //   { aclIdx, aclName, family }          -> add a rule to that existing ACL
   //   { edit: {aclIdx, aceIdx, aclName, init} } -> edit an existing rule
   function openAclRuleForm(s, opts) {
-    const title = opts.edit ? ('ACL \u00b7 ' + opts.edit.aclName + ' \u00b7 rule ' + opts.edit.aceIdx)
+    const title = opts.edit ? ('ACL · ' + opts.edit.aclName + ' · rule ' + opts.edit.aceIdx)
       : (opts.newAcl ? 'New access list' : ('Add rule to ' + opts.aclName));
     const tab = opts.edit ? 'Rule' : (opts.newAcl ? 'New ACL' : 'Add rule');
     openTabbedPopout(s, title, [{ label: tab, fill: (pane, close) => aclRuleForm(s, pane, close, opts) }], []);
@@ -669,10 +908,11 @@
     const ace = acl && acl.aces.get(String(aceIdx));
     if (!acl || !ace) return;
     const view = aclRuleView(ace, model.tupleMap);
-    if (view.unsupported.length) {
-      openTabbedPopout(s, 'ACL \u00b7 ' + acl.name + ' \u00b7 rule ' + ace.idx, [{ label: 'Rule', fill: (pane) => {
-        pane.appendChild(el('div', 'card-sub', view.action + ' ' + view.proto + ' from ' + view.src + ' to ' + view.dst + (view.extra.length ? ' (' + view.extra.join(', ') + ')' : '')));
-        pane.appendChild(el('div', 'card-sub', 'This rule also matches ' + view.unsupported.join(', ') + ', which this editor does not handle, so saving it here would drop that part of the match. Change it in the switch\u2019s web interface or CLI, or delete it and add it again.'));
+    if (view.unsupported.length || view.init.family !== acl.family || acl.family === 'mac') {
+      const what = view.unsupported.length ? view.unsupported.join(', ') : 'a match this editor does not handle';
+      openTabbedPopout(s, 'ACL · ' + acl.name + ' · rule ' + ace.idx, [{ label: 'Rule', fill: (pane) => {
+        pane.appendChild(el('div', 'card-sub', view.action + ' ' + view.proto + ' from ' + view.src + ' to ' + view.dst + (view.extra.length ? ', ' + view.extra.join(', ') : '')));
+        pane.appendChild(el('div', 'card-sub', 'This rule also matches ' + what + ', so saving it here would drop that part of the match. Change it in the switch’s web interface or CLI, or delete it and add it again.'));
       } }], []);
       return;
     }
@@ -683,14 +923,17 @@
     const editing = !!opts.edit;
     const init = (opts.edit && opts.edit.init) || {};
     const aclName = opts.aclName || (opts.edit && opts.edit.aclName) || '';
+    let family = init.family || opts.family || 'ip';
     const form = el('div', 'snmp-form acl-form');
 
     // --- Section: the list (only when naming a new one) + the basics ---
     const basics = formSection(opts.newAcl ? 'List & rule' : 'Rule');
-    let nameIn = null;
+    let nameIn = null, familySel = null;
     if (opts.newAcl) {
       nameIn = el('input'); nameIn.type = 'text'; nameIn.maxLength = 32; nameIn.placeholder = 'list name';
       basics.body.appendChild(field('ACL name', nameIn));
+      familySel = selectInput([{ label: 'IPv4', value: 'ip' }, { label: 'IPv6', value: 'ipv6' }], family);
+      basics.body.appendChild(field('List type', familySel));
     }
     const actionSel = selectInput([
       { label: 'permit', value: '1' }, { label: 'deny', value: '2' },
@@ -698,20 +941,47 @@
     ], init.action ? String(init.action) : '1');
     basics.body.appendChild(field('Action', actionSel));
     const protoSel = selectInput([
-      { label: 'any IP', value: 'ip' }, { label: 'TCP', value: 'tcp' }, { label: 'UDP', value: 'udp' }
-    ], init.proto || 'ip');
+      { label: 'any', value: 'any' }, { label: 'TCP', value: 'tcp' }, { label: 'UDP', value: 'udp' },
+      { label: 'ICMP', value: 'icmp' }, { label: 'other protocol number', value: 'num' }
+    ], init.proto || 'any');
     basics.body.appendChild(field('Protocol', protoSel));
+    const protoNumIn = el('input'); protoNumIn.type = 'number'; protoNumIn.min = '0'; protoNumIn.max = '255'; protoNumIn.placeholder = '47';
+    if (init.protoNum != null) protoNumIn.value = String(init.protoNum);
+    const protoNumField = field('Protocol number', protoNumIn);
+    basics.body.appendChild(protoNumField);
     form.appendChild(basics.sec);
 
     // --- Section: match (source, then destination stacked below it so each
     //     address line - IP / prefix - has the full width and is never cut) ---
     const match = formSection('Match');
     match.body.classList.add('acl-stack');
-    const src = addressGroup('source', init.src || { any: true });
-    const dst = addressGroup('destination', init.dst || { any: true });
+    const src = addressGroup('source', init.src || { any: true }, family);
+    const dst = addressGroup('destination', init.dst || { any: true }, family);
     match.body.appendChild(field('Source', src.wrap));
     match.body.appendChild(field('Destination', dst.wrap));
     form.appendChild(match.sec);
+
+    // --- Section: ports (TCP and UDP). Blank is any port; a "to" makes a range. ---
+    const portsSec = formSection('Ports');
+    portsSec.body.classList.add('acl-stack');
+    const srcPort = portRange('source', init.srcPort);
+    const dstPort = portRange('destination', init.dstPort);
+    portsSec.body.appendChild(field('Source port', srcPort.wrap));
+    portsSec.body.appendChild(field('Destination port', dstPort.wrap));
+    portsSec.body.appendChild(el('div', 'card-sub', 'Leave a port blank for any port. Fill in both boxes for a range.'));
+    form.appendChild(portsSec.sec);
+
+    // --- Section: ICMP type and code (ICMP only). Blank is any. ---
+    const icmpSec = formSection('ICMP');
+    const icmpTypeIn = el('input'); icmpTypeIn.type = 'number'; icmpTypeIn.min = '0'; icmpTypeIn.max = '255'; icmpTypeIn.placeholder = 'any';
+    const icmpCodeIn = el('input'); icmpCodeIn.type = 'number'; icmpCodeIn.min = '0'; icmpCodeIn.max = '255'; icmpCodeIn.placeholder = 'any';
+    if (init.icmpType != null) icmpTypeIn.value = String(init.icmpType);
+    if (init.icmpCode != null) icmpCodeIn.value = String(init.icmpCode);
+    icmpSec.body.appendChild(field('Type', icmpTypeIn));
+    icmpSec.body.appendChild(field('Code', icmpCodeIn));
+    const icmpHint = el('div', 'card-sub', '');
+    icmpSec.body.appendChild(icmpHint);
+    form.appendChild(icmpSec.sec);
 
     // --- Section: TCP flags (only for TCP). Each flag is tri-state: Set (must
     //     be 1), Unset (must be 0), or Don't care (ignored) - matching the
@@ -738,9 +1008,19 @@
     }
     flagsSec.body.appendChild(flagRow);
     form.appendChild(flagsSec.sec);
-    const syncFlagsVisible = () => { flagsSec.sec.style.display = (protoSel.value === 'tcp') ? '' : 'none'; };
-    protoSel.addEventListener('change', syncFlagsVisible);
-    syncFlagsVisible();
+
+    // Show only the sections the chosen protocol uses.
+    const syncVisible = () => {
+      const pv = protoSel.value;
+      protoNumField.style.display = pv === 'num' ? '' : 'none';
+      portsSec.sec.style.display = (pv === 'tcp' || pv === 'udp') ? '' : 'none';
+      icmpSec.sec.style.display = pv === 'icmp' ? '' : 'none';
+      flagsSec.sec.style.display = pv === 'tcp' ? '' : 'none';
+      icmpHint.textContent = family === 'ipv6' ? 'For example type 128 is echo request (ping) and 135 is neighbor solicitation.' : 'For example type 8 is echo request (ping) and 0 is echo reply.';
+    };
+    protoSel.addEventListener('change', syncVisible);
+    if (familySel) familySel.addEventListener('change', () => { family = familySel.value; src.setFamily(family); dst.setFamily(family); syncVisible(); });
+    syncVisible();
 
     // Adding is one tap; saving an edit replaces the rule, so it asks for a
     // second tap (standard B8: confirm only when the click is drastic).
@@ -748,32 +1028,59 @@
     withConfirm(apply, (ev) => {
       const name = aclName || (nameIn ? (nameIn.value || '').trim() : '');
       clear(msg);
-      if (!name) { msg.appendChild(el('div', 'sw-err', 'Enter an ACL name.')); return; }
-      if (opts.newAcl && aclModel(s.health).acls.some((a) => a.name === name)) { msg.appendChild(el('div', 'sw-err', 'An ACL named \u201c' + name + '\u201d already exists. Use its Add rule instead.')); return; }
-      if (!src.any.checked && !ipv4ToHex(src.ip.value)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid source IPv4 address.')); return; }
-      if (!dst.any.checked && !ipv4ToHex(dst.ip.value)) { msg.appendChild(el('div', 'sw-err', 'Enter a valid destination IPv4 address.')); return; }
-      const protoName = protoSel.value;
-      const proto = protoName === 'tcp' ? 6 : (protoName === 'udp' ? 17 : 0);
-      const aceType = protoName === 'tcp' ? ACE_TYPE_VAL['ip-tcp'] : (protoName === 'udp' ? ACE_TYPE_VAL['ip-udp'] : ACE_TYPE_VAL.ip);
-      let tcpFlags = null;
-      if (protoName === 'tcp') {
+      const fail = (text) => { msg.appendChild(el('div', 'sw-err', text)); };
+      if (!name) return fail('Enter an ACL name.');
+      if (opts.newAcl && aclModel(s.health).acls.some((a) => a.name === name)) return fail('An ACL named “' + name + '” already exists. Use its Add rule instead.');
+      const v6 = family === 'ipv6';
+      const addrOk = v6 ? ipv6ToHex : ipv4ToHex;
+      const maxPref = v6 ? 128 : 32;
+      const addr = (g, word) => {
+        if (g.any.checked) return { any: true };
+        if (!addrOk(g.ip.value)) return 'Enter a valid ' + word + ' ' + ACL_FAMILY_WORD[family] + ' address.';
+        const pr = numIn(g.pref);
+        if (pr == null || !(pr <= maxPref)) return 'The ' + word + ' prefix length must be 0 to ' + maxPref + '.';
+        return { any: false, ip: g.ip.value.trim(), pref: pr };
+      };
+      const srcA = addr(src, 'source'), dstA = addr(dst, 'destination');
+      if (typeof srcA === 'string') return fail(srcA);
+      if (typeof dstA === 'string') return fail(dstA);
+      const pv = protoSel.value;
+      const cfg = { aclName: name, family, action: parseInt(actionSel.value, 10), proto: pv, src: srcA, dst: dstA };
+      if (pv === 'num') {
+        const n = numIn(protoNumIn);
+        if (n == null || !(n <= 255)) return fail('Enter a protocol number from 0 to 255.');
+        cfg.protoNum = n;
+      }
+      if (pv === 'tcp' || pv === 'udp') {
+        for (const [side, g, word] of [['srcPort', srcPort, 'source'], ['dstPort', dstPort, 'destination']]) {
+          const a = numIn(g.from), b = numIn(g.to);
+          if (a == null && b == null) continue;
+          if (a == null) return fail('Enter the first ' + word + ' port of the range.');
+          if (!(a <= 65535) || (b != null && !(b <= 65535))) return fail('A ' + word + ' port must be 0 to 65535.');
+          if (b != null && b < a) return fail('The ' + word + ' port range must run from the lower port to the higher one.');
+          cfg[side] = { from: a, to: b == null ? a : b };
+        }
+      }
+      if (pv === 'icmp') {
+        const t = numIn(icmpTypeIn), c = numIn(icmpCodeIn);
+        if (t != null && !(t <= 255)) return fail('The ICMP type must be 0 to 255.');
+        if (c != null && !(c <= 255)) return fail('The ICMP code must be 0 to 255.');
+        if (c != null && t == null) return fail('An ICMP code needs a type.');
+        if (t != null) cfg.icmpType = t;
+        if (c != null) cfg.icmpCode = c;
+      }
+      if (pv === 'tcp') {
         let val = 0, dc = 0;
         for (const [nm, bit] of TCP_FLAGS) {
           const st = flagCtl[nm].set.checked ? 'set' : (flagCtl[nm].unset.checked ? 'unset' : 'care');
           if (st === 'care') dc |= bit; else if (st === 'set') val |= bit;
         }
         // Only emit a flags tuple if at least one flag is actually constrained.
-        if (dc !== 0x3f) tcpFlags = { val, dc };
+        if (dc !== 0x3f) cfg.tcpFlags = { val, dc };
       }
-      const cfg = {
-        aclName: name, aclType: 2, action: parseInt(actionSel.value, 10), aceType, proto: proto || 0,
-        srcAny: src.any.checked, srcIp: src.ip.value, srcPref: parseInt(src.pref.value, 10),
-        dstAny: dst.any.checked, dstIp: dst.ip.value, dstPref: parseInt(dst.pref.value, 10),
-        tcpFlags
-      };
       runButtonAction(ev.currentTarget, {
         failLabel: editing ? 'Save rule' : 'Add rule',
-        spinLabel: editing ? 'Saving\u2026' : (opts.newAcl ? 'Creating\u2026' : 'Adding\u2026'),
+        spinLabel: editing ? 'Saving…' : (opts.newAcl ? 'Creating…' : 'Adding…'),
         run: async () => {
           try {
             if (editing) await editQosAce(s, opts.edit.aclIdx, opts.edit.aceIdx, cfg);
@@ -782,7 +1089,7 @@
           } catch (e) { return { ok: false, error: e.message }; }
         },
         ok: (r) => r && r.ok,
-        error: (r) => { msg.appendChild(el('div', 'sw-err', (editing ? 'Could not save rule \u2014 ' : 'Could not add rule \u2014 ') + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+        error: (r) => { fail((editing ? 'Could not save rule — ' : 'Could not add rule — ') + ((r && r.error) || 'failed')); return (r && r.error) || 'failed'; },
         onApplied: () => markConfigDirty(s),
         settle: () => aclRefresh(s).then(() => close())
       });
