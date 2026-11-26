@@ -360,7 +360,14 @@ recordings, and written back by `scripts/switch-test-acl.js`.
 - **Value1 reads with a thousands separator** in the display ("8,000"), so
   the app reads the raw number.
 - **Binding.** rlQosIfPolicyTable: `rlQosIfAclIn`/`Out` hold an IPv4 or MAC
-  list, `rlQosIfIpv6AclIn`/`Out` an IPv6 list.
+  list, `rlQosIfIpv6AclIn`/`Out` an IPv6 list. On .253 an IPv4 and an IPv6
+  list bound together, and a MAC list bound alone (rlQosIfAclIn by itself).
+  A MAC list sent in place of the IPv4 list, in the same SET that cleared
+  the IPv6 column, was refused (WrongValue on rlQosIfAclIn); the panel then
+  says to clear the port first and bind the MAC list on its own.
+- **Proven** by `scripts/switch-test-acl.js` on .253, 32 of 32: every rule
+  kind added, read back and edited, the bindings, and the lists deleted with
+  no tuples left behind.
 - **Not offered:** an Ethernet type on a MAC rule (the sample line was not
   taken by the switch, so there is no switch-made row to encode from), DSCP,
   IP precedence, CoS, and offset rules.

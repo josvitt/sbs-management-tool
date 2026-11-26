@@ -546,7 +546,15 @@
         failLabel: 'Apply binding',
         run: () => snmpSet(s, vbs).then(() => ({ ok: true }), (e) => ({ ok: false, error: e.message })),
         ok: (r) => r && r.ok,
-        error: (r) => { msg.appendChild(el('div', 'sw-err', 'Could not apply binding \u2014 ' + ((r && r.error) || 'failed'))); return (r && r.error) || 'failed'; },
+        error: (r) => {
+          msg.appendChild(el('div', 'sw-err', 'Could not apply binding \u2014 ' + ((r && r.error) || 'failed')));
+          // On .253 a MAC list was refused (WrongValue) when it replaced an
+          // IPv4 list in the same step while an IPv6 list was bound, and taken
+          // on the port with nothing else bound.
+          const macChosen = controls.some((c) => { const a = acls.find((x) => String(x.idx) === c.aclSel.value); return a && a.family === 'mac'; });
+          if (macChosen) msg.appendChild(el('div', 'card-sub', 'The switch can refuse a MAC list in place of another list, or next to an IPv6 list. Set both lists to (none) and apply, then choose the MAC list on its own.'));
+          return (r && r.error) || 'failed';
+        },
         onApplied: () => markConfigDirty(s, changedCtls),
         // Read the binding back and re-read the ACL tables, so the form shows
         // what the switch now holds before the spinner turns to Done.
