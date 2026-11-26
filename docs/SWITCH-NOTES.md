@@ -419,6 +419,51 @@ sbs-ref-arp, port gi1/0/4 trusted for both), read from the recording.
   entries added and removed, and DHCP snooping and ARP inspection turned off
   and on for the switch.
 
+## IPv6 addressing (`switch-ipv6.js`, `31-ipv6-addressing.js`)
+
+Encoded from the settings made from the CLI on .253 for VLAN 999 (ifIndex
+100998): `ipv6 enable`, `ipv6 address 2001:db8:999::1/64`, `ipv6 address
+autoconfig`, `ipv6 route 2001:db8:998::/48 2001:db8:999::fe` and `ip
+name-server 2001:db8:999::53`, read from the recording.
+
+- **Addresses live in rlIpAddressTable (V.26.36.1).** The index is address
+  type, length and bytes, then the origin (2 manual, 5 link-layer) and an
+  empty general-prefix name (length 0). A link-local address is type 4,
+  length 20, with the zone (the ifIndex) as its last four bytes. Columns:
+  IfIndex (.5), ExtdType 1 unicast (.6), RowStatus (.11), ExtdPrefixLength
+  (.13, Gauge). ipAddressTable (4.34) shows the same rows read-only; its
+  prefix column reads "0.0".
+- **IPv6 on is seen by the link-local address.** ipv6InterfaceEnableStatus
+  (4.30.1.5) reads down(2) on both VLAN 1 and VLAN 999 although both have
+  IPv6 on; VLAN 1 has it on by default. So the app shows an interface as on
+  when it has a link-local address, and checks a change the same way.
+- **Autoconfig is rlipv6InterfaceAutoconfigEnable** (V.26.20.1.2, enable 1 /
+  disable 2). rlDhcpv6ClientStatelessAdminStatus (V.214.2.3.1.3) mirrors it
+  read-only: 3 autoconfig on VLAN 999, 4 autoconfig and DHCPv6 on VLAN 1.
+- **Static routes are rlInetStaticRouteTable (V.26.28.1)**, which also holds
+  the IPv4 default route (type 1). The index is the destination (type,
+  length, bytes), the prefix length, the next hop (type, length, bytes) and
+  the interface the next hop is reached through. Columns: PathCost (.7,
+  Gauge), Type 4 remote (.8), RowStatus (.10), ForwardingStatus (.11, 1 in
+  use, 2 not: the sample's next hop does not answer). inetCidrRouteTable is
+  empty.
+- **DNS servers are listed in rlDnsClv2ServersTable (V.93.15.1)**, indexed
+  by source (1 static), interface, preference, then the address and "0.1";
+  RowStatus is .8. They are added through rlDnsResConfigSbeltInetTable
+  (V.93.9.1), name ".", preference 0 and createAndGo in one PDU, as the IPv4
+  panel adds one.
+- **Forms tried:** each add tries the ways of making the row in turn and
+  reports the one the switch took. On .253 an address, a static route and a
+  DNS server each went in with the first form.
+- **A second address in the same /64 is refused** by every form (WrongValue
+  on createAndGo, InconsistentValue on createAndWait). An address in another
+  prefix goes in.
+- **IPv6 off:** ipv6InterfaceEnableStatus down and destroying the link-local
+  row were both refused (WrongValue) with autoconfig on. The app now turns
+  autoconfig off first; the switch test result for that form is pending.
+- **Removing an interface's last global address drops the static routes
+  through it**; the switch test puts them back.
+
 ## Port actions (`routes/ports.js`)
 
 - **A PoE bounce makes the config "unsaved".** The bounce is two writes to
