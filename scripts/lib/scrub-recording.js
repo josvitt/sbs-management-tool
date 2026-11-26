@@ -111,7 +111,9 @@ function scrub(varbinds, secrets) {
     return macs.get(hex);
   };
   const mapName = (str) => {
-    if (!str.trim()) return str;
+    // A bare number (a VLAN interface's description is its VLAN number)
+    // names nothing, and swapping it would rename the VLAN everywhere.
+    if (!str.trim() || /^\d+$/.test(str.trim())) return str;
     if (!names.has(str)) {
       const tok = 'R' + (names.size + 1).toString(36);
       names.set(str, (tok + 'x'.repeat(Math.max(0, str.length - tok.length))).slice(0, Math.max(1, str.length)));

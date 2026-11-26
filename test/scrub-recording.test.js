@@ -106,3 +106,11 @@ test('the switch MAC goes from the LACP system id and from link-local addresses 
   assert.equal(varbinds[2][2].$buf, 'fe80000000000000' + eui(to));
   assert.ok(varbinds[1][0].includes(eui(to).match(/../g).map((h) => parseInt(h, 16)).join('.')), varbinds[1][0]);
 });
+
+test('a bare number in a name column (a VLAN interface\'s description) is left alone', () => {
+  const { varbinds } = scrub([
+    ['1.3.6.1.4.1.9.6.1.101.54.43.1.23.100998', OCT, hex('999')],    // rlifPresentName 
+    ['1.3.6.1.4.1.9.6.1.101.54.43.1.2.100998', OCT, hex('999')]      // rlifPresentDescr
+  ], []);
+  assert.deepEqual(varbinds.map((v) => Buffer.from(v[2].$buf, 'hex').toString()), ['999', '999']);
+});
