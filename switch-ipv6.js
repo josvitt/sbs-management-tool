@@ -32,6 +32,7 @@
 
 const snmp = require('net-snmp');
 const { walkColumns } = require('./switch-ports');
+const { setVarbinds, tryForms, getInt, getBytes, rowStatusIs, I, G, OCT, ROW } = require('./snmp-write');
 
 const V = '1.3.6.1.4.1.9.6.1.101';
 const MIB2_IP = '1.3.6.1.2.1.4';
@@ -204,45 +205,6 @@ async function readIpv6(session) {
 // (docs/SWITCH-NOTES.md, "IPv6 addressing"). Nothing here saves the
 // configuration.
 
-function setVarbinds(session, varbinds) {
-  return new Promise((resolve, reject) => {
-    session.set(varbinds, (error, result) => {
-      if (error) return reject(error);
-      const bad = (result || []).find((vb) => snmp.isVarbindError(vb));
-      if (bad) return reject(new Error(snmp.varbindError(bad)));
-      resolve(result);
-    });
-  });
-}
-const OT = snmp.ObjectType;
-const I = (oid, value) => ({ oid, type: OT.Integer, value });
-const G = (oid, value) => ({ oid, type: OT.Gauge, value });
-const OCT = (oid, value) => ({ oid, type: OT.OctetString, value });
-const ROW = { active: 1, createAndGo: 4, createAndWait: 5, destroy: 6 };
-
-// Try the ways of making a row in turn until one reads back (MODULE-STANDARD
-// rule 6): forms is [[name, [pdu, ...]], ...]. A form that fails is undone
-// with destroy before the next. Resolves { via, refused }; when every form
-// fails, the error names each one and what the switch said.
-async function tryForms(session, forms, readsBack, destroy) {
-  const refused = [];
-  for (const [name, steps] of forms) {
-    try {
-      for (const step of steps) await setVarbinds(session, step);
-      if (!(await readsBack())) throw new Error('the row does not read back');
-      return { via: name, refused };
-    } catch (e) {
-      refused.push(name + ': ' + e.message);
-      await setVarbinds(session, destroy).catch(() => {});
-    }
-  }
-  throw new Error('The switch refused every form (' + refused.join('; ') + ').');
-}
-async function rowStatusIs(session, oid, want) {
-  const vbs = await new Promise((resolve, reject) => session.get([oid], (e, v) => (e ? reject(e) : resolve(v))));
-  return !!vbs[0] && !snmp.isVarbindError(vbs[0]) && Number(vbs[0].value) === want;
-}
-
 /** Parse IPv6 text into 16 bytes, or null. Takes '::' and an IPv4 tail. */
 function v6Bytes(text) {
   let t = String(text || '').trim().toLowerCase();
@@ -364,17 +326,6 @@ function linkLocalIndex(id, ifx) {
   const zone = [(ifx >>> 24) & 255, (ifx >>> 16) & 255, (ifx >>> 8) & 255, ifx & 255];
   return '4.20.' + [254, 128, 0, 0, 0, 0, 0, 0].concat(Array.from(id), zone).join('.') + '.5.0';
 }
-async function getInt(session, oid) {
-  const vbs = await new Promise((resolve, reject) => session.get([oid], (e, v) => (e ? reject(e) : resolve(v)))).catch(() => null);
-  const vb = vbs && vbs[0];
-  return vb && !snmp.isVarbindError(vb) ? Number(vb.value) : null;
-}
-async function getBytes(session, oid) {
-  const vbs = await new Promise((resolve, reject) => session.get([oid], (e, v) => (e ? reject(e) : resolve(v)))).catch(() => null);
-  const vb = vbs && vbs[0];
-  return vb && !snmp.isVarbindError(vb) && Buffer.isBuffer(vb.value) ? vb.value : null;
-}
-
 /** Stateless autoconfig on or off for an interface (rlipv6InterfaceAutoconfigEnable 1 / 2). */
 async function setAutoconfig(session, ifIndex, on) {
   const ifx = checkIf(ifIndex);

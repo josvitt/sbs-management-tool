@@ -23,6 +23,7 @@ const { readPorts } = require('./switch-ports');
 const { readStp } = require('./switch-stp');
 const { readSecurity } = require('./switch-security');
 const { readIpv6 } = require('./switch-ipv6');
+const { readQos } = require('./switch-qos');
 
 const READERS = {
   snmpConfig: (session, target) => snmpConfig.readAll(snmpConfigBundle(session), {
@@ -35,7 +36,8 @@ const READERS = {
   ports: (session) => readPorts(session),
   stp: (session) => readStp(session),
   security: (session) => readSecurity(session),
-  ipv6: (session) => readIpv6(session)
+  ipv6: (session) => readIpv6(session),
+  qos: (session) => readQos(session)
 };
 
 const MODULE_KEYS = Object.keys(READERS);

@@ -22,7 +22,7 @@ async function replayAgent(varbinds, label) {
     const health = await collectHealthFor(target, {});
     const healthRequests = Object.assign({}, counter);
     for (const k of Object.keys(counter)) counter[k] = 0;
-    const modules = await collectModulesFor(target, ['snmpConfig', 'flash', 'captures', 'maint', 'system', 'ports', 'stp', 'security', 'ipv6']);
+    const modules = await collectModulesFor(target, ['snmpConfig', 'flash', 'captures', 'maint', 'system', 'ports', 'stp', 'security', 'ipv6', 'qos']);
     return { health, modules, requests: { health: healthRequests, modules: Object.assign({}, counter) } };
   } finally {
     setSessionFactory(null);

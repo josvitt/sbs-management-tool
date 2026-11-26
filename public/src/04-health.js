@@ -74,7 +74,10 @@
     { key: 'security', title: 'Switching security', span: 12, h: 0, needs: () => true },
     // IPv6 addressing: IPv6 and autoconfig per interface, global addresses,
     // static routes and DNS servers (31-ipv6-addressing.js). Always offered.
-    { key: 'ipv6', title: 'IPv6 addressing', span: 12, h: 0, needs: () => true }
+    { key: 'ipv6', title: 'IPv6 addressing', span: 12, h: 0, needs: () => true },
+    // QoS: the mode and trust, trust, rate limit and shapers per port, and
+    // the CoS and DSCP queue maps (32-qos.js). Always offered.
+    { key: 'qos', title: 'QoS', span: 12, h: 0, needs: () => true }
   ];
 
   const builtinDef = (key) => BUILTIN.find((b) => b.key === key);
@@ -1188,7 +1191,8 @@
     portfeatures: ['interfaces'],
     stpsettings: ['interfaces'],
     security: ['interfaces'],
-    ipv6: ['interfaces', 'vlans', 'portL2L3']
+    ipv6: ['interfaces', 'vlans', 'portL2L3'],
+    qos: ['interfaces']
   };
   function panelDependsOn(key, changedTables) {
     const deps = PANEL_TABLE_DEPS[key];
@@ -1368,6 +1372,7 @@
     take('_stpSet', body.stp && !body.stp.error ? body.stp : (body.stp ? { error: body.stp.error } : undefined));
     take('_secSet', body.security && !body.security.error ? body.security : (body.security ? { error: body.security.error } : undefined));
     take('_v6Set', body.ipv6 && !body.ipv6.error ? body.ipv6 : (body.ipv6 ? { error: body.ipv6.error } : undefined));
+    take('_qosSet', body.qos && !body.qos.error ? body.qos : (body.qos ? { error: body.qos.error } : undefined));
   }
 
   // Viewer sync: show the server's latest snapshot WITHOUT the browser walking
@@ -1488,7 +1493,7 @@
     if (p.key === 'auth') { loadSessions(s); }
     // SNMP configuration, Flash files and Packet capture re-run their own
     // loaders (server endpoints, not health tables) and reconcile in place.
-    const ownLoader = { snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad, maint: maintLoad, system: systemLoad, portfeatures: portsLoad, stpsettings: stpSetLoad, security: secLoad, ipv6: v6Load }[p.key];
+    const ownLoader = { snmpcfg: snmpLoad, flash: flashLoad, capture: captureLoad, maint: maintLoad, system: systemLoad, portfeatures: portsLoad, stpsettings: stpSetLoad, security: secLoad, ipv6: v6Load, qos: qosLoad }[p.key];
     if (ownLoader) {
       if (btn) { btn.disabled = true; btn.classList.add('spin'); }
       ownLoader(s).catch(() => {}).then(() => { if (btn) { btn.disabled = false; btn.classList.remove('spin'); } });

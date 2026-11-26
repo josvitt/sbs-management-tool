@@ -40,6 +40,7 @@
     if (key === 'stpsettings') { paintStpSettingsPanel(s, body, p); return; }
     if (key === 'security') { paintSecurityPanel(s, body, p); return; }
     if (key === 'ipv6') { paintIpv6Panel(s, body, p); return; }
+    if (key === 'qos') { paintQosPanel(s, body, p); return; }
     const h = s.health;
     if (!h) { body.appendChild(el('div', 'card-sub', 'No SNMP data yet.')); return; }
     const sc = (k) => (h.scalars[k] ? h.scalars[k].display : null);

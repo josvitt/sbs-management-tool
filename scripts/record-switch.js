@@ -42,7 +42,7 @@ async function main() {
   phases.health = Object.assign({ ms: Date.now() - t0 }, rec.requests);
   rec.requests = { get: 0, getNext: 0, getBulk: 0 };
   t0 = Date.now();
-  await collectModulesFor(target, ['snmpConfig', 'flash', 'captures', 'maint', 'system', 'ports', 'stp', 'security', 'ipv6']);
+  await collectModulesFor(target, ['snmpConfig', 'flash', 'captures', 'maint', 'system', 'ports', 'stp', 'security', 'ipv6', 'qos']);
   phases.modules = Object.assign({ ms: Date.now() - t0 }, rec.requests);
   setSessionFactory(null);
 
