@@ -414,7 +414,10 @@ sbs-ref-arp, port gi1/0/4 trusted for both), read from the recording.
 - **Walked octet strings arrive as hex text** ("10 00 00 00",
   "00:00:5E:00:53:23"); the reader turns them back into bytes for port lists
   and MACs.
-- **Proven:** SWITCH_TEST_RESULT
+- **Proven** by `scripts/switch-test-security.js` on .253, 43 of 43: every
+  setting above changed on VLAN 999 and port 4 and put back, ARP list
+  entries added and removed, and DHCP snooping and ARP inspection turned off
+  and on for the switch.
 
 ## Port actions (`routes/ports.js`)
 
