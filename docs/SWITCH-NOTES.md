@@ -372,6 +372,53 @@ recordings, and written back by `scripts/switch-test-acl.js`.
   taken by the switch, so there is no switch-made row to encode from), DSCP,
   IP precedence, CoS, and offset rules.
 
+## Switching security (`switch-security.js`, `30-switch-security.js`)
+
+Encoded from the settings made from the CLI on .253 for a test VLAN 999
+(IGMP snooping and its querier, DHCP snooping, ARP inspection with the list
+sbs-ref-arp, port gi1/0/4 trusted for both), read from the recording.
+
+- **The snooping tables hold a row for every VLAN number.**
+  rlIgmpSnoopQuerierVlanTable (55.2.12, indexed by VLAN) and
+  rlIgmpMldSnoopVlanTable (55.5.5, indexed by address type 1 IPv4 / 2 IPv6
+  and VLAN) answer for VLANs 1 to 4094 whether the VLAN exists or not. A walk
+  stopped at the 600-row cap before VLAN 999 and took 860 requests, so the
+  app reads them by GET for the VLANs in dot1qVlanStaticTable. The legacy
+  rlIgmpSnoopVlanTable (55.2.7) and rlIgmpSnoopMembershipTable (55.2.11) are
+  empty on a C1300; the 55.5 tables replace them.
+- **Snooping and the querier are plain column SETs** on those rows:
+  rlIgmpMldSnoopVlanEnable, RouterLearn and IsImmediateLeave; the querier's
+  AdminEnable, AdminAddr (255.255.255.255 means the switch's own address on
+  the VLAN), AdminVersionNumber (2 or 3) and ElectionEnable. Switch-wide:
+  rlIgmpSnoopEnable, rlIgmpSnoopQuerierEnable and rlMldSnoopEnable.
+- **DHCP snooping and ARP inspection keep a row only for what is set.** A
+  VLAN with DHCP snooping on is a row in rlIpDhcpSnoopEnableVlanTable
+  (112.1.12); a trusted port is a row in rlIpDhcpSnoopTrustedPortTable
+  (112.1.13) and rlIpArpInspectTrustedPortTable (112.3.7). A VLAN with ARP
+  inspection is a row in rlIpArpInspectEnableVlanTable (112.3.6) carrying
+  the assigned list name. The app makes these rows with createAndGo and
+  removes them with destroy, as the MIB says. An empty list name is refused
+  (WrongLength on rlIpArpInspectAssignedListName), so the app clears a
+  VLAN's list by destroying the row and making it again without one.
+- **ARP lists** (rlIpArpInspectListTable, 112.3.5) are indexed by the list
+  name as length and bytes, then the IP address; the MAC is an octet string
+  column. A list exists while it has an entry.
+- **The MAC check and the packet check are enable 1 / disable 2**, not
+  TruthValue (rlIpDhcpSnoopVerifyMacAddress, rlIpDhcpSnoopFileEnable,
+  rlIpArpInspectValidation). rlIpArpInspectLogInterval is Unsigned32, 0 to
+  86400 seconds.
+- **A static DHCP binding was not taken from the CLI.** Three forms of
+  `ip dhcp snooping binding` (MAC with colons and with dots, expiry infinite
+  and 3600) gave "Wrong number of parameters". The panel shows the bindings
+  the switch learns and does not add them.
+- **Walked octet strings arrive as hex text** ("10 00 00 00",
+  "00:00:5E:00:53:23"); the reader turns them back into bytes for port lists
+  and MACs.
+- **Proven** by `scripts/switch-test-security.js` on .253, 43 of 43: every
+  setting above changed on VLAN 999 and port 4 and put back, ARP list
+  entries added and removed, and DHCP snooping and ARP inspection turned off
+  and on for the switch.
+
 ## Port actions (`routes/ports.js`)
 
 - **A PoE bounce makes the config "unsaved".** The bounce is two writes to
