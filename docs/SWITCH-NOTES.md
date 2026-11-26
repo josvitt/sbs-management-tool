@@ -514,7 +514,12 @@ recording.
   (with the row made active, or the rate before the status); a new queue
   shaper tries createAndGo with every queue, createAndGo with the shaped
   queue only, then createAndWait.
-- **Proven** by `scripts/switch-test-qos.js` on .253: PENDING.
+- **Proven** by `scripts/switch-test-qos.js` on .253, 21 of 21: the trust
+  mode changed and back, advanced mode and back, port trust off and on, the
+  rate limit, port shaper and queue 3 shaper on gi1/0/4 changed and put
+  back, a new shape profile made for queue 5 on gi1/0/5 and removed, CoS 5
+  and DSCP 10 moved and put back (CoS with "Put back the defaults"), and
+  the end state matched the start. Every write took its first form.
 
 ## Port actions (`routes/ports.js`)
 

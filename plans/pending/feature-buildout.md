@@ -211,5 +211,5 @@ A new **QoS** panel.
 | 8 Switching security | Shipped in v1.14.0: IGMP and MLD snooping for the switch and per VLAN, immediate leave, the IGMP snooping querier (on, address, version, election), DHCP snooping (switch, VLANs, MAC check, bindings file, trusted ports), ARP inspection (switch, VLANs with their list, packet check, log interval, trusted ports, ARP lists). Switch test 43/43 on .253. Not offered: a static DHCP snooping binding (the switch took no CLI form, so there is no switch-made row). |
 | 9 Alerts | Dropped (D7) |
 | 10 IPv6 | Shipped in v1.15.0: IPv6 Addressing panel with IPv6 and autoconfig per interface, global addresses, static and default routes, IPv6 DNS servers, management address and default route locked. Switch test 19/19 on .253. The switch refuses a second address in the same /64; IPv6 off turns autoconfig off first. The recording scrubber now also maps the switch MAC in LACP system ids, link-local addresses and interface identifiers. |
-| 11 QoS | Not started |
+| 11 QoS | Shipped in v1.16.0: QoS panel with the mode and trust, trust, rate limit, shaper and queue shapers per port, and the CoS and DSCP queue maps with put-back-the-defaults. Switch test 21/21 on .253. The C1300 keeps `rate-limit` in the storm control table (traffic all), not rlQosIfPolicyTable. Policy maps out of scope. |
 | 12 Many switches | Dropped (D8) |
