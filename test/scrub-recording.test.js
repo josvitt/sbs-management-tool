@@ -87,3 +87,34 @@ test('a firmware version that looks like an address is left alone', () => {
   assert.equal(Buffer.from(varbinds[0][2].$buf, 'hex').toString(), '4.1.9.92');
   assert.notEqual(Buffer.from(varbinds[1][2].$buf, 'hex').toString(), 'reached via 4.1.9.92');
 });
+
+test('the switch MAC goes from the LACP system id and from link-local addresses made of it', () => {
+  const mac = '0c1122334455';
+  const ll = 'fe80000000000000' + '0e1122fffe334455';   // EUI-64: U/L bit flipped, ff:fe inserted
+  const llArcs = ll.match(/../g).map((h) => parseInt(h, 16)).join('.');
+  const { varbinds } = scrub([
+    ['1.2.840.10006.300.43.1.1.1.1.4.1000', OCT, { $buf: mac }],                          // dot3adAggActorSystemID
+    ['1.3.6.1.2.1.4.34.1.3.4.20.' + llArcs + '.0.1.134.160', INT, 100000],                  // ipAddressIfIndex, link-local
+    ['1.3.6.1.4.1.9.6.1.101.26.36.1.14.4.20.' + llArcs + '.0.1.134.160.5.0', OCT, { $buf: ll }],
+    ['1.3.6.1.2.1.4.30.1.3.100000', OCT, { $buf: '0e1122fffe334455' }],                     // ipv6InterfaceIdentifier
+    ['1.3.6.1.6.3.10.2.1.1.0', OCT, { $buf: '80000009030c1122334455' }]                       // snmpEngineID
+  ], []);
+  const all = JSON.stringify(varbinds);
+  assert.ok(!all.includes('0c1122334455') && !all.includes('0e1122fffe334455'), all);
+  assert.ok(!varbinds.some(([oid]) => oid.includes('14.17.34.255.254.51.68.85')), all);
+  const to = varbinds[0][2].$buf;
+  assert.match(to, /^00005e0053/);
+  const eui = (h) => { const b = Buffer.from(h, 'hex'); return Buffer.from([b[0] ^ 2, b[1], b[2], 255, 254, b[3], b[4], b[5]]).toString('hex'); };
+  assert.equal(varbinds[2][2].$buf, 'fe80000000000000' + eui(to));
+  assert.equal(varbinds[3][2].$buf, eui(to));
+  assert.equal(varbinds[4][2].$buf, '8000000903' + to);
+  assert.ok(varbinds[1][0].includes(eui(to).match(/../g).map((h) => parseInt(h, 16)).join('.')), varbinds[1][0]);
+});
+
+test('a bare number in a name column (a VLAN interface\'s description) is left alone', () => {
+  const { varbinds } = scrub([
+    ['1.3.6.1.4.1.9.6.1.101.54.43.1.23.100998', OCT, hex('999')],    // rlifPresentName 
+    ['1.3.6.1.4.1.9.6.1.101.54.43.1.2.100998', OCT, hex('999')]      // rlifPresentDescr
+  ], []);
+  assert.deepEqual(varbinds.map((v) => Buffer.from(v[2].$buf, 'hex').toString()), ['999', '999']);
+});

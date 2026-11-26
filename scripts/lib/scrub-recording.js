@@ -9,8 +9,11 @@
  *    and masks still line up. Applied to IpAddress values, 4-byte InetAddress
  *    values, dotted text inside strings and runs of four arcs in OID indexes.
  *    Masks (255.x, 0.x) are left alone.
- *  - MAC addresses (MAC, PhysAddress, chassis and bridge-id columns, and the
- *    MAC in the index of the forwarding and 802.1X host tables) become
+ *  - MAC addresses (MAC, PhysAddress, chassis, bridge-id and LACP system-id
+ *    columns, the MAC in the index of the forwarding and 802.1X host tables,
+ *    the EUI-64 interface identifiers and link-local addresses made from a
+ *    MAC, and a known MAC inside other bytes such as an SNMP engine ID)
+ *    become
  *    00:00:5E:00:53:xx (RFC 7042 documentation range).
  *  - Names and secrets (system name, location and contact, communities,
  *    security and user names, keys, descriptions and aliases, neighbour and
@@ -32,7 +35,19 @@ const NOT_SENSITIVE = /^(sysDescr|entPhysical|ifDescr|rlifPresentName|rlPhdUnitG
 // addresses, and image file names are the vendor's; neither identifies a
 // network, and mapping them would make the fixture lie.
 const VERSION_COL = /^(rndImage\d(Internal)?Version|rndImage\dName|rndBrgVersion|rndBaseBootVersion|entPhysical(Hardware|Firmware|Software)Rev)$/;
-const MAC_COL = /Mac(Address)?|PhysAddress|ChassisId|BridgeAddress|DesignatedRoot|DesignatedBridge|BridgeId|RootId/i;
+const MAC_COL = /Mac(Address)?|PhysAddress|ChassisId|BridgeAddress|DesignatedRoot|DesignatedBridge|BridgeId|RootId|SystemID/i;
+// An IPv6 link-local address made from a MAC (EUI-64: fe80::, the MAC with
+// the universal/local bit flipped and ff:fe in the middle).
+const LINK_LOCAL = [254, 128, 0, 0, 0, 0, 0, 0];
+const eui64 = (hex) => { const b = Buffer.from(hex, 'hex'); return Buffer.from([b[0] ^ 2, b[1], b[2], 0xff, 0xfe, b[3], b[4], b[5]]).toString('hex'); };
+const macOfEui = (b) => (b.length === 8 && b[3] === 0xff && b[4] === 0xfe ? Buffer.from([b[0] ^ 2, b[1], b[2], b[5], b[6], b[7]]).toString('hex') : null);
+const linkLocalMacs = (arcs) => {
+  const found = [];
+  for (let i = 0; i + 16 <= arcs.length; i++) {
+    if (LINK_LOCAL.every((n, j) => arcs[i + j] === n)) { const m = macOfEui(Buffer.from(arcs.slice(i + 8, i + 16))); if (m) found.push(m); }
+  }
+  return found;
+};
 // Tables with a MAC in the index: [entry OID prefix, arc position of the MAC
 // from the end of the suffix (0 = the last six arcs)].
 const MAC_INDEXED = [
@@ -99,7 +114,9 @@ function scrub(varbinds, secrets) {
     return macs.get(hex);
   };
   const mapName = (str) => {
-    if (!str.trim()) return str;
+    // A bare number (a VLAN interface's description is its VLAN number)
+    // names nothing, and swapping it would rename the VLAN everywhere.
+    if (!str.trim() || /^\d+$/.test(str.trim())) return str;
     if (!names.has(str)) {
       const tok = 'R' + (names.size + 1).toString(36);
       names.set(str, (tok + 'x'.repeat(Math.max(0, str.length - tok.length))).slice(0, Math.max(1, str.length)));
@@ -136,6 +153,10 @@ function scrub(varbinds, secrets) {
       const arcs = oid.slice(prefix.length + 1).split('.').slice(1);   // drop the column number
       for (const i of starts(arcs)) if (i >= 0 && i + 4 <= arcs.length) mapIp(arcs.slice(i, i + 4).join('.'));
     }
+    if (buf && !isPrintable(buf)) for (const m of linkLocalMacs(Array.from(buf))) mapMac(m);
+    // An interface identifier on its own (ipv6InterfaceIdentifier): 8 bytes, EUI-64.
+    if (buf && buf.length === 8 && macOfEui(buf)) mapMac(macOfEui(buf));
+    if (c.index) for (const m of linkLocalMacs(c.index.split('.').map(Number))) mapMac(m);
     if (buf && buf.length === 6 && /TAddress/i.test(c.syntax + c.name)) mapIp(Array.from(buf.slice(0, 4)).join('.'));
     if (buf && internalIp(buf) > 0) mapIp(Array.from(buf.slice(internalIp(buf))).join('.'));
     if (c.index) {
@@ -168,7 +189,11 @@ function scrub(varbinds, secrets) {
   const mapIpKnown = (ip) => (isHostIp(ip) ? mapIp(ip) : ip);
   const arcRuns = [];   // [fromArcs, toArcs]
   for (const [from, to] of ips) arcRuns.push([from.split('.'), to.split('.')]);
-  for (const [from, to] of macs) arcRuns.push([from.match(/../g).map((h) => String(parseInt(h, 16))), to.match(/../g).map((h) => String(parseInt(h, 16)))]);
+  const hexArcs = (hex) => hex.match(/../g).map((h) => String(parseInt(h, 16)));
+  for (const [from, to] of macs) {
+    arcRuns.push([hexArcs(from), hexArcs(to)]);
+    arcRuns.push([hexArcs(eui64(from)), hexArcs(eui64(to))]);
+  }
   for (const [from, to] of names) {
     if (from.length < 2) continue;
     arcRuns.push([Array.from(Buffer.from(from, 'latin1')).map(String), Array.from(Buffer.from(to, 'latin1')).map(String)]);
@@ -220,6 +245,15 @@ function scrub(varbinds, secrets) {
         const str = buf.toString('latin1');
         const fixed = fixText(str);
         if (fixed !== str) buf = Buffer.from(fixed, 'latin1');
+        // A link-local address carries the MAC it was made from.
+        let hex = buf.toString('hex');
+        for (const [from, to] of macs) hex = hex.split('fe80000000000000' + eui64(from)).join('fe80000000000000' + eui64(to));
+        if (buf.length === 8) for (const [from, to] of macs) if (hex === eui64(from)) hex = eui64(to);
+        // A MAC inside other bytes, such as an SNMP engine ID (80 00 00 09 03 + MAC).
+        for (const [from, to] of macs) {
+          for (let i = hex.indexOf(from); i >= 0; i = hex.indexOf(from, i + 1)) if (i % 2 === 0) hex = hex.slice(0, i) + to + hex.slice(i + to.length);
+        }
+        buf = Buffer.from(hex, 'hex');
       }
       v = { $buf: buf.toString('hex') };
     } else if (typeof v === 'string') {

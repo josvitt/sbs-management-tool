@@ -73,6 +73,7 @@ require('./routes/system')(app);
 require('./routes/port-features')(app);
 require('./routes/stp-settings')(app);
 require('./routes/security-settings')(app);
+require('./routes/ipv6-settings')(app);
 require('./routes/monitoring')(app);
 require('./routes/state')(app);
 require('./routes/streams')(app);
@@ -127,7 +128,7 @@ function startCollector() {
     // with every full collection; SNMP configuration, Flash files and Reboot
     // and firmware follow the settings rule (after a change, a reboot, a
     // Refresh, or hourly).
-    modules: { everyCycle: ['captures'], onSettings: ['snmpConfig', 'flash', 'maint', 'system', 'ports', 'stp', 'security'] },
+    modules: { everyCycle: ['captures'], onSettings: ['snmpConfig', 'flash', 'maint', 'system', 'ports', 'stp', 'security', 'ipv6'] },
     collectModules: (target, keys) => collectModulesFor(target, keys),
     history, events, log, configHistory
   });
