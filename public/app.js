@@ -16174,7 +16174,8 @@
     sec.body.appendChild(field('IPv6', on));
     sec.body.appendChild(field('Autoconfig', auto));
     sec.body.appendChild(el('div', 'card-sub', 'With IPv6 on, the interface has a link-local address. ' +
-      'Autoconfig also takes an address from the prefix a router announces on this network.'));
+      'Autoconfig also takes an address from the prefix a router announces on this network. ' +
+      'Autoconfig keeps IPv6 on, so turning IPv6 off turns autoconfig off too.'));
     const { actions, apply } = applyActions('Apply');
     apply.addEventListener('click', async (e) => {
       const btn = e.currentTarget;

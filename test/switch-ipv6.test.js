@@ -144,3 +144,21 @@ test('IPv6 off falls back to destroying the link-local row, and on makes it from
   assert.deepEqual(on.refused, ['ipv6InterfaceEnableStatus up: WrongValue']);
   assert.equal((await v6.readIpv6(s)).summary.find((x) => x.ifIndex === 100998).linkLocal, 'fe80::200:5eff:fe00:5324%100998');
 });
+
+test('with autoconfig on, IPv6 off turns autoconfig off first, and puts it back when that fails too', async () => {
+  const values = sample();
+  const s = switchLike(values);
+  const set = s.set;
+  let autoOff = false;
+  s.set = (vbs, cb) => {
+    const o = vbs[0].oid;
+    if (o === v6.T.rlIface + '.2.100998') autoOff = vbs[0].value === 2;
+    if (o === v6.T.iface + '.5.100998' && !autoOff) return setImmediate(() => cb(new Error('WrongValue')));
+    if (o.startsWith(v6.T.rlAddr + '.11.4.')) return setImmediate(() => cb(new Error('WrongValue')));
+    return set(vbs, cb);
+  };
+  const off = await v6.setEnabled(s, 100998, false);
+  assert.equal(off.via, 'autoconfig off, then ipv6InterfaceEnableStatus down');
+  assert.deepEqual(off.refused.map((x) => x.split(':')[0]), ['ipv6InterfaceEnableStatus down', 'destroy the link-local row']);
+  assert.equal((await v6.readIpv6(s)).summary.find((x) => x.ifIndex === 100998).autoconfig, false);
+});

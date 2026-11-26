@@ -337,11 +337,23 @@ async function setEnabled(session, ifIndex, on) {
       forms.push(['a link-local row from the interface identifier', [[I(T.rlAddr + '.11.' + k, ROW.createAndGo), I(T.rlAddr + '.5.' + k, ifx), G(T.rlAddr + '.13.' + k, 64)]]]);
       undo = [I(T.rlAddr + '.11.' + k, ROW.destroy)];
     }
+    // Autoconfig turns IPv6 on by itself, as "ipv6 address autoconfig" does.
+    forms.push(['autoconfig on', [[I(T.rlIface + '.2.' + ifx, 1)]]]);
   } else {
     const rows = await lls();
-    if (rows.length) forms.push(['destroy the link-local row', [rows.map((r) => I(T.rlAddr + '.11.' + r.key, ROW.destroy))]]);
+    const destroyLl = rows.map((r) => I(T.rlAddr + '.11.' + r.key, ROW.destroy));
+    if (rows.length) forms.push(['destroy the link-local row', [destroyLl]]);
+    // With autoconfig on, the switch keeps IPv6 on: autoconfig goes off
+    // first, and is put back if IPv6 still will not go off.
+    const auto = await getInt(session, T.rlIface + '.2.' + ifx);
+    if (auto === 1) {
+      const off = [I(T.rlIface + '.2.' + ifx, 2)];
+      forms.push(['autoconfig off, then ipv6InterfaceEnableStatus down', [off, [I(T.iface + '.5.' + ifx, 2)]]]);
+      if (rows.length) forms.push(['autoconfig off, then destroy the link-local row', [off, destroyLl]]);
+      undo = [I(T.rlIface + '.2.' + ifx, 1)];
+    } else undo = [];
   }
-  const r = await tryForms(session, forms, async () => ((await lls()).length > 0) === !!on, on ? undo : []);
+  const r = await tryForms(session, forms, async () => ((await lls()).length > 0) === !!on, undo);
   return Object.assign({ ifIndex: ifx, on: !!on }, r);
 }
 
@@ -351,6 +363,11 @@ async function setEnabled(session, ifIndex, on) {
 function linkLocalIndex(id, ifx) {
   const zone = [(ifx >>> 24) & 255, (ifx >>> 16) & 255, (ifx >>> 8) & 255, ifx & 255];
   return '4.20.' + [254, 128, 0, 0, 0, 0, 0, 0].concat(Array.from(id), zone).join('.') + '.5.0';
+}
+async function getInt(session, oid) {
+  const vbs = await new Promise((resolve, reject) => session.get([oid], (e, v) => (e ? reject(e) : resolve(v)))).catch(() => null);
+  const vb = vbs && vbs[0];
+  return vb && !snmp.isVarbindError(vb) ? Number(vb.value) : null;
 }
 async function getBytes(session, oid) {
   const vbs = await new Promise((resolve, reject) => session.get([oid], (e, v) => (e ? reject(e) : resolve(v)))).catch(() => null);
