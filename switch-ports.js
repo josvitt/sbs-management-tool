@@ -323,7 +323,9 @@ async function setPortSecurity(session, ifIndex, p) {
 
 /**
  * Storm control on one port: the rate for one kind of traffic ('broadcast',
- * 'multicastAll' or 'unknownUnicast'); 0 turns it off. Only the rate column
+ * 'multicastAll' or 'unknownUnicast'); 0 turns it off. 'all' is the port's
+ * ingress rate limit: the CLI's "rate-limit" lands in this row on a C1300
+ * (QoS recording, v1.16.0), not in rlQosIfPolicyTable. Only the rate column
  * is written, in kb/s. The unit (.3) and action (.4) stay as the switch has
  * them: on a C1300 on 4.1.9.92 every row reads unit 1, action 1, and the
  * switch's web page shows a rate of 10000 there as "10000 kbits/sec".
@@ -331,7 +333,7 @@ async function setPortSecurity(session, ifIndex, p) {
 async function setStorm(session, ifIndex, traffic, rate) {
   const ifx = checkIf(ifIndex);
   const t = Number(Object.keys(TRAFFIC).find((k) => TRAFFIC[k] === traffic));
-  if (!t || [1, 4, 5].indexOf(t) < 0) throw new Error('traffic must be broadcast, multicastAll or unknownUnicast.');
+  if (!t || [1, 4, 5, 6].indexOf(t) < 0) throw new Error('traffic must be broadcast, multicastAll, unknownUnicast or all.');
   const n = Number(rate);
   if (!Number.isInteger(n) || n < 0 || n > 10000000) throw new Error('The rate must be 0 to 10000000.');
   await setVarbinds(session, [{ oid: STORM + '.2.' + ifx + '.' + t, type: snmp.ObjectType.Gauge, value: n }]);
@@ -553,7 +555,7 @@ async function readPorts(session) {
 }
 
 module.exports = {
-  readPorts, setPoe, setPortSecurity, setStorm, setErrdisableInterval, setErrdisableCause, setGlobal,
+  readPorts, presentPorts, setPoe, setPortSecurity, setStorm, setErrdisableInterval, setErrdisableCause, setGlobal,
   setLldpPort, setCdpPort, setEeePort, addMirror, removeMirror, addMirrorSource, removeMirrorSource, cableTest, walkColumns, getRows, SCALARS, PRESENT_TYPE, TRAFFIC,
   PETH, RL_PETH, SWIF, STORM, ERRDIS, LLDP_PORTS, CDP_IF, EEE_PORTS, SPAN_DEST, SPAN_SRC, PHY_GET,
   CAUSES, LOCK_MODE, LLDP_ADMIN, POE_PRIORITY

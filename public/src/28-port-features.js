@@ -380,7 +380,7 @@
       const storm = rowFor(d.storm, 'ifIndex', ifx);
       const lldp = rowFor(d.lldp && d.lldp.ports, 'port', ifx);
       const eee = rowFor(d.eee && d.eee.ports, 'ifIndex', ifx);
-      const stormOn = storm && Object.keys(storm.traffic).filter((k) => storm.traffic[k].rate > 0);
+      const stormOn = storm && Object.keys(storm.traffic).filter((k) => k !== 'all' && storm.traffic[k].rate > 0);   // 'all' is the QoS rate limit
       return {
         key: 'port:' + ifx,
         cells: [{ v: portNameOf(s, ifx) },
