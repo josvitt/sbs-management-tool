@@ -14,6 +14,12 @@ function sample() {
   v[S.enable] = int(1);
   v[S.version] = int(8);
   v[S.priority] = int(32768);
+  // ifIndex 5 is a present Ethernet port; the bridge tables also carry a row
+  // for port 300, which is not present and is not read.
+  v[require('../switch-ports').PRESENT_TYPE + '.5'] = int(6);
+  v[require('../switch-ports').PRESENT_TYPE + '.300'] = int(1);
+  v[stp.STP_PORT + '.2.300'] = int(128);
+  v[stp.BASE_PORT + '.2.300'] = int(300);
   // Bridge port 5 is ifIndex 5: PortFast on, BPDU guard on, cost automatic.
   v[stp.BASE_PORT + '.2.5'] = int(5);
   v[stp.STP_PORT + '.2.5'] = int(128);
@@ -45,26 +51,19 @@ test('readStp reads the mode, priorities and port settings', async () => {
   assert.deepEqual(r.instances, []);
 });
 
-test('the writes send the columns for the switch, VLAN, instance and port', async () => {
+test('the writes send the columns for the switch and the port', async () => {
   const s = fakeSession(sample());
   await stp.setEnabled(s, false);
   await stp.setMode(s, 'mstp');
   await stp.setBridgePriority(s, 8192);
-  await stp.setBridgePriority(s, 4096, { vlan: 10 });
-  await stp.setBridgePriority(s, 0, { instance: 1 });
-  await stp.setPort(s, 5, { priority: 64, cost: 0, edge: false, bpduGuard: false });
-  await stp.setPortIn(s, { vlan: 10 }, 5, { cost: 200 });
-  await stp.setPortIn(s, { instance: 1 }, 5, { priority: 32 });
+  await stp.setPort(s, 5, { priority: 64, cost: 0, edge: false, autoEdge: true, bpduGuard: false, enabled: false });
   const V = '1.3.6.1.4.1.9.6.1.101';
   assert.deepEqual(s.sets.map((vbs) => vbs.map((v) => v.oid.replace(V, 'V') + '=' + v.value)), [
     ['V.57.2.3.0=2'],
     ['1.3.6.1.2.1.17.2.16.0=3'],
     ['1.3.6.1.2.1.17.2.2.0=8192'],
-    ['V.57.9.1.1.5.10=4096'],
-    ['V.57.6.1.1.12.1=0'],
-    ['1.3.6.1.2.1.17.2.15.1.2.5=64'], ['1.3.6.1.2.1.17.2.19.1.6.5=0'], ['1.3.6.1.2.1.17.2.19.1.2.5=2'], ['V.57.2.24.1.1.5=2'],
-    ['V.57.9.3.1.3.10.5=200'],
-    ['V.57.6.2.1.3.1.5=32']
+    ['1.3.6.1.2.1.17.2.15.1.4.5=2'], ['1.3.6.1.2.1.17.2.15.1.2.5=64'], ['1.3.6.1.2.1.17.2.19.1.6.5=0'],
+    ['1.3.6.1.2.1.17.2.19.1.2.5=2'], ['V.57.2.13.1.10.5=1'], ['V.57.2.24.1.1.5=2']
   ]);
 });
 
@@ -74,26 +73,10 @@ test('the writes refuse values the switch would not take', async () => {
   await assert.rejects(stp.setBridgePriority(s, 1000), /steps of 4096/);
   await assert.rejects(stp.setPort(s, 5, { priority: 100 }), /steps of 16/);
   await assert.rejects(stp.setPort(s, 5, {}), /Nothing to change/);
-  await assert.rejects(stp.setPortIn(s, {}, 5, { cost: 1 }), /Name a vlan/);
   assert.equal(s.sets.length, 0);
 });
 
-test('a VLAN priority makes the PVST row when the switch has none, and reset removes it', async () => {
-  const V = '1.3.6.1.4.1.9.6.1.101';
-  const s = fakeSession(sample(), { refuse: (vbs) => (vbs.length === 1 && vbs[0].oid === stp.PVST_VLAN + '.5.20' ? 'NoCreation' : null) });
-  const r = await stp.setBridgePriority(s, 8192, { vlan: 20 });
-  assert.equal(r.via, 'createAndGo with the columns');
-  await stp.resetVlan(s, 20);
-  await stp.resetPortInVlan(s, 20, 5);
-  assert.deepEqual(s.sets.map((vbs) => vbs.map((v) => v.oid.replace(V, 'V') + '=' + v.value)), [
-    ['V.57.9.1.1.5.20=8192'],
-    ['V.57.9.1.1.6.20=4', 'V.57.9.1.1.5.20=8192'],
-    ['V.57.9.1.1.6.20=6'],
-    ['V.57.9.3.1.5.20.5=6']
-  ]);
-});
-
-test('every refused form is named in the error', async () => {
-  const s = fakeSession(sample(), { refuse: () => 'InconsistentValue' });
-  await assert.rejects(stp.setPortIn(s, { vlan: 20 }, 5, { cost: 10 }), /every form \(the columns.*createAndGo.*createAndWait/);
+test('a refused port setting names itself and what was already set', async () => {
+  const s = fakeSession(sample(), { refuse: (vbs) => (vbs[0].oid.indexOf(stp.BPDU_GUARD) === 0 ? 'NotWritable' : null) });
+  await assert.rejects(stp.setPort(s, 5, { edge: true, bpduGuard: true }), /NotWritable \(1\.3\.6\.1\.4\.1\.9\.6\.1\.101\.57\.2\.24\.1\.1\.5; already set: 1\.3\.6\.1\.2\.1\.17\.2\.19\.1\.2\.5\)/);
 });

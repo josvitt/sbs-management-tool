@@ -24,7 +24,7 @@ async function withSession(target, fn) {
   finally { try { session.close(); } catch (e) {} }
 }
 
-const USER_ERROR = /must|is required|Nothing to change|Name a vlan|is 0 to|is 1 to/;
+const USER_ERROR = /must|is required|Nothing to change|is 0 to|is 1 to/;
 
 function writeRoute(app, path, what, fn) {
   app.post(path, writeHold(), async (req, res) => {
@@ -55,16 +55,9 @@ module.exports = function register(app) {
   writeRoute(app, '/api/stp/enabled', 'Spanning tree turned on or off', (s, b) => stp.setEnabled(s, !!b.on));
   // { mode }
   writeRoute(app, '/api/stp/mode', 'Spanning tree mode changed', (s, b) => stp.setMode(s, b.mode));
-  // { priority, vlan?, instance? }
-  writeRoute(app, '/api/stp/priority', 'Bridge priority changed', (s, b) =>
-    stp.setBridgePriority(s, b.priority, b.vlan != null ? { vlan: b.vlan } : (b.instance != null ? { instance: b.instance } : null)));
+  // { priority }
+  writeRoute(app, '/api/stp/priority', 'Bridge priority changed', (s, b) => stp.setBridgePriority(s, b.priority));
   // { port, enabled?, priority?, cost?, edge?, autoEdge?, bpduGuard? }
   writeRoute(app, '/api/stp/port', 'Spanning tree port settings changed', (s, b) =>
     stp.setPort(s, b.port, { enabled: b.enabled, priority: b.priority, cost: b.cost, edge: b.edge, autoEdge: b.autoEdge, bpduGuard: b.bpduGuard }));
-  // { port, vlan? | instance?, priority?, cost? }
-  writeRoute(app, '/api/stp/port-in', 'Spanning tree port settings changed for a VLAN or instance', (s, b) =>
-    stp.setPortIn(s, b.vlan != null ? { vlan: b.vlan } : (b.instance != null ? { instance: b.instance } : {}), b.port, { priority: b.priority, cost: b.cost }));
-  // { vlan, port? }: back to the defaults (removes the PVST row the settings made)
-  writeRoute(app, '/api/stp/vlan/reset', 'Spanning tree VLAN settings reset', (s, b) =>
-    (b.port != null ? stp.resetPortInVlan(s, b.vlan, b.port) : stp.resetVlan(s, b.vlan)));
 };

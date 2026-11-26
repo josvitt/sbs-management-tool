@@ -86,36 +86,9 @@
     sec.body.appendChild(actions);
     pane.appendChild(sec.sec);
 
-    // Under PVST or MSTP: the port's cost and priority in one VLAN or instance.
-    const per = stpPerVlan(d.mode) ? (d.vlans || []).map((v) => ({ id: v.vlan, rows: v.ports, key: 'vlan' }))
-      : (d.mode === 'mstp' ? (d.instances || []).map((i) => ({ id: i.instance, rows: i.ports, key: 'instance' })) : []);
-    if (per.length) {
-      const word = per[0].key === 'vlan' ? 'VLAN' : 'Instance';
-      const sec2 = formSection('In one ' + word.toLowerCase());
-      const which = selectInput(per.map((x) => ({ label: word + ' ' + x.id, value: String(x.id) })), String(per[0].id));
-      const pri2 = selectInput(portPriorityOptions(), '128');
-      const cost2 = textInput('0', '0'); cost2.size = 10;
-      const fill = () => {
-        const x = per.find((y) => String(y.id) === which.value);
-        const row = x && (x.rows || []).find((y) => y.port === r.port);
-        pri2.value = String(row && row.priority != null ? row.priority : 128);
-        cost2.value = String(row ? (row.cost != null ? row.cost : (row.adminCost || 0)) : 0);
-      };
-      which.addEventListener('change', fill); fill();
-      sec2.body.appendChild(field(word, which));
-      sec2.body.appendChild(field('Port priority', pri2));
-      sec2.body.appendChild(field('Cost (0 = automatic)', cost2));
-      const a2 = applyActions('Apply to this ' + word.toLowerCase());
-      a2.apply.addEventListener('click', (e) => {
-        const c = Number(cost2.value);
-        if (!Number.isInteger(c) || c < 0) { toast('The cost is a whole number; 0 means automatic.', 'error'); return; }
-        const body = { port: r.port, priority: Number(pri2.value), cost: c };
-        body[per[0].key] = Number(which.value);
-        stpWrite(e.currentTarget, s, '/api/stp/port-in', body, 'Apply', done);
-      });
-      sec2.body.appendChild(a2.actions);
-      pane.appendChild(sec2.sec);
-    }
+    if (stpPerVlan(d.mode) || d.mode === 'mstp') pane.appendChild(el('div', 'card-sub', 'These settings apply in every ' +
+      (d.mode === 'mstp' ? 'instance' : 'VLAN') + '. A cost or priority for one ' + (d.mode === 'mstp' ? 'instance' : 'VLAN') +
+      ' is set on the switch\'s own web page: the switch does not take it over SNMP.'));
   }
 
   function stpPortTab(s, ifx) {
@@ -179,22 +152,13 @@
     }
 
     // ---- per VLAN or per instance ----
-    if (per !== 'none') {
-      const word = per === 'vlan' ? 'VLAN' : 'Instance';
-      const list = per === 'vlan' ? (d.vlans || []).map((v) => ({ id: v.vlan, priority: v.priority }))
-        : (d.instances || []).map((i) => ({ id: i.instance, priority: i.priority }));
-      if (!s._ktReconcile) body.appendChild(el('div', 'section-title', 'Bridge priority per ' + word.toLowerCase()));
-      mountInto(body, s, p, 'stp:per', [word, 'Bridge priority', ''], list.map((x) => {
-        const sel = selectInput(bridgePriorityOptions(), String(x.priority == null ? 32768 : x.priority));
-        const b = actBtn('Set', (e) => {
-          const payload = { priority: Number(sel.value) };
-          payload[per] = x.id;
-          stpWrite(e.currentTarget, s, '/api/stp/priority', payload, 'Set ' + word.toLowerCase() + ' priority');
-        });
-        return { key: per + ':' + x.id, cells: [{ v: String(x.id) }, { v: x.priority == null ? '' : String(x.priority) },
-          { cellNode: actGroup([sel, b]), sig: 'set:' + x.priority }] };
-      }));
-      if (!list.length && !s._ktReconcile) body.appendChild(el('div', 'card-sub', 'The switch lists no ' + word.toLowerCase() + ' settings.'));
+    // Not written: a C1300 answers NotWritable to every form of the PVST
+    // tables (switch-stp.js, setBridgePriority). Their running values are on
+    // the Spanning tree panel.
+    if (per !== 'none' && !s._ktReconcile) {
+      body.appendChild(el('div', 'card-sub', 'Under ' + (STP_MODE_WORDS[d.mode] || d.mode) + ' each ' + (per === 'vlan' ? 'VLAN' : 'instance') +
+        ' can have its own bridge priority. The switch does not take that over SNMP, so set it on the switch\'s own web page; ' +
+        'the Spanning tree panel shows what each one is running with.'));
     }
 
     // ---- per port ----
