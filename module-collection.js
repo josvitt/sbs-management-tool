@@ -21,6 +21,7 @@ const { readMaint } = require('./switch-maint');
 const { readSystem } = require('./switch-system');
 const { readPorts } = require('./switch-ports');
 const { readStp } = require('./switch-stp');
+const { readSecurity } = require('./switch-security');
 
 const READERS = {
   snmpConfig: (session, target) => snmpConfig.readAll(snmpConfigBundle(session), {
@@ -31,7 +32,8 @@ const READERS = {
   maint: (session) => readMaint(session),
   system: (session) => readSystem(session),
   ports: (session) => readPorts(session),
-  stp: (session) => readStp(session)
+  stp: (session) => readStp(session),
+  security: (session) => readSecurity(session)
 };
 
 const MODULE_KEYS = Object.keys(READERS);
