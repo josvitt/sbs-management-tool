@@ -320,16 +320,42 @@ async function removeAddress(session, address) {
 
 /**
  * IPv6 on or off for an interface. ipv6InterfaceEnableStatus reads down(2)
- * on .253 even where "ipv6 enable" is set, so a change is checked by the
- * link-local address coming or going, and the vendor row is the second form.
+ * on .253 even where "ipv6 enable" is set, and refuses down with WrongValue
+ * (switch test, v1.15.0), so a change is checked by the link-local address
+ * coming or going, and the link-local row itself is the next form: made
+ * from fe80:: and the interface identifier, or destroyed.
  */
 async function setEnabled(session, ifIndex, on) {
   const ifx = checkIf(ifIndex);
-  const hasLinkLocal = async () => (await walkColumns(session, T.rlAddr, [5])).some((r) => r.index[0] === 4 && num(r.cols[5]) === ifx);
+  const lls = async () => (await walkColumns(session, T.rlAddr, [5])).filter((r) => r.index[0] === 4 && num(r.cols[5]) === ifx);
   const forms = [['ipv6InterfaceEnableStatus ' + (on ? 'up' : 'down'), [[I(T.iface + '.5.' + ifx, on ? 1 : 2)]]]];
-  if (on) forms.push(['the vendor interface row (rlipv6InterfaceNdDadAttemps 1)', [[I(T.rlIface + '.1.' + ifx, 1)]]]);
-  const r = await tryForms(session, forms, async () => (await hasLinkLocal()) === !!on, [I(T.iface + '.5.' + ifx, on ? 2 : 1)]);
+  let undo = [I(T.iface + '.5.' + ifx, on ? 2 : 1)];
+  if (on) {
+    const id = await getBytes(session, T.iface + '.3.' + ifx);
+    if (id && id.length === 8) {
+      const k = linkLocalIndex(id, ifx);
+      forms.push(['a link-local row from the interface identifier', [[I(T.rlAddr + '.11.' + k, ROW.createAndGo), I(T.rlAddr + '.5.' + k, ifx), G(T.rlAddr + '.13.' + k, 64)]]]);
+      undo = [I(T.rlAddr + '.11.' + k, ROW.destroy)];
+    }
+  } else {
+    const rows = await lls();
+    if (rows.length) forms.push(['destroy the link-local row', [rows.map((r) => I(T.rlAddr + '.11.' + r.key, ROW.destroy))]]);
+  }
+  const r = await tryForms(session, forms, async () => ((await lls()).length > 0) === !!on, on ? undo : []);
   return Object.assign({ ifIndex: ifx, on: !!on }, r);
+}
+
+// rlIpAddressTable index of a link-local address: type 4, length 20, fe80::
+// and the 8-byte interface identifier, the zone (the ifIndex, 4 bytes), then
+// origin link-layer(5) and an empty prefix name, as the switch made it.
+function linkLocalIndex(id, ifx) {
+  const zone = [(ifx >>> 24) & 255, (ifx >>> 16) & 255, (ifx >>> 8) & 255, ifx & 255];
+  return '4.20.' + [254, 128, 0, 0, 0, 0, 0, 0].concat(Array.from(id), zone).join('.') + '.5.0';
+}
+async function getBytes(session, oid) {
+  const vbs = await new Promise((resolve, reject) => session.get([oid], (e, v) => (e ? reject(e) : resolve(v)))).catch(() => null);
+  const vb = vbs && vbs[0];
+  return vb && !snmp.isVarbindError(vb) && Buffer.isBuffer(vb.value) ? vb.value : null;
 }
 
 /** Stateless autoconfig on or off for an interface (rlipv6InterfaceAutoconfigEnable 1 / 2). */
@@ -399,5 +425,5 @@ async function removeDnsServer(session, index) {
 
 module.exports = {
   readIpv6, addAddress, removeAddress, setEnabled, setAutoconfig, addRoute, removeRoute, addDnsServer, removeDnsServer,
-  inetAt, v6Text, v6Bytes, routeIndex, addrIndex, T, SCALARS, SBELT
+  inetAt, v6Text, v6Bytes, routeIndex, addrIndex, linkLocalIndex, T, SCALARS, SBELT
 };

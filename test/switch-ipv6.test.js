@@ -129,3 +129,18 @@ test('a refused form is undone and the next one tried, and the error names every
   await assert.rejects(v6.addRoute(s, '2001:db8:997::', 48, '2001:db8:999::fe', 100998),
     /refused every form \(createAndGo with type remote and the metric: NoCreation; createAndGo alone: NoCreation; createAndWait, columns, then active: NoCreation\)/);
 });
+
+test('IPv6 off falls back to destroying the link-local row, and on makes it from the interface identifier', async () => {
+  const values = sample();
+  values[v6.T.iface + '.3.100998'] = [T.OctetString, Buffer.from('02005efffe005324', 'hex')];
+  const s = switchLike(values);
+  const set = s.set;
+  s.set = (vbs, cb) => (vbs[0].oid.startsWith(v6.T.iface + '.5.') ? setImmediate(() => cb(new Error('WrongValue'))) : set(vbs, cb));
+  const off = await v6.setEnabled(s, 100998, false);
+  assert.equal(off.via, 'destroy the link-local row');
+  assert.equal((await v6.readIpv6(s)).summary.find((x) => x.ifIndex === 100998).linkLocal, null);
+  const on = await v6.setEnabled(s, 100998, true);
+  assert.equal(on.via, 'a link-local row from the interface identifier');
+  assert.deepEqual(on.refused, ['ipv6InterfaceEnableStatus up: WrongValue']);
+  assert.equal((await v6.readIpv6(s)).summary.find((x) => x.ifIndex === 100998).linkLocal, 'fe80::200:5eff:fe00:5324%100998');
+});

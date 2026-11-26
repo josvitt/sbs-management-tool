@@ -13,7 +13,9 @@
  *
  *   1. Reads everything.
  *   2. Autoconfig off and back on (or on and back off).
- *   3. A global address 2001:db8:999::2/64 added and removed.
+ *   3. A global address 2001:db8:996::2/64 added and removed. A second
+ *      address in the sample's /64 (2001:db8:999::2) is tried and noted,
+ *      not checked.
  *   4. A static route 2001:db8:997::/48 via 2001:db8:999::fe, metric 5,
  *      added and removed; the default route ::/0 the same way when the
  *      switch has none.
@@ -58,7 +60,10 @@ if (host.includes(':')) {
   console.error('Give the switch\'s IPv4 address: this test turns IPv6 off on an interface, which must not be the way the app reaches the switch.');
   process.exit(2);
 }
-const TEST_ADDR = '2001:db8:999::2';
+// A second prefix: a second address in the same /64 as the sample was
+// refused (WrongValue) by every form on .253, so it is tried only as a note.
+const TEST_ADDR = '2001:db8:996::2';
+const SAME_PREFIX = '2001:db8:999::2';
 const TEST_ROUTE = '2001:db8:997::';
 const NEXT_HOP = '2001:db8:999::fe';
 const TEST_DNS = '2001:db8:999::54';
@@ -153,6 +158,11 @@ async function main() {
   // ---- 3. an address --------------------------------------------------------------
   const hasAddr = (d, a) => iface(d).global.some((g) => g.address === a);
   if (hasAddr(d0, TEST_ADDR)) await step('removed ' + TEST_ADDR + ' left by an earlier run', '/api/ipv6/address/remove', { address: TEST_ADDR }, (d) => !hasAddr(d, TEST_ADDR));
+  {
+    const r = await post('/api/ipv6/address/add', { ifIndex: IFX, address: SAME_PREFIX, prefixLength: 64 });
+    say('NOTE a second address in the same /64, ' + SAME_PREFIX + ': ' + (r.httpOk ? 'taken' + forms(r) : 'refused: ' + r.error));
+    if (r.httpOk) await post('/api/ipv6/address/remove', { address: SAME_PREFIX });
+  }
   await step('address ' + TEST_ADDR + '/64 added', '/api/ipv6/address/add', { ifIndex: IFX, address: TEST_ADDR, prefixLength: 64 },
     (d) => iface(d).global.some((g) => g.address === TEST_ADDR && g.prefixLength === 64));
   await step('address ' + TEST_ADDR + ' removed', '/api/ipv6/address/remove', { address: TEST_ADDR }, (d) => !hasAddr(d, TEST_ADDR));

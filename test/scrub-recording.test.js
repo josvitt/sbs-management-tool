@@ -95,7 +95,8 @@ test('the switch MAC goes from the LACP system id and from link-local addresses 
   const { varbinds } = scrub([
     ['1.2.840.10006.300.43.1.1.1.1.4.1000', OCT, { $buf: mac }],                          // dot3adAggActorSystemID
     ['1.3.6.1.2.1.4.34.1.3.4.20.' + llArcs + '.0.1.134.160', INT, 100000],                  // ipAddressIfIndex, link-local
-    ['1.3.6.1.4.1.9.6.1.101.26.36.1.14.4.20.' + llArcs + '.0.1.134.160.5.0', OCT, { $buf: ll }]
+    ['1.3.6.1.4.1.9.6.1.101.26.36.1.14.4.20.' + llArcs + '.0.1.134.160.5.0', OCT, { $buf: ll }],
+    ['1.3.6.1.2.1.4.30.1.3.100000', OCT, { $buf: '0e1122fffe334455' }]                      // ipv6InterfaceIdentifier
   ], []);
   const all = JSON.stringify(varbinds);
   assert.ok(!all.includes('0c1122334455') && !all.includes('0e1122fffe334455'), all);
@@ -104,6 +105,7 @@ test('the switch MAC goes from the LACP system id and from link-local addresses 
   assert.match(to, /^00005e0053/);
   const eui = (h) => { const b = Buffer.from(h, 'hex'); return Buffer.from([b[0] ^ 2, b[1], b[2], 255, 254, b[3], b[4], b[5]]).toString('hex'); };
   assert.equal(varbinds[2][2].$buf, 'fe80000000000000' + eui(to));
+  assert.equal(varbinds[3][2].$buf, eui(to));
   assert.ok(varbinds[1][0].includes(eui(to).match(/../g).map((h) => parseInt(h, 16)).join('.')), varbinds[1][0]);
 });
 

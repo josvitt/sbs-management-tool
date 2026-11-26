@@ -44,6 +44,7 @@ for (const file of files) {
       const b = v && v.$buf ? Buffer.from(v.$buf, 'hex') : null;
       if (e && b && /Mac(Address)?$|PhysAddress|SystemID/i.test(e.entry.name) && b.length === 6 && !b.every((c) => c === 0) &&
           !/^00005e0053/.test(b.toString('hex')) && !b.every((c) => c === 255)) bad.push(e.entry.name);
+      if (b && b.length === 8 && b[3] === 255 && b[4] === 254 && !(b[0] === 2 && b[1] === 0 && b[2] === 0x5e && b[5] === 0 && b[6] === 0x53)) bad.push((e && e.entry.name) || oid);
       const ll = [oid.split('.').map(Number), b ? Array.from(b) : []];
       for (const arcs of ll) {
         for (let i = 0; i + 16 <= arcs.length; i++) {

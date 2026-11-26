@@ -9,8 +9,10 @@
  *    and masks still line up. Applied to IpAddress values, 4-byte InetAddress
  *    values, dotted text inside strings and runs of four arcs in OID indexes.
  *    Masks (255.x, 0.x) are left alone.
- *  - MAC addresses (MAC, PhysAddress, chassis and bridge-id columns, and the
- *    MAC in the index of the forwarding and 802.1X host tables) become
+ *  - MAC addresses (MAC, PhysAddress, chassis, bridge-id and LACP system-id
+ *    columns, the MAC in the index of the forwarding and 802.1X host tables,
+ *    and the EUI-64 interface identifiers and link-local addresses made
+ *    from a MAC) become
  *    00:00:5E:00:53:xx (RFC 7042 documentation range).
  *  - Names and secrets (system name, location and contact, communities,
  *    security and user names, keys, descriptions and aliases, neighbour and
@@ -151,6 +153,8 @@ function scrub(varbinds, secrets) {
       for (const i of starts(arcs)) if (i >= 0 && i + 4 <= arcs.length) mapIp(arcs.slice(i, i + 4).join('.'));
     }
     if (buf && !isPrintable(buf)) for (const m of linkLocalMacs(Array.from(buf))) mapMac(m);
+    // An interface identifier on its own (ipv6InterfaceIdentifier): 8 bytes, EUI-64.
+    if (buf && buf.length === 8 && macOfEui(buf)) mapMac(macOfEui(buf));
     if (c.index) for (const m of linkLocalMacs(c.index.split('.').map(Number))) mapMac(m);
     if (buf && buf.length === 6 && /TAddress/i.test(c.syntax + c.name)) mapIp(Array.from(buf.slice(0, 4)).join('.'));
     if (buf && internalIp(buf) > 0) mapIp(Array.from(buf.slice(internalIp(buf))).join('.'));
@@ -243,6 +247,7 @@ function scrub(varbinds, secrets) {
         // A link-local address carries the MAC it was made from.
         let hex = buf.toString('hex');
         for (const [from, to] of macs) hex = hex.split('fe80000000000000' + eui64(from)).join('fe80000000000000' + eui64(to));
+        if (buf.length === 8) for (const [from, to] of macs) if (hex === eui64(from)) hex = eui64(to);
         buf = Buffer.from(hex, 'hex');
       }
       v = { $buf: buf.toString('hex') };
