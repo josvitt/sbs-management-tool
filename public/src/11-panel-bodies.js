@@ -38,6 +38,7 @@
     if (key === 'system') { paintSystemPanel(s, body, p); return; }
     if (key === 'portfeatures') { paintPortFeaturesPanel(s, body, p); return; }
     if (key === 'stpsettings') { paintStpSettingsPanel(s, body, p); return; }
+    if (key === 'security') { paintSecurityPanel(s, body, p); return; }
     const h = s.health;
     if (!h) { body.appendChild(el('div', 'card-sub', 'No SNMP data yet.')); return; }
     const sc = (k) => (h.scalars[k] ? h.scalars[k].display : null);

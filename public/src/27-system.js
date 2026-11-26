@@ -75,12 +75,16 @@
       p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()) + ':' + p2(d.getUTCSeconds());
   }
 
-  function agoWords(secs) {
+  // A length of time in words: "90 seconds", "5 minutes", "3 hours", "2 days".
+  function durWords(secs) {
     if (secs == null) return '';
-    if (secs < 120) return secs + ' seconds ago';
-    if (secs < 7200) return Math.round(secs / 60) + ' minutes ago';
-    if (secs < 172800) return Math.round(secs / 3600) + ' hours ago';
-    return Math.round(secs / 86400) + ' days ago';
+    if (secs < 120) return secs + ' seconds';
+    if (secs < 7200) return Math.round(secs / 60) + ' minutes';
+    if (secs < 172800) return Math.round(secs / 3600) + ' hours';
+    return Math.round(secs / 86400) + ' days';
+  }
+  function agoWords(secs) {
+    return secs == null ? '' : durWords(secs) + ' ago';
   }
 
   const PRIVILEGES = [

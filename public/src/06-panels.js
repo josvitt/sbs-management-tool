@@ -8,7 +8,7 @@
   // has no mounted keyed tables yet (caller should fall back to a full repaint).
   // panelIsConverted lists the keys that use keyed tables for every table they
   // render; a converted panel is safe to reconcile without a full repaint.
-  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg', 'stp', 'flash', 'capture', 'maint', 'system', 'portfeatures', 'stpsettings']);
+  const KEYED_PANELS = new Set(['interfaces', 'hardware', 'auth', 'vlans', 'connected', 'routing', 'acl', 'snmpcfg', 'stp', 'flash', 'capture', 'maint', 'system', 'portfeatures', 'stpsettings', 'security']);
   // A converted panel may still have sections built on a full paint only (auth's
   // 802.1X editor). When a refresh changes a table those read, full-repaint
   // instead of reconciling.
@@ -616,6 +616,8 @@
     if (hasIf && Number(detail.ifIndex) < 1000) tabs.push(portFeaturesTab(s, Number(detail.ifIndex)));
     // ---- Spanning tree tab: cost, priority, PortFast, BPDU guard (29-stp-settings.js). ----
     if (hasIf) tabs.push(stpPortTab(s, Number(detail.ifIndex)));
+    // ---- Security tab: trusted for DHCP snooping and ARP inspection (30-switch-security.js). ----
+    if (hasIf && Number(detail.ifIndex) < 1000) tabs.push(secPortTab(s, Number(detail.ifIndex)));
 
     // ---- ACL tab: ACLs bound to this interface (input/output + default) ----
     if (hasIf) {
