@@ -172,15 +172,32 @@ async function main() {
       check('the panel shows them as bound', listOf(m, 'sbs-test-ip').bound && (b0.v6In == null || listOf(m, 'sbs-test-v6').bound), '');
       const refused = await w.deleteQosAcl(s, ipList.idx);
       check('a bound list cannot be deleted from the panel', !refused.ok && /bound/.test(refused.error || ''), refused.error || 'it was deleted');
-      const macList = listOf(m, 'sbs-test-mac');
-      if (macList) {
-        err = await setBinding(Number(macList.idx), 0);
-        b = await w.readIfAclBinding(s, ifx, w.IFTYPE_PORT);
-        check('the MAC list bound to port ' + ifx + ' in its place', !err && b.inAcl === Number(macList.idx), err || JSON.stringify(b));
-      }
       err = await setBinding(0, 0);
       b = await w.readIfAclBinding(s, ifx, w.IFTYPE_PORT);
       check('port ' + ifx + ' unbound again', !err && JSON.stringify(b) === JSON.stringify(b0), err || JSON.stringify(b));
+      // A MAC list in place of the IP list in one SET was refused (WrongValue
+      // on rlQosIfAclIn) on .253. Try it on the unbound port, in the forms the
+      // panel could send, and record what the switch answers.
+      const macList = listOf(m, 'sbs-test-mac');
+      if (macList) {
+        const forms = [
+          ['the input column alone', [{ oid: w.QOS_IFPOL.aclIn + sfx, type: 'Integer', value: Number(macList.idx) }]],
+          ['with the default action', [{ oid: w.QOS_IFPOL.aclIn + sfx, type: 'Integer', value: Number(macList.idx) }, { oid: w.QOS_IFPOL.defIn + sfx, type: 'Integer', value: b0.defIn || 1 }]],
+          ['with an empty IPv6 column', [{ oid: w.QOS_IFPOL.aclIn + sfx, type: 'Integer', value: Number(macList.idx) }].concat(b0.v6In != null ? [{ oid: w.QOS_IFPOL.v6In + sfx, type: 'Integer', value: 0 }] : [])]
+        ];
+        const tried = [];
+        let bound = false;
+        for (const [label, vbs] of forms) {
+          try { await w.snmpSet(s, vbs); bound = true; say('  MAC list bound with ' + label); break; } catch (e) { tried.push(label + ': ' + e.message); }
+        }
+        b = await w.readIfAclBinding(s, ifx, w.IFTYPE_PORT);
+        check('the MAC list bound to port ' + ifx + ' on its own', bound && b.inAcl === Number(macList.idx), bound ? JSON.stringify(b) : 'refused every form: ' + tried.join('; '));
+        if (bound) {
+          err = await setBinding(0, 0);
+          b = await w.readIfAclBinding(s, ifx, w.IFTYPE_PORT);
+          check('port ' + ifx + ' unbound after the MAC list', !err && JSON.stringify(b) === JSON.stringify(b0), err || JSON.stringify(b));
+        }
+      }
     } else say('SKIP binding: port ' + ifx + ' already has a list bound, or a list is missing');
   }
 
