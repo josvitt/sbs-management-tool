@@ -301,6 +301,35 @@ on an empty port, each change put back.
   on the source row with its direction) and taking it out (destroy) are
   proven, as is removing a session (sources, then the destination).
 
+## Spanning tree (`switch-stp.js`, `29-stp-settings.js`)
+
+Proven on a C1300-24MGP-4X (4.1.9.92) running Rapid PVST+, with
+`scripts/switch-test-stp.js` on an empty port, each change put back.
+
+- **Every bridge table carries a row for each possible port:** 424 rows in
+  dot1dBasePortTable, dot1dStpPortTable, dot1dStpExtPortTable,
+  rldot1dStpPortTable and rldot1dStpPortBpduGuardTable (bridge ports 1 to
+  416 and 1000 to 1007). A walk of them took 750 requests and 34 s. The
+  present ports come from `rlifPresentType` (Ethernet under 1000, port
+  channels type 161) and their rows are read by GET. A bridge port's number
+  is its ifIndex.
+- **Plain SETs of the column, proven:** `rldot1dStpEnable`,
+  `dot1dStpVersion` (rstp 2 and rpvst 8, each way), `dot1dStpPriority`,
+  `dot1dStpPortPriority`, `dot1dStpPortEnable`, `dot1dStpPortAdminPathCost`
+  (0 is automatic), `dot1dStpPortAdminEdgePort` (PortFast),
+  `rldot1dStpPortAutoEdgePort` (on by default) and
+  `rldot1dStpPortBpduGuardEnable`. Each is sent as its own SET, so a refusal
+  names its column.
+- **Per VLAN, not taken over SNMP.** `rlBrgPvstVlanTable` and
+  `rlBrgPvstPortTable` are empty until a VLAN is configured. For VLAN 1 and
+  port 4 the switch refused every form: the priority or cost column on the
+  row as it is (NotWritable), createAndGo with the columns (NotWritable on
+  the row status) and createAndWait then active (WrongValue on the row
+  status). The app does not offer per-VLAN priority or cost; the panel says
+  to set them on the switch's web page.
+- **MSTP instances:** not tried (.253 runs PVST, so there was no switch-made
+  `rldot1sMstpInstanceTable` row to encode from).
+
 ## Port actions (`routes/ports.js`)
 
 - **A PoE bounce makes the config "unsaved".** The bounce is two writes to
