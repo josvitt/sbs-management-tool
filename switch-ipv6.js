@@ -10,6 +10,9 @@
  *   ipv6IpForwarding 1.3.6.1.2.1.4.25, ipv6IpDefaultHopLimit .26
  *   ipv6InterfaceTable 1.3.6.1.2.1.4.30.1 (ifIndex; .3 Identifier,
  *     .5 EnableStatus, .8 Forwarding)
+ *   rlipv6InterfaceTable V.26.20.1 (ifIndex; .1 NdDadAttemps, .2 AutoconfigEnable,
+ *     .3 IcmpUnreachSendEnable, .4 LinkMTU, .5 MLDVersion, .6 RetransmitTime,
+ *     .7 IcmpRedirectSendEnable)
  *   ipAddressTable 1.3.6.1.2.1.4.34.1 (type, address; .3 IfIndex, .4 Type,
  *     .5 Prefix, .6 Origin, .7 Status, .10 RowStatus)
  *   rlIpAddressTable V.26.36.1 (type, address, ...; .5 IfIndex, .6 ExtdType,
@@ -34,6 +37,7 @@ const V = '1.3.6.1.4.1.9.6.1.101';
 const MIB2_IP = '1.3.6.1.2.1.4';
 const T = {
   iface: MIB2_IP + '.30.1',
+  rlIface: V + '.26.20.1',
   addr: MIB2_IP + '.34.1',
   rlAddr: V + '.26.36.1',
   prefix: MIB2_IP + '.32.1',
@@ -51,7 +55,12 @@ const ADDR_STATUS = { 1: 'preferred', 2: 'deprecated', 3: 'invalid', 4: 'inacces
 const ROUTE_PROTO = { 1: 'other', 2: 'local', 3: 'static', 8: 'rip', 13: 'ospf' };
 const ROUTE_TYPE = { 1: 'other', 2: 'reject', 3: 'local', 4: 'remote', 5: 'blackhole' };
 
-const num = (v) => (v == null || v === '' ? null : Number(String(v).replace(/,/g, '')));
+// A walked value comes as display text ("down (2)", "1,500"); a GET as a number.
+const num = (v) => {
+  if (v == null || v === '') return null;
+  const m = /\((-?\d+)\)\s*$/.exec(String(v));
+  return Number(m ? m[1] : String(v).replace(/,/g, ''));
+};
 const word = (map, v) => (v == null ? null : (map[num(v)] || String(v)));
 
 /** IPv6 text from 16 numbers, the longest run of zero words as '::'. */
@@ -96,6 +105,12 @@ async function readIpv6(session) {
   const interfaces = (await safe(T.iface, [3, 5, 8])).map((r) => ({
     ifIndex: r.index[0], identifier: r.cols[3] == null ? null : String(r.cols[3]),
     enabled: num(r.cols[5]) === 1, forwarding: num(r.cols[8]) === 1
+  }));
+
+  const rlInterfaces = (await safe(T.rlIface, [1, 2, 3, 4, 5, 6, 7])).map((r) => ({
+    ifIndex: r.index[0], dad: num(r.cols[1]), autoconfig: r.cols[2] == null ? null : num(r.cols[2]) === 1,
+    unreachables: r.cols[3] == null ? null : num(r.cols[3]) === 1, mtu: num(r.cols[4]), mld: num(r.cols[5]),
+    retransmit: num(r.cols[6]), redirects: r.cols[7] == null ? null : num(r.cols[7]) === 1
   }));
 
   const addresses = (await safe(T.addr, [3, 4, 5, 6, 7, 10])).filter((r) => isV6Type(r.index[0])).map((r) => ({
@@ -148,7 +163,7 @@ async function readIpv6(session) {
   return {
     forwarding: s.forwarding == null ? null : num(s.forwarding) === 1,
     hopLimit: s.hopLimit == null ? null : num(s.hopLimit),
-    interfaces, addresses, rlAddresses, prefixes, routes, staticRoutes, defaultRouters, raPrefixes, dhcpClients, dnsServers
+    interfaces, rlInterfaces, addresses, rlAddresses, prefixes, routes, staticRoutes, defaultRouters, raPrefixes, dhcpClients, dnsServers
   };
 }
 
